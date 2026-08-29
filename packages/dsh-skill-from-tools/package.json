@@ -1,6 +1,6 @@
 {
   "name": "@blake-r/dsh-skill-from-tools",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "One skill per tool (no module grouping), short form.",
   "type": "module",
   "main": "src/dsh-skill-from-tools.mjs",

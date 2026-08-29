@@ -1,9 +1,10 @@
 // dsh-skill-from-tools — one skill per tool (no module grouping). Every
-// non-`skill` tool becomes its own skill whose description AND content use the
-// SHORT form: first sentence of the original description + the parameter schema
-// rendered as a COMPACT JSON literal (no descriptions, no `Requires` /
-// `Optionally` words). The full `parameters` schema stays in the tool registry;
-// only the compact JSON line is rendered.
+// non-`skill` tool becomes its own skill. The skill `description` carries the
+// SHORT form: first sentence + the parameter schema as a COMPACT JSON literal
+// (no descriptions). The `content` block carries the FULL annotated schema —
+// each field with its description as a comment. The full `parameters` schema
+// stays in the tool registry; only the compact JSON line is rendered in the
+// description.
 //
 // COMPACT SCHEMA NOTATION (per user spec):
 //   - required field:  `"command":string`
@@ -56,9 +57,10 @@
 // PUBLISHES; this plugin publishes no service, so no realm is needed.)
 //
 // DISAMBIGUATION: the word "tool" is ambiguous — a model that reads a skill may
-// try to route the call through the `mcp` gateway. Every skill therefore states
-// explicitly (in both the catalog description and the content block) that the
-// tool is invoked as a direct `tool_call` with its own name, NOT via `mcp`.
+// not know how to invoke it. The content block therefore states explicitly that
+// the tool is invoked as a direct `tool_call` with its own name. We deliberately
+// do NOT add a "not via mcp" note: it is redundant noise repeated across all
+// skills. The skill id and description already name the tool.
 const name = "dsh-skill-from-tools";
 const inject = ["skills", "systemPrompt", "tools"];
 // The `skill` loader stays in the prompt; every other tool is hidden.
@@ -108,6 +110,43 @@ function schemaJson(parameters) {
   return objStr(parameters);
 }
 
+// Full annotated schema for the skill `content`: multi-line, each field with
+// its description as a comment. Nested objects expand recursively. The compact
+// JSON literal stays in the `description`; the content block carries the
+// complete schema. '' when there are no parameters.
+function fullSchema(parameters) {
+  if (parameters === undefined || parameters === null || typeof parameters !== "object") return "";
+  const props = parameters.properties ?? {};
+  const required = new Set(Array.isArray(parameters.required) ? parameters.required : []);
+  const lines = [];
+  for (const key of Object.keys(props)) {
+    lines.push(...fieldLines(key, props[key], required.has(key), 0));
+  }
+  return lines.join("\n");
+}
+
+// One field's lines: `key (type, required|optional): description` plus nested
+// children (objects and arrays-of-objects) indented one level deeper.
+function fieldLines(key, node, isRequired, depth) {
+  const pad = "  ".repeat(depth);
+  const req = isRequired ? "required" : "optional";
+  const desc = node && typeof node.description === "string" ? node.description.replaceAll(/\s+/g, " ").trim() : "";
+  const lines = [`${pad}${key} (${typeStr(node)}, ${req})${desc ? `: ${desc}` : ""}`];
+  const child =
+    node && node.type === "object" && node.properties
+      ? node
+      : node && node.type === "array" && node.items && node.items.type === "object" && node.items.properties
+        ? node.items
+        : null;
+  if (child) {
+    const subReq = new Set(Array.isArray(child.required) ? child.required : []);
+    for (const subKey of Object.keys(child.properties)) {
+      lines.push(...fieldLines(subKey, child.properties[subKey], subReq.has(subKey), depth + 1));
+    }
+  }
+  return lines;
+}
+
 // First sentence of a description; '' when empty.
 function firstSentence(text) {
   if (typeof text !== "string") return "";
@@ -117,27 +156,22 @@ function firstSentence(text) {
   return m ? m[0].trim() : t;
 }
 
-// Short description line for a tool: first sentence + compact JSON schema.
-function shortLine(tool) {
-  const desc = firstSentence(tool.description);
-  const schema = schemaJson(tool.parameters);
-  return [desc, schema].filter(Boolean).join(" ");
-}
-
-// Short content block for one tool: `## \`<tool>\` tool` + an explicit
-// "invoke via tool_call" note + the short description line. (Prose guidance is
-// NOT folded here.)
+// Full content block for one tool: `## \`<tool>\` tool` + an explicit "invoke as
+// a tool_call" note + the FULL description + the FULL annotated schema. (Prose
+// guidance is NOT folded here.) The catalog `description` keeps only the first
+// sentence; the content block carries the complete description.
 //
 // DISAMBIGUATION: the bare word "tool" is ambiguous — a model that reads the
-// skill may try to route the call through the `mcp` gateway instead of calling
-// the tool directly. The explicit note below pins the mechanism: the tool is
-// invoked as a direct `tool_call` with its own name, NOT via the `mcp` tool.
-function toolBlock(tool) {
+// skill may not know how to invoke it. The explicit note below pins the
+// mechanism: the tool is invoked as a direct `tool_call` with its own name.
+function toolBlock(tool, fullSchemaText) {
+  const desc = typeof tool.description === "string" ? tool.description.replaceAll(/\s+/g, " ").trim() : "";
   return [
     `## \`${tool.name}\` tool`,
-    `Invoke directly as a tool_call named \`${tool.name}\` — do NOT route through the \`mcp\` gateway.`,
-    shortLine(tool)
-  ].join("\n").trim();
+    `Invoke directly as a tool_call named \`${tool.name}\`.`,
+    desc,
+    fullSchemaText
+  ].filter(Boolean).join("\n").trim();
 }
 
 function apply(ctx) {
@@ -171,15 +205,14 @@ function apply(ctx) {
       const skillName = `t${index.toString(16).padStart(hexWidth, "0")}${initials(tool.name)}`;
       if (registered !== undefined && registered.has(skillName)) { index++; continue; }
       const desc = firstSentence(tool.description);
-      const schema = schemaJson(tool.parameters);
       const lower = desc.length > 0 ? desc[0].toLowerCase() + desc.slice(1) : desc;
-      const catalogDesc = `Skill details about tool_call \`${tool.name}\` to ${lower} — invoke it directly as a tool_call, not via the \`mcp\` gateway`.trim();
-      const full = [catalogDesc, schema].filter(Boolean).join(" ");
-      const content = toolBlock(tool);
+      const catalogDesc = `Skill details about tool_call \`${tool.name}\` to ${lower}`.trim();
+      const description = [catalogDesc, schemaJson(tool.parameters)].filter(Boolean).join(" ");
+      const content = toolBlock(tool, fullSchema(tool.parameters));
       if (content.length === 0) { index++; continue; }
       const skill = {
         name: skillName,
-        description: full,
+        description,
         whenToUse: `When the model intends to call the "${tool.name}" tool (this skill is "${skillName}").`,
         content,
         invocation: { modelInvocable: true, userInvocable: false },
