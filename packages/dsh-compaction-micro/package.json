@@ -1,0 +1,30 @@
+{
+  "name": "@blake-r/dsh-compaction-micro",
+  "version": "0.1.0",
+  "description": "Per-request trajectory re-composition for the kb preset.",
+  "type": "module",
+  "main": "src/dsh-compaction-micro.mjs",
+  "exports": {
+    ".": "./src/dsh-compaction-micro.mjs"
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "node --check src/dsh-compaction-micro.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}

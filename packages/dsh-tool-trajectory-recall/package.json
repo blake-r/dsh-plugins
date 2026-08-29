@@ -1,0 +1,30 @@
+{
+  "name": "@blake-r/dsh-tool-trajectory-recall",
+  "version": "0.1.0",
+  "description": "Model-facing same-session recall/search tools over the durable session log.",
+  "type": "module",
+  "main": "src/dsh-tool-trajectory-recall.mjs",
+  "exports": {
+    ".": "./src/dsh-tool-trajectory-recall.mjs"
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "node --check src/dsh-tool-trajectory-recall.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}

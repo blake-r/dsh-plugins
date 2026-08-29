@@ -1,0 +1,9 @@
+# @blake-r/dsh-skill-from-tools bundle patch.
+# Declaring `dsh.bundle` in package.json makes `dsh plugin add` treat this
+# package as a profile layer: it is added to `dsh.profile.bundles`
+# automatically and this patch is applied as a layer. The user's profile
+# patch is applied after this bundle, so per-profile overrides still win.
+
+- insert:
+    - id: dsh-skill-from-tools
+      name: '@blake-r/dsh-skill-from-tools'

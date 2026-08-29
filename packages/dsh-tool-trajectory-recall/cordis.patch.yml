@@ -1,0 +1,13 @@
+# @blake-r/dsh-tool-trajectory-recall bundle patch.
+# Declaring `dsh.bundle` in package.json makes `dsh plugin add` treat this
+# package as a profile layer: it is added to `dsh.profile.bundles`
+# automatically and this patch is applied as a layer. The user's profile
+# patch is applied after this bundle, so per-profile overrides still win.
+
+# This plugin is the sole source of the `recall`/`search` tools. The bundle's
+# own tool-recall row is disabled by the web profile's cordis.patch.yml (applied
+# after this bundle layer), so no duplicate registration occurs. The compaction
+# engine row stays active.
+- insert:
+    - id: dsh-tool-trajectory-recall
+      name: '@blake-r/dsh-tool-trajectory-recall'

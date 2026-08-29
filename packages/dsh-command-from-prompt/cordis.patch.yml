@@ -1,0 +1,16 @@
+# @blake-r/dsh-command-from-prompt bundle patch.
+# Declaring `dsh.bundle` in package.json makes `dsh plugin add` treat this
+# package as a profile layer: it is added to `dsh.profile.bundles`
+# automatically and this patch is applied as a layer. The user's profile
+# patch is applied after this bundle, so per-profile overrides still win.
+
+- insert:
+    - id: dsh-command-from-prompt
+      name: '@blake-r/dsh-command-from-prompt'
+      config:
+        commit:
+          description: Ask the model to create a commit of the changes made in this session
+          prompt: >-
+            Create a commit of the changes made in this session. Review the
+            current working tree, stage the relevant changes, and write a
+            clear, conventional commit message describing what was done.

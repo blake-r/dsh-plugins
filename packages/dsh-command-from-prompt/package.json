@@ -1,0 +1,30 @@
+{
+  "name": "@blake-r/dsh-command-from-prompt",
+  "version": "0.1.0",
+  "description": "Generic 'command = user prompt' slash-command plugin.",
+  "type": "module",
+  "main": "src/dsh-command-from-prompt.mjs",
+  "exports": {
+    ".": "./src/dsh-command-from-prompt.mjs"
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "node --check src/dsh-command-from-prompt.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
