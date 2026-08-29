@@ -31,6 +31,30 @@
 // Keeping the two concerns separate means each plugin has a single
 // responsibility.
 //
+// REALM / SCOPE: this plugin is a HOST plugin (mounted in the profile's bundle
+// list), so its `system-prompt/assemble` listener is registered on the
+// unscoped host context and fires for EVERY agent in EVERY dialog. Skills must
+// therefore be registered through the AGENT's own scoped context
+// (`context.agent.ctx`), not the plugin's host `ctx`. `skills.register()` files
+// into the layer of `scopeOf(this.ctx)`: registering through the host ctx puts
+// every skill in the GLOBAL layer, which the skill registry merges into every
+// agent's catalog — so one dialog's tools leak into all other dialogs. Routing
+// through `context.agent.ctx` lands each skill in that agent's scope layer
+// (visible only to it) and ties its lifecycle to the agent (unregistered when
+// the agent is disposed). The "already registered" set must likewise be keyed
+// per agent, not shared, or a later agent would skip skills a previous agent
+// already registered.
+//
+// IMPORTANT: reach the skills service on the agent's scoped context via
+// `agentCtx.get("skills")`, NOT `agentCtx.skills`. The property form throws
+// "cannot get property skills without inject" because the agent's scoped
+// context does not declare `skills` injection. `get()` reads the service from
+// the store without the inject requirement and returns a traceable proxy bound
+// to `agentCtx`, so `register()` sees `this.ctx = agentCtx` and files into
+// `scopeOf(agentCtx)` = that agent's layer. (An `isolate` realm in the
+// composition is a different mechanism — it isolates services a `cordis:group`
+// PUBLISHES; this plugin publishes no service, so no realm is needed.)
+//
 // DISAMBIGUATION: the word "tool" is ambiguous — a model that reads a skill may
 // try to route the call through the `mcp` gateway. Every skill therefore states
 // explicitly (in both the catalog description and the content block) that the
@@ -117,17 +141,35 @@ function toolBlock(tool) {
 }
 
 function apply(ctx) {
-  const registered = new Set(); // skill ids already registered this agent
+  // Per-agent skill-id tracking. The host listener fires for every agent, so
+  // the "already registered" set must be keyed by the agent scope — a single
+  // shared set would make a later agent skip skills an earlier agent already
+  // registered. WeakMap lets the entry be collected with the agent object.
+  const registeredByAgent = new WeakMap();
   ctx.on("system-prompt/assemble", async (assembly, context, next) => {
     const tools = Array.isArray(assembly?.tools) ? assembly.tools : [];
     const all = tools.filter(
       (tool) => tool !== null && typeof tool === "object" && typeof tool.name === "string" && !EXCLUDED.has(tool.name)
     );
+    // Register through the agent's own scoped context so skills land in that
+    // agent's scope layer (visible only to it) and are unregistered when the
+    // agent is disposed. `context.agent` is always set by the agent loop's
+    // `assembleContextFor`; the fallback below is only a safety net.
+    const agent = context?.agent;
+    const agentCtx = agent?.ctx;
+    let registered;
+    if (agentCtx !== undefined) {
+      registered = registeredByAgent.get(agent);
+      if (registered === undefined) {
+        registered = new Set();
+        registeredByAgent.set(agent, registered);
+      }
+    }
     const hexWidth = Math.max(1, (all.length - 1).toString(16).length);
     let index = 0;
     for (const tool of all) {
       const skillName = `t${index.toString(16).padStart(hexWidth, "0")}${initials(tool.name)}`;
-      if (registered.has(skillName)) { index++; continue; }
+      if (registered !== undefined && registered.has(skillName)) { index++; continue; }
       const desc = firstSentence(tool.description);
       const schema = schemaJson(tool.parameters);
       const lower = desc.length > 0 ? desc[0].toLowerCase() + desc.slice(1) : desc;
@@ -135,15 +177,29 @@ function apply(ctx) {
       const full = [catalogDesc, schema].filter(Boolean).join(" ");
       const content = toolBlock(tool);
       if (content.length === 0) { index++; continue; }
-      ctx.skills.register({
+      const skill = {
         name: skillName,
         description: full,
         whenToUse: `When the model intends to call the "${tool.name}" tool (this skill is "${skillName}").`,
         content,
         invocation: { modelInvocable: true, userInvocable: false },
         source: `dsh-skill-from-tools:${tool.name}`
-      });
-      registered.add(skillName);
+      };
+      if (agentCtx !== undefined) {
+        // `agentCtx.skills` (property access) throws "cannot get property
+        // skills without inject" — the agent's scoped context does not declare
+        // `skills` injection. `get('skills')` reads the service from the store
+        // without the inject requirement AND returns a traceable proxy bound to
+        // `agentCtx`, so `register()` sees `this.ctx = agentCtx` and files the
+        // skill into `scopeOf(agentCtx)` = this agent's scope layer (visible
+        // only to it), not the global layer.
+        agentCtx.get("skills").register(skill);
+        registered.add(skillName);
+      } else {
+        // No agent scope (should not happen in normal operation); fall back to
+        // the plugin's own context so the tool still becomes a skill.
+        ctx.skills.register(skill);
+      }
       index++;
     }
     // Authoritative: only `skill` stays in the LLM request's tools array.
