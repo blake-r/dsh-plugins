@@ -21,7 +21,7 @@ dsh-plugins/
 
 | Package | What it does |
 | --- | --- |
-| [dsh-assembly-plan-compacter](packages/dsh-assembly-plan-compacter/README.md) | Make `plan_mode` print the full plan and `exit_plan_mode` carry a brief summary. |
+| [dsh-assembly-rewrite](packages/dsh-assembly-rewrite/README.md) | Rewrite named system-prompt assembly inserts (tools, sections, contexts, variables) from config. |
 | [dsh-assembly-tools-prompt-strip](packages/dsh-assembly-tools-prompt-strip/README.md) | Drop the `tool:<name>` prose guidance sections from the system prompt. |
 | [dsh-command-from-prompt](packages/dsh-command-from-prompt/README.md) | Generic "command = user prompt" slash-command plugin. |
 | [dsh-compaction-micro](packages/dsh-compaction-micro/README.md) | Per-request trajectory re-composition for the kb preset. |

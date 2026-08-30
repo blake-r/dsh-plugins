@@ -1,9 +1,0 @@
-# @blake-r/dsh-assembly-plan-compacter bundle patch.
-# Declaring `dsh.bundle` in package.json makes `dsh plugin add` treat this
-# package as a profile layer: it is added to `dsh.profile.bundles`
-# automatically and this patch is applied as a layer. The user's profile
-# patch is applied after this bundle, so per-profile overrides still win.
-
-- insert:
-    - id: dsh-assembly-plan-compacter
-      name: '@blake-r/dsh-assembly-plan-compacter'
