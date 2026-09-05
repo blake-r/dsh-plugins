@@ -6,10 +6,12 @@
 // into its own dependency-free plugin so the bundle can be decomposed. The tool
 // cores (`recall.js`, `search.js`) and the compiler helpers they need
 // (`estimateEntryTokens`, `sanitize`, `truncateTokens`, `projectToolResultText`,
-// `isCheckpointSource`) are vendored verbatim because profile-local plugin
-// files are loaded dependency-free. The upstream `tool-recall` row is disabled
-// in the web profile patch; this plugin is the sole source of `recall` /
-// `search`.
+// `isCheckpointSource`) are vendored from upstream, adapted to the current
+// session API: the removed `session.events` array is replaced by the public
+// `session.eventAt(seq)` accessor and the contiguous `session.log` (see the
+// `sessionEventAt`/`sessionLog` helpers below). The upstream `tool-recall` row
+// is disabled in the web profile patch; this plugin is the sole source of
+// `recall` / `search`.
 //
 // Two complementary entry points over the append-only event log:
 //   - `recall` — restore the exact original content of earlier events by a
@@ -150,6 +152,24 @@ function isCheckpointSource(source) {
   return source !== undefined && source.kind === "plugin" && source.plugin === "compact";
 }
 
+// ── session event access (current session API) ────────────────────────────────
+// The session object no longer exposes the removed `session.events` array.
+// Events are read through the public `eventAt(seq)` accessor and the full
+// contiguous log through `session.log` (`seq = log.length` contiguity
+// contract). These helpers keep the vendored cores working against the current
+// API while falling back gracefully on older session shapes.
+
+/** The session's contiguous event log, or an empty array when unavailable. */
+function sessionLog(session) {
+  return session.log ?? [];
+}
+
+/** Read one event by seq from the current session API (eventAt, else log). */
+function sessionEventAt(session, seq) {
+  if (typeof session.eventAt === "function") return session.eventAt(seq);
+  return sessionLog(session)[seq];
+}
+
 // ── vendored recall core ────────────────────────────────────────────────────
 
 /** Default total budget for one recall operation, in density-aware tokens. */
@@ -234,7 +254,7 @@ function expandSelections(selections) {
 /** Collect the durable seqs of every landed compaction checkpoint node. */
 function findCheckpointSeqs(session) {
   const seqs = [];
-  for (const event of session.events) {
+  for (const event of sessionLog(session)) {
     if (event.type === "user/message" && isCheckpointSource(event.data?.source)) seqs.push(event.seq);
   }
   return seqs;
@@ -249,7 +269,7 @@ function resolveRecallReference(session, type, id) {
     const match = /^(\d+)$/u.exec(token);
     if (match === null) return { selections: [], errors: [`invalid result reference "${id}" (expected a seq like "3" or "result 3")`] };
     const seq = Number(match[1]);
-    const event = session.events[seq];
+    const event = sessionEventAt(session, seq);
     if (event === undefined || event.seq !== seq) return { selections: [], errors: [`result seq ${seq} not found in this session`] };
     if (event.type !== "tool/result") return { selections: [], errors: [`seq ${seq} is not a tool result (it is ${event.type})`] };
     return { selections: [{ start: seq, end: seq }], errors: [] };
@@ -259,7 +279,7 @@ function resolveRecallReference(session, type, id) {
     const bySeq = /^seqs?\s+(\d+)$/iu.exec(token);
     if (bySeq !== null) {
       const seq = Number(bySeq[1]);
-      const event = session.events[seq];
+      const event = sessionEventAt(session, seq);
       if (event === undefined || event.seq !== seq) return { selections: [], errors: [`checkpoint seq ${seq} not found in this session`] };
       if (!isCheckpointSource(event.data?.source)) return { selections: [], errors: [`seq ${seq} is not a checkpoint node`] };
       return { selections: [{ start: seq, end: seq }], errors: [] };
@@ -294,7 +314,7 @@ function recallSession(session, selections, config) {
       truncated = true;
       break;
     }
-    const event = session.events[seq];
+    const event = sessionEventAt(session, seq);
     if (event === undefined || event.seq !== seq) {
       missing += 1;
       entries.push({ seq, text: `[seq ${seq}: not found in this session]` });
@@ -356,7 +376,7 @@ function searchSession(session, patternSource, config) {
   const pattern = compileSearchPattern(patternSource);
   const maxHits = config.maxSearchHits;
   const maxTokens = config.maxRecallTokens;
-  const events = session.events;
+  const events = sessionLog(session);
   const hits = [];
   let totalMatches = 0;
   let budget = maxTokens;

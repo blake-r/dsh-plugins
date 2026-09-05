@@ -27,10 +27,11 @@
 // as a skill id — always route through the `t<hex><initials>` scheme.
 //
 // SCOPE: this plugin ONLY moves tools out of the LLM context into skills. It
-// does NOT touch the `tool:*` prose sections — cleaning those out of the system
-// prompt is a separate concern (see the profile's cordis.patch.yml).
-// Keeping the two concerns separate means each plugin has a single
-// responsibility.
+// folds each tool's `tool:<name>` prose guidance section (from the assembly)
+// into the skill's content block, but does NOT strip those sections out of the
+// system prompt — cleaning them out is a separate concern (see the profile's
+// cordis.patch.yml). Keeping the two concerns separate means each plugin has a
+// single responsibility.
 //
 // REALM / SCOPE: this plugin is a HOST plugin (mounted in the profile's bundle
 // list), so its `system-prompt/assemble` listener is registered on the
@@ -157,19 +158,21 @@ function firstSentence(text) {
 }
 
 // Full content block for one tool: `## \`<tool>\` tool` + an explicit "invoke as
-// a tool_call" note + the FULL description + the FULL annotated schema. (Prose
-// guidance is NOT folded here.) The catalog `description` keeps only the first
-// sentence; the content block carries the complete description.
+// a tool_call" note + the FULL description + the FULL annotated schema + the
+// `tool:<name>` prose guidance section from the assembly (when present). The
+// catalog `description` keeps only the first sentence; the content block
+// carries the complete description and the full prose guidance.
 //
 // DISAMBIGUATION: the bare word "tool" is ambiguous — a model that reads the
 // skill may not know how to invoke it. The explicit note below pins the
 // mechanism: the tool is invoked as a direct `tool_call` with its own name.
-function toolBlock(tool, fullSchemaText) {
+function toolBlock(tool, fullSchemaText, proseText) {
   const desc = typeof tool.description === "string" ? tool.description.replaceAll(/\s+/g, " ").trim() : "";
   return [
     `## \`${tool.name}\` tool`,
     `Invoke directly as a tool_call named \`${tool.name}\`.`,
     desc,
+    proseText,
     fullSchemaText
   ].filter(Boolean).join("\n").trim();
 }
@@ -182,6 +185,18 @@ function apply(ctx) {
   const registeredByAgent = new WeakMap();
   ctx.on("system-prompt/assemble", async (assembly, context, next) => {
     const tools = Array.isArray(assembly?.tools) ? assembly.tools : [];
+    // Map `tool:<name>` prose guidance sections (registered at `order: 100` by
+    // each tool plugin) by tool name so each skill can fold its full prose into
+    // its content block. Sections are `{name, text}`; only exact `tool:<name>`
+    // matches are used.
+    const proseByTool = new Map();
+    if (Array.isArray(assembly?.sections)) {
+      for (const section of assembly.sections) {
+        if (typeof section?.name === "string" && section.name.startsWith("tool:") && typeof section.text === "string") {
+          proseByTool.set(section.name.slice("tool:".length), section.text);
+        }
+      }
+    }
     const all = tools.filter(
       (tool) => tool !== null && typeof tool === "object" && typeof tool.name === "string" && !EXCLUDED.has(tool.name)
     );
@@ -206,9 +221,9 @@ function apply(ctx) {
       if (registered !== undefined && registered.has(skillName)) { index++; continue; }
       const desc = firstSentence(tool.description);
       const lower = desc.length > 0 ? desc[0].toLowerCase() + desc.slice(1) : desc;
-      const catalogDesc = `Skill details about tool_call \`${tool.name}\` to ${lower}`.trim();
-      const description = [catalogDesc, schemaJson(tool.parameters)].filter(Boolean).join(" ");
-      const content = toolBlock(tool, fullSchema(tool.parameters));
+      const catalogDesc = `Details for tool_call \`${tool.name}\`: ${lower}`.trim();
+      const description = [catalogDesc, schemaJson(tool.parameters)].filter(Boolean).map((s, i) => i === 1 ? `Arguments: ${s}` : s).join(" ");
+      const content = toolBlock(tool, fullSchema(tool.parameters), proseByTool.get(tool.name));
       if (content.length === 0) { index++; continue; }
       const skill = {
         name: skillName,

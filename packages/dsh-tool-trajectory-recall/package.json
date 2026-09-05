@@ -1,6 +1,6 @@
 {
   "name": "@blake-r/dsh-tool-trajectory-recall",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Model-facing same-session recall/search tools over the durable session log.",
   "type": "module",
   "main": "src/dsh-tool-trajectory-recall.mjs",

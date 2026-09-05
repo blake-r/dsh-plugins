@@ -1,6 +1,6 @@
 {
   "name": "@blake-r/dsh-assembly-rewrite",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Rewrite named system-prompt assembly inserts (tools, sections, contexts, variables) from config.",
   "type": "module",
   "main": "src/dsh-assembly-rewrite.mjs",

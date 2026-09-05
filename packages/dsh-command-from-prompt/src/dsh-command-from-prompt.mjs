@@ -27,8 +27,8 @@
 //   - Commands take no arguments (`input` omitted), so handlers ignore
 //     `invocation.rawInput`.
 //
-// After editing this file bump the `?v=` in the referencing row of
-// cordis.patch.yml, otherwise the loader may serve the cached module.
+// After editing this file bump the `?v=` in the referencing row of the
+// profile's cordis.patch.yml, otherwise the loader may serve the cached module.
 
 const name = "dsh-command-from-prompt";
 const inject = ["commands"];

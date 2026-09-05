@@ -9,3 +9,4 @@
       name: '@blake-r/dsh-provider-websearch-lightpanda'
       config:
         maxSources: 10
+        toolPrefix: mcp__lightpanda__

@@ -41,7 +41,10 @@
 // reached"), `aborted`, or `blocked` — or a completed turn whose last assistant
 // message is reasoning-only folds everything up to the previous turn, keeping
 // only the last (problematic) session live so the interrupted reply / chain of
-// thought survives for a "Continue" prompt.
+// thought survives for a "Continue" prompt. This `keepLastSession` behavior is
+// gated behind the `compactOnAbnormal` config flag (default `false`):
+// when disabled, compaction is skipped entirely on such turn ends so past
+// sessions are never compressed on a request failure.
 //
 // The compiler is vendored (trimmed) from the upstream compaction compiler
 // because preset-local plugin files are loaded dependency-free. Bump the `?v=`
@@ -81,6 +84,12 @@
 // (no new session started) the last session is the blocked turn's session and
 // is kept. Normal turns still fold all sessions; attachment folding is
 // unchanged.
+//
+// This `keepLastSession` path is gated behind the `compactOnAbnormal`
+// config flag (default `false`). When the flag is `false`, an abnormal or
+// reasoning-only turn end skips compaction entirely — past sessions are never
+// compressed on a request failure. Set `compactOnAbnormal: true` in the
+// plugin row's `config` to restore the original keep-last-session behavior.
 //
 // ── breakdown log + whitespace normalization ────────────────────────────────
 // The `re-composed N surface nodes ...` log line carries a per-kind breakdown
@@ -169,11 +178,16 @@ function resolveToolKeyArgFields(config) {
 
 /**
  * Build the compact label for a tool-call block from its raw JSON arguments
- * string. Prefers the model-authored `description` (the UI caption, e.g.
- * `Bash Syntax-check the plugin file`); when absent, falls back to the tool's
- * key argument(s) (pattern for glob/grep, file path for read/write/edit) so the
- * compacted row still names the concrete target. Returns undefined when the
- * arguments are absent, unparseable, or carry no usable label.
+ * string. Resolves in three steps:
+ *   1. When the tool is in `toolKeyArgFields`, prefer its first present key
+ *      field (pattern for glob/grep, file path for read/write/edit) — the same
+ *      primary the GUI surfaces as the caption.
+ *   2. When the tool is NOT in `toolKeyArgFields`, prefer the model-authored
+ *      `description` (the UI caption, e.g. `Bash Syntax-check the plugin file`).
+ *   3. When neither produced a label, fall back to the first string argument
+ *      field (the same system approach the GUI uses for generic tool calls).
+ * Returns undefined when the arguments are absent, unparseable, or carry no
+ * usable label.
  * @param block - the tool-call block.
  * @param keyArgFields - resolved `{ toolName: fieldNames }` map.
  */
@@ -188,8 +202,6 @@ function toolCallLabel(block, keyArgFields) {
     return undefined;
   }
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
-  const desc = parsed.description;
-  if (typeof desc === "string" && desc.trim().length > 0) return desc.trim();
   const fields = keyArgFields[block.name];
   if (fields !== undefined) {
     // Prefer the first present key field (pattern for glob/grep, file path for
@@ -198,6 +210,14 @@ function toolCallLabel(block, keyArgFields) {
       const value = parsed[field];
       if (typeof value === "string" && value.trim().length > 0) return value.trim();
     }
+  }
+  // Tool not in `toolKeyArgFields`: prefer the model-authored `description`.
+  const desc = parsed.description;
+  if (typeof desc === "string" && desc.trim().length > 0) return desc.trim();
+  // System fallback: the first string argument field (mirrors the GUI's generic
+  // tool-call caption, e.g. `py_exec · <first field>`).
+  for (const value of Object.values(parsed)) {
+    if (typeof value === "string" && value.trim().length > 0) return value.trim();
   }
   return undefined;
 }
@@ -495,7 +515,13 @@ function apply(ctx, config = {}) {
   // Resolve the configurable key-argument fields once per plugin install.
   const resolvedConfig = {
     includeReasoning: config.includeReasoning === true,
-    toolKeyArgFields: resolveToolKeyArgFields(config)
+    toolKeyArgFields: resolveToolKeyArgFields(config),
+    // When true, an abnormal turn end (`error`, `max-tokens`, `aborted`,
+    // `blocked`) or a reasoning-only turn folds everything up to the previous
+    // turn and keeps only the last (problematic) session live. When false
+    // (default), compaction is skipped entirely on such turn ends so past
+    // sessions are never compressed on a request failure.
+    compactOnAbnormal: config.compactOnAbnormal === true
   };
 
   /**
@@ -505,10 +531,10 @@ function apply(ctx, config = {}) {
    * the plugin must not fold it.
    */
   const lastAssistantOnlyReasoning = (session, turn) => {
-    const events = session.events;
-    if (events === undefined || events === null) return false;
+    const log = session.log;
+    if (log === undefined || log === null) return false;
     let lastAssistant = null;
-    for (const event of events) {
+    for (const event of log) {
       if (event === undefined || event === null || event.type !== "assistant/message") continue;
       const data = event.data;
       if (data === undefined || data === null || data.turn !== turn) continue;
@@ -551,7 +577,7 @@ function apply(ctx, config = {}) {
     let boundaryIdx = 0;
     for (let i = nodes.length - 1; i >= 0; i--) {
       const seq = nodes[i];
-      const event = session.events[seq];
+      const event = session.eventAt ? session.eventAt(seq) : undefined;
       if (event === undefined || event === null || event.type !== "user/message") continue;
       const source = event.data && event.data.source;
       if (source !== null && source !== undefined && source.kind === "plugin" && source.plugin === "dsh-compaction-micro") {
@@ -567,7 +593,7 @@ function apply(ctx, config = {}) {
     let current = [];
     for (let i = boundaryIdx; i < nodes.length; i++) {
       const seq = nodes[i];
-      const event = session.events[seq];
+      const event = session.eventAt ? session.eventAt(seq) : undefined;
       if (event === undefined || event === null) continue;
       if (event.type === "assistant/message" || event.type === "tool/result") {
         current.push(seq);
@@ -594,7 +620,7 @@ function apply(ctx, config = {}) {
     const attachmentUsers = attachmentCandidates.filter((seq) => {
       const idx = nodes.indexOf(seq);
       for (let i = idx + 1; i < nodes.length; i++) {
-        const event = session.events[nodes[i]];
+        const event = session.eventAt ? session.eventAt(nodes[i]) : undefined;
         if (event !== undefined && event !== null && (event.type === "assistant/message" || event.type === "tool/result")) {
           return true;
         }
@@ -614,7 +640,7 @@ function apply(ctx, config = {}) {
   const sessionOnlyReasoning = (session, span) => {
     let hasAssistant = false;
     for (const seq of span) {
-      const event = session.events[seq];
+      const event = session.eventAt ? session.eventAt(seq) : undefined;
       if (event === undefined || event === null || event.type !== "assistant/message") continue;
       hasAssistant = true;
       const message = session.deriveEventMessage(event);
@@ -629,7 +655,10 @@ function apply(ctx, config = {}) {
   const runCompaction = (agent, opts = {}) => {
     try {
       const session = agent.session;
-      if (session === undefined || session.surface === undefined || session.events === undefined) return;
+      if (session === undefined || session.surface === undefined || typeof session.eventAt !== "function") {
+        log("warn", `Failed to run, session object keys: ${Object.keys(session)}`);
+        return;
+      }
 
       const { sessions, attachmentUsers } = pendingWork(session);
       if (sessions.length === 0 && attachmentUsers.length === 0) return;
@@ -655,7 +684,7 @@ function apply(ctx, config = {}) {
         const shadowedSeqs = [];
         let shadowedTokenCount = 0;
         for (const seq of span) {
-          const event = session.events[seq];
+          const event = session.eventAt ? session.eventAt(seq) : undefined;
           if (event === undefined || event === null) continue;
           shadowedSeqs.push(seq);
           const message = session.deriveEventMessage(event);
@@ -712,7 +741,7 @@ function apply(ctx, config = {}) {
       // Fold attachments in every real user message the agent has already passed
       // into recall links, keeping the text.
       for (const attachmentUser of attachmentUsers) {
-        const event = session.events[attachmentUser];
+        const event = session.eventAt ? session.eventAt(attachmentUser) : undefined;
         if (event === undefined || event === null) continue;
         const message = session.deriveEventMessage(event);
         if (message === null || message === undefined || message.content === undefined) continue;
@@ -748,14 +777,14 @@ function apply(ctx, config = {}) {
 
       if (replaced === 0) return;
 
-      // persist the replacements (best effort, fire-and-forget).
-      try {
-        if (ctx.sessions !== undefined && typeof ctx.sessions.flush === "function") {
-          ctx.sessions.flush(session);
-        }
-      } catch (error) {
-        log("warn", `session flush failed: ${error instanceof Error ? error.message : String(error)}`);
-      }
+      // The replacements are persisted by the engine's own write-behind
+      // (SessionWriteBehind drains the buffer on its 200ms deadline and on
+      // session dispose). We deliberately do NOT call ctx.sessions.flush here:
+      // an explicit flush during an abnormal turn end (interrupted/aborted)
+      // forces a durable write while the tool-delta stream is still open, which
+      // can reorder buffered deltas after the turn's closing events and corrupt
+      // the seq sequence. Letting the engine flush at its own quiescent point
+      // keeps the seq order intact.
     } catch (error) {
       log("warn", `compaction failed: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -791,9 +820,19 @@ function apply(ctx, config = {}) {
       // first; the surface is already complete by then.
       queueMicrotask(() => {
         try {
+          // A request that did not end successfully — `error` (request failed),
+          // `max-tokens` (reply cut off), `aborted` (cancelled mid-turn),
+          // `blocked` (rejected before any step ran) — or a reasoning-only turn
+          // (last message is just a chain of thought) folds everything up to the
+          // previous turn and keeps only the last (problematic) session live so
+          // the interrupted reply / chain of thought survives for a "Continue".
           if (abnormal || reasoningOnly) {
-            log("info", `turn ${turn} ended ${abnormal ? `with ${kind}` : "reasoning-only"}: folding up to previous turn, keeping last session`);
-            runCompaction(agent, { keepLastSession: true });
+            if (resolvedConfig.compactOnAbnormal) {
+              log("info", `turn ${turn} ended ${abnormal ? `with ${kind}` : "reasoning-only"}: folding up to previous turn, keeping last session`);
+              runCompaction(agent, { keepLastSession: true });
+            } else {
+              log("info", `turn ${turn} ended ${abnormal ? `with ${kind}` : "reasoning-only"}: compactOnAbnormal disabled, skipping compaction`);
+            }
           } else {
             runCompaction(agent);
           }

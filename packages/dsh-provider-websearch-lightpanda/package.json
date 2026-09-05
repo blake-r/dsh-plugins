@@ -1,6 +1,6 @@
 {
   "name": "@blake-r/dsh-provider-websearch-lightpanda",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "description": "WebRuntime provider pair backed by the lightpanda MCP server.",
   "type": "module",
   "main": "src/dsh-provider-websearch-lightpanda.mjs",

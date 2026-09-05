@@ -3,17 +3,16 @@
 // MCP server — one WebSearchProvider and one WebFetchProvider, both with id
 // "lightpanda".
 //
-// Call path: web_search/web_fetch → ctx.web → this provider → a programmatic
-// `ctx.tools.execute` of dsh-mcp-adapter's `mcp` proxy tool → the mcporter
-// bridge server "m" (mcporter-serve-claude) → the lightpanda MCP server "lp"
-// (registered in the mcporter config). Routing through `mcp` reuses the
-// adapter's lazy connection pool and its single lightpanda browser process —
-// this plugin never spawns its own browser. The lightpanda server itself does
-// the real work: search uses its EXA-backed `search` tool (EXA_API_KEY lives
-// in the server's env in the mcporter config), fetch uses `goto` +
-// `markdown` (full JS rendering and the shared cookie jar). The mcporter
-// bridge namespaces tools as `<server>__<tool>`, so these are `m_lp__search`,
-// `m_lp__goto`, `m_lp__markdown`.
+// Call path: web_search/web_fetch → ctx.web → this provider → a direct
+// `ctx.tools.execute` of the dsh-mcp-client-registered tool
+// `mcp__m__lp__<tool>` → the mcporter bridge server "m"
+// (mcporter-serve-claude) → the lightpanda MCP server "lp" (registered in the
+// mcporter config). The tool-name prefix is set via `config.toolPrefix` (no
+// default — it must match the dsh-mcp-client registration). The lightpanda
+// server itself does the real work:
+// search uses its EXA-backed `search` tool (EXA_API_KEY lives in the server's
+// env in the mcporter config), fetch uses `goto` + `markdown` (full JS
+// rendering and the shared cookie jar).
 //
 // The seam itself (@deepseek-ai/dsh-web) is mounted once globally by dsh-base
 // with `searchProvider: deepseek-official` — mounting it again here fails with
@@ -81,16 +80,8 @@ const name = "dsh-provider-websearch-lightpanda";
 const inject = ["web", "tools", "agents"];
 
 /**
- * MCP server name as configured in the dsh-mcp-adapter `mcpServers` list.
- * This is the mcporter bridge (`mcporter-serve-claude`, server "m" in
- * the dsh-mcp-adapter mcpServers list), which exposes every mcporter server as one MCP server with
- * tools namespaced as `<server>__<tool>`. The lightpanda server is registered
- * in the mcporter config under the name "lp".
+ * Provider id registered with the seam and named in the seam config.
  */
-const SERVER = "m";
-/** lightpanda server name inside the mcporter config. */
-const MCPORTER_SERVER = "lp";
-/** Provider id registered with the seam and named in the seam config. */
 const PROVIDER_ID = "lightpanda";
 /** Cap on a fetched markdown body; the tool layer has its own render cap. */
 const FETCH_MAX_CHARS = 100000;
@@ -119,24 +110,27 @@ function isAntiBotPage(text) {
 // --- mcp plumbing -----------------------------------------------------------
 
 /**
- * Run one lightpanda MCP tool through the dsh-mcp-adapter `mcp` proxy tool and
- * return plain text.
+ * Run one lightpanda MCP tool through a direct `ctx.tools.execute` of the
+ * dsh-mcp-client-registered tool named `toolPrefix + tool` (e.g.
+ * `mcp__m__lp__search`) and return plain text.
  *
  * `ctx.tools.execute` takes a ToolExecutionInput whose `signal` field is
  * REQUIRED — omitting it crashes the registry with
  * "Cannot read properties of undefined (reading 'aborted')". We mint a local
  * controller and fuse the caller's signal in.
  *
- * The adapter's `mcp` tool is registered globally (not per preset), so we pass
- * the current agent via the `agents` service only to keep the call attributed
- * to the initiating agent; the tool itself resolves regardless of scope.
+ * The tool is registered globally (not per preset), so we pass the current
+ * agent via the `agents` service only to keep the call attributed to the
+ * initiating agent; the tool itself resolves regardless of scope.
  *
- * Failure contract: the adapter never sets `isError` on a failed call — it
- * returns a normal text result prefixed with `Failed to call <tool>:`. We
- * detect that prefix and throw so the provider surfaces an honest error
- * instead of parsing the failure text as search results / page content.
+ * Failure contract: dsh-mcp-client's executor throws on `isError` and returns
+ * a normal text result otherwise. We detect the `Failed to call <tool>:`
+ * prefix (left by the mcporter bridge) and throw so the provider surfaces an
+ * honest error instead of parsing the failure text as search results / page
+ * content.
  */
-async function callLightpanda(ctx, tool, args, callerSignal) {
+async function callLightpanda(ctx, toolPrefix, tool, args, callerSignal) {
+	const toolName = toolPrefix + tool;
 	const controller = new AbortController();
 	let onAbort;
 	if (callerSignal !== undefined) {
@@ -148,26 +142,22 @@ async function callLightpanda(ctx, tool, args, callerSignal) {
 	}
 	try {
 		const agent = ctx.agents.requireInitiator();
-		// The mcporter bridge namespaces tools as `<server>__<tool>`, and the
-		// adapter prefixes them with the bridge server name, so the lightpanda
-		// tools are `m_lp__search`, `m_lp__goto`, `m_lp__markdown`.
-		const mcTool = `${SERVER}_${MCPORTER_SERVER}__${tool}`;
 		const result = await ctx.tools.execute({
 			callId: `web-lightpanda-${crypto.randomUUID()}`,
-			name: "mcp",
-			arguments: { tool: mcTool, server: SERVER, args },
+			name: toolName,
+			arguments: args,
 			agent,
 			signal: controller.signal
 		});
 		if (result.isError) {
-			throw new Error(`lightpanda ${tool} failed: ${result.error?.message ?? "unknown mcp error"}`);
+			throw new Error(`lightpanda ${toolName} failed: ${result.error?.message ?? "unknown mcp error"}`);
 		}
 		const text = (result.content ?? [])
 			.filter((block) => block && block.type === "text" && typeof block.text === "string")
 			.map((block) => block.text)
 			.join("\n");
 		if (/^Failed to call /u.test(text)) {
-			throw new Error(`lightpanda ${tool} failed: ${text}`);
+			throw new Error(`lightpanda ${toolName} failed: ${text}`);
 		}
 		return text;
 	} finally {
@@ -243,9 +233,10 @@ function parseSearchSources(text) {
 
 class LightpandaSearchProvider {
 	id = PROVIDER_ID;
-	constructor(ctx, maxSources) {
+	constructor(ctx, maxSources, toolPrefix) {
 		this.ctx = ctx;
 		this.maxSources = maxSources;
+		this.toolPrefix = toolPrefix;
 	}
 	/** Cheap local check only (seam contract: no network calls here). */
 	available() {
@@ -253,7 +244,7 @@ class LightpandaSearchProvider {
 	}
 	async search(request, signal) {
 		signal?.throwIfAborted();
-		const text = await callLightpanda(this.ctx, "search", { query: request.query }, signal);
+		const text = await callLightpanda(this.ctx, this.toolPrefix, "search", { query: request.query }, signal);
 		signal?.throwIfAborted();
 		if (isCaptchaPage(text)) {
 			throw new Error(
@@ -272,17 +263,18 @@ class LightpandaSearchProvider {
 
 class LightpandaFetchProvider {
 	id = PROVIDER_ID;
-	constructor(ctx) {
+	constructor(ctx, toolPrefix) {
 		this.ctx = ctx;
+		this.toolPrefix = toolPrefix;
 	}
 	available() {
 		return true;
 	}
 	async fetch(request, signal) {
 		signal?.throwIfAborted();
-		await callLightpanda(this.ctx, "goto", { url: request.url, timeout: GOTO_TIMEOUT_MS }, signal);
+		await callLightpanda(this.ctx, this.toolPrefix, "goto", { url: request.url, timeout: GOTO_TIMEOUT_MS }, signal);
 		signal?.throwIfAborted();
-		let markdown = await callLightpanda(this.ctx, "markdown", {}, signal);
+		let markdown = await callLightpanda(this.ctx, this.toolPrefix, "markdown", {}, signal);
 		signal?.throwIfAborted();
 		if (isAntiBotPage(markdown)) {
 			throw new Error(
@@ -318,11 +310,20 @@ function apply(ctx, config) {
 	const maxSources = Number.isInteger(config?.maxSources) && config.maxSources > 0
 		? config.maxSources
 		: 8;
+	// Prefix of the dsh-mcp-client-registered lightpanda tool names
+	// (`mcp__m__lp__` → `mcp__m__lp__search` / `mcp__m__lp__goto` /
+	// `mcp__m__lp__markdown` in the web profile). Required via
+	// `config.toolPrefix` — there is no default, it must match the
+	// dsh-mcp-client registration.
+	const toolPrefix = config?.toolPrefix;
+	if (typeof toolPrefix !== "string" || toolPrefix.length === 0) {
+		throw new Error(`${name}: config.toolPrefix is required (e.g. "mcp__m__lp__")`);
+	}
 	if (!web.searchProviders.has(PROVIDER_ID)) {
-		web.registerSearchProvider(new LightpandaSearchProvider(ctx, maxSources));
+		web.registerSearchProvider(new LightpandaSearchProvider(ctx, maxSources, toolPrefix));
 	}
 	if (!web.fetchProviders.has(PROVIDER_ID)) {
-		web.registerFetchProvider(new LightpandaFetchProvider(ctx));
+		web.registerFetchProvider(new LightpandaFetchProvider(ctx, toolPrefix));
 	}
 	// Re-point the global seam (mounted by dsh-base with
 	// `searchProvider: deepseek-official`) at this provider pair for as long as

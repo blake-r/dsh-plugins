@@ -17,6 +17,8 @@
 //     sections:
 //       <sectionName>:
 //         text: <replacement section text>
+//         before: <existingSectionName>   # insert a NEW section before this anchor
+//         after: <existingSectionName>    # insert a NEW section after this anchor
 //     contexts:
 //       <contextName>:
 //         text: <replacement context text>
@@ -29,6 +31,12 @@
 // called `foo`) — the key is the (namespace, name) pair, so there is no
 // conflict. If a configured name is not present in the assembled prompt, that
 // entry is silently skipped.
+//
+// Sections: a `sections.<name>` entry whose name already exists overwrites that
+// section's text in place. A name that does NOT exist inserts a NEW section —
+// positioned before/after the named anchor section via `before`/`after`, or at
+// the end of the section list when no anchor is given (or the anchor is
+// missing). `before` wins over `after`; an existing section is never duplicated.
 //
 // Ordering: the listener is registered with `{ prepend: true }`, so it runs
 // FIRST in the waterfall regardless of where this row sits in the profile's
@@ -67,13 +75,46 @@ function apply(ctx, config) {
         }
       }
 
-      // sections: { <sectionName>: { text } }
+      // sections: { <sectionName>: { text, before?, after?, at? } }
+      //
+      // Idempotent insert: first removes ALL existing sections with the target
+      // name, then inserts one copy at the configured position. This ensures
+      // the same final state regardless of how many times assemble() runs.
+      //
+      // Positioning:
+      //   - `before: <name>` — insert before the named anchor
+      //   - `after: <name>`  — insert after the named anchor (default)
+      //   - no anchor        — append at the end
+      //
+      // `before` wins over `after`; a missing anchor falls back to appending
+      // so the block still lands in the prompt.
       for (const [secName, def] of Object.entries(cfg.sections ?? {})) {
         if (!def || typeof def !== "object") continue;
-        const sec = assembly.sections?.find((s) => s.name === secName);
-        if (sec && typeof def.text === "string") {
-          sec.text = def.text;
+        if (typeof def.text !== "string") continue;
+        const list = assembly.sections ?? [];
+
+        // Step 1: remove ALL existing copies of this section name
+        const beforeCount = list.length;
+        const filtered = list.filter((s) => s.name !== secName);
+        const removed = beforeCount - filtered.length;
+
+        // Step 2: determine anchor and insert position
+        const anchor = typeof def.before === "string" ? def.before : typeof def.after === "string" ? def.after : null;
+        const idx = anchor === null ? -1 : filtered.findIndex((s) => s.name === anchor);
+
+        const newEntry = { name: secName, text: def.text };
+
+        if (idx < 0) {
+          // No anchor found (or none given): append
+          filtered.push(newEntry);
+        } else if (typeof def.before === "string") {
+          filtered.splice(idx, 0, newEntry);
+        } else {
+          filtered.splice(idx + 1, 0, newEntry);
         }
+
+        // Step 3: replace the list (avoids in-place mutation surprises)
+        assembly.sections = filtered;
       }
 
       // contexts: { <contextName>: { text } }
