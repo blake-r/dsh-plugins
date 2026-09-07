@@ -706,12 +706,26 @@ function apply(ctx, config = {}) {
         const start = shadowedSeqs[0];
         const end = shadowedSeqs[shadowedSeqs.length - 1];
 
+        // Net freed tokens: the gross shadowed span minus the price of the
+        // replacement text we re-installed (mirrors the token-meter's fold,
+        // which subtracts the replacement). Computed before the message is
+        // built so the `notice` summary can cite it.
+        const netSaved = shadowedTokenCount - estimateMessage({ content: blocks });
+
         // commit the model-free replacement (no token metering: no budgets).
+        // `form: "notice"` + `summary` let the Chat UI surface a one-line
+        // micro-compaction account (with the net saved tokens) on the collapsed
+        // row instead of the generic "Context injection" label alone.
         const replacementMessage = deepFreeze({
           id: newMessageId(),
           role: "user",
           content: deepFreeze(blocks),
-          source: { kind: "plugin", plugin: "dsh-compaction-micro" }
+          source: {
+            kind: "plugin",
+            plugin: "dsh-compaction-micro",
+            form: "notice",
+            summary: `Micro-compaction: removed ${netSaved} tokens`
+          }
         });
 
         // Arm the token-meter's shadow-price claim: the `compaction/summary`
@@ -729,11 +743,8 @@ function apply(ctx, config = {}) {
           sourceEventSeqs: shadowedSeqs
         });
 
-        // Net freed tokens: the gross shadowed span minus the price of the
-        // replacement text we re-installed (mirrors the token-meter's fold,
-        // which subtracts the replacement). The `compaction/summary` above stays
-        // gross — the meter subtracts the replacement itself.
-        const netSaved = shadowedTokenCount - estimateMessage(replacementMessage);
+        // The `compaction/summary` above stays gross — the meter subtracts the
+        // replacement itself; `netSaved` (computed above) is the net figure.
         log("info", `re-composed ${shadowedSeqs.length} surface nodes (seqs ${start}-${end}) into seq ${replacement.seq}; saved ${netSaved} tokens (tool calls: ${stats.tools}, reasoning blocks: ${stats.reasoningRemoved}, text lines: ${stats.text}, media links: ${stats.media})`);
         replaced++;
       }
@@ -752,11 +763,20 @@ function apply(ctx, config = {}) {
         const shadowedSeqs = [attachmentUser];
         const shadowedTokenCount = estimateMessage(message);
 
+        // Net freed tokens, computed before the message is built so the
+        // `notice` summary can cite it (mirrors the token-meter's fold).
+        const netSaved = shadowedTokenCount - estimateMessage({ content: blocks });
+
         const replacementMessage = deepFreeze({
           id: newMessageId(),
           role: "user",
           content: blocks,
-          source: { kind: "plugin", plugin: "dsh-compaction-micro" }
+          source: {
+            kind: "plugin",
+            plugin: "dsh-compaction-micro",
+            form: "notice",
+            summary: `Micro-compaction: removed ${netSaved} tokens`
+          }
         });
 
         session.append("compaction/summary", {
@@ -770,7 +790,6 @@ function apply(ctx, config = {}) {
           sourceEventSeqs: shadowedSeqs
         });
 
-        const netSaved = shadowedTokenCount - estimateMessage(replacementMessage);
         log("info", `folded ${attachments.length} attachment(s) in user message seq ${attachmentUser} into seq ${replacement.seq}; saved ${netSaved} tokens`);
         replaced++;
       }
