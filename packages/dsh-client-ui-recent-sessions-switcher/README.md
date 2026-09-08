@@ -29,7 +29,10 @@ selected one. Each session counts at most one agent: an agent paused on a
 question/approval keeps its loop phase "running", so it is counted under
 "awaiting input" only, never as both working and awaiting input. It is
 highlighted green when any idle agent has unread output and orange when any
-agent awaits input (orange outranks green).
+agent awaits input (orange outranks green). The highlight is rim-only: the
+badge keeps a transparent background and its neutral border width, only the
+border color changes to the state color (success green / warn orange), so the
+counter itself is never filled solid.
 
 ## Layout
 
