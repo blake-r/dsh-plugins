@@ -136,8 +136,13 @@ export function apply(ctx) {
         for (const id of list.ids) {
           const s = list.byId[id];
           if (s === undefined || s.blank || s.origin === "subagent") continue;
-          if (s.running === true) running++;
-          if (visiblePendingKind(pendingInteractions.get(id)?.kind)) input++;
+          // One session = at most one active agent. An agent paused on a
+          // question/approval keeps the loop phase "running", so it must be
+          // counted under `input` only — counting it as running too would
+          // inflate the badge by one.
+          const pending = visiblePendingKind(pendingInteractions.get(id)?.kind);
+          if (pending) input++;
+          else if (s.running === true) running++;
           if (s.completed === true) unread++;
         }
         return { count: running + input, running, input, unread };

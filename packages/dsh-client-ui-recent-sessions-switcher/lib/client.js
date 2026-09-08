@@ -179,8 +179,12 @@ window.__ModuleLoader__.load({
 						for (const id of list.ids) {
 							const s = list.byId[id];
 							if (s === undefined || s.blank || s.origin === "subagent") continue;
-							if (s.running === true) running++;
-							if (visiblePendingKind(pendingInteractions.get(id)?.kind)) input++;
+							// One session = at most one agent. An agent paused on a
+							// question/approval keeps its loop phase "running", so it must be
+							// counted under `input` only — otherwise the badge inflates by one.
+							const pending = visiblePendingKind(pendingInteractions.get(id)?.kind);
+							if (pending) input++;
+							else if (s.running === true) running++;
 							if (s.completed === true) unread++;
 						}
 						return { count: running + input, running, input, unread };

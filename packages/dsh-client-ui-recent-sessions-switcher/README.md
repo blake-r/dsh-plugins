@@ -25,8 +25,11 @@ was still running, cleared on refocus.
 
 The counter next to the trigger shows the total number of active agents
 (working or awaiting input) across all sessions, including the currently
-selected one. It is highlighted green when any idle agent has unread output
-and orange when any agent awaits input (orange outranks green).
+selected one. Each session counts at most one agent: an agent paused on a
+question/approval keeps its loop phase "running", so it is counted under
+"awaiting input" only, never as both working and awaiting input. It is
+highlighted green when any idle agent has unread output and orange when any
+agent awaits input (orange outranks green).
 
 ## Layout
 
