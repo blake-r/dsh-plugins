@@ -162,7 +162,7 @@ window.__ModuleLoader__.load({
 				: t("compaction.unavailable");
 			return react.createElement("div", { className: "cmc-row" },
 				react.createElement("span", { className: "cmc-leading", "aria-hidden": true },
-					react.createElement(primitives.IconApiOutline14, {})
+					react.createElement(primitives.IconSkillOutline16, {})
 				),
 				react.createElement("span", { className: "cmc-title" }, t("compaction.title")),
 				react.createElement("span", { className: "cmc-sep", "aria-hidden": true }),

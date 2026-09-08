@@ -2,8 +2,8 @@
 
 DSH Web UI plugin: renders a transcript marker at every `dsh-compaction-micro`
 compaction point — *"Micro-compaction — N history items (~M tokens)"*, styled as
-a system row (faded, 13px) with the same `IconApiOutline14` leading icon the
-built-in compaction marker uses. The seq range is not shown; consecutive micro
+a system row (faded, 13px) with a `IconSkillOutline16` leading icon (scaled to
+14px, from `@deepseek-ai/dsh-client-ui-primitives`). The seq range is not shown; consecutive micro
 compactions are collapsed into one marker that sums items and tokens across the
 run.
 
