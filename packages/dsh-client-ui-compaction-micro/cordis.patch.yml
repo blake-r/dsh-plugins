@@ -1,0 +1,8 @@
+# Bundle patch for the compaction-micro UI marker plugin: inserts its plugin row
+# into the web profile roster. Applied as a profile bundle layer (the
+# `dsh.bundle.patch` manifest field). The row's `name` resolves to this
+# package's host half (lib/index.js); the browser half is discovered through
+# the package.json `dsh.client` declaration by dsh-client-modules.
+- insert:
+    - id: compaction-micro-ui
+      name: '@blake-r/dsh-client-ui-compaction-micro'
