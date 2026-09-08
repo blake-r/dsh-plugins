@@ -31,6 +31,8 @@
 // required from the platform seed. Keep the two in sync; lib/client.js is what
 // the browser actually loads.
 
+import { IconApiOutline14 } from "@deepseek-ai/dsh-client-ui-primitives";
+
 const NS = "compaction-micro";
 
 const en = {
@@ -177,6 +179,9 @@ const MarkerView = ({ node, t }) => {
     ? t("compaction.completed", { items: data.shadowedItemCount, tokens: data.shadowedTokenCount })
     : t("compaction.unavailable");
   return React.createElement("div", { className: "cmc-row" },
+    React.createElement("span", { className: "cmc-leading", "aria-hidden": true },
+      React.createElement(IconApiOutline14, {})
+    ),
     React.createElement("span", { className: "cmc-title" }, t("compaction.title")),
     React.createElement("span", { className: "cmc-sep", "aria-hidden": true }),
     React.createElement("span", { className: "cmc-summary" }, summary)

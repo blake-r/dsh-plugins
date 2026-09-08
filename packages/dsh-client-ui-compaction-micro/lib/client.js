@@ -5,12 +5,15 @@ window.__ModuleLoader__.load({
 		var exports = module.exports;
 		Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 		let react = require("react");
+		let primitives = require("@deepseek-ai/dsh-client-ui-primitives");
 
 		// CSS for the marker, injected once at materialization. Uses the same
 		// data-plugin-css guard the official client bundles use so re-materialization
 		// (HMR / reload) does not duplicate the <style> tag.
 		const css = [
 			".cmc-row{display:flex;align-items:center;min-width:0;contain:size layout;height:calc(24px + var(--dsh-content-font-delta,0px))}",
+			".cmc-leading{width:calc(16px + var(--dsh-content-font-delta,0px));height:calc(16px + var(--dsh-content-font-delta,0px));color:var(--dsw-alias-label-secondary);flex:none;place-items:center;margin-right:6px;display:inline-grid}",
+			".cmc-leading svg{width:calc(14px + var(--dsh-content-font-delta,0px));height:calc(14px + var(--dsh-content-font-delta,0px))}",
 			".cmc-title{flex:none;color:var(--dsw-alias-label-secondary);font-weight:400;font-size:var(--dsh-content-font-size-secondary,13px);line-height:calc(20px + var(--dsh-content-font-delta-secondary,0px));white-space:nowrap}",
 			".cmc-sep{flex:none;width:2px;height:2px;border-radius:1px;background:var(--dsw-alias-label-caption);margin:0 8px}",
 			".cmc-summary{min-width:0;color:var(--dsw-alias-label-tertiary);font-size:var(--dsh-content-font-size-secondary,13px);line-height:calc(20px + var(--dsh-content-font-delta-secondary,0px));white-space:nowrap;overflow:hidden;text-overflow:ellipsis}"
@@ -158,6 +161,9 @@ window.__ModuleLoader__.load({
 				? t("compaction.completed", { items: data.shadowedItemCount, tokens: data.shadowedTokenCount })
 				: t("compaction.unavailable");
 			return react.createElement("div", { className: "cmc-row" },
+				react.createElement("span", { className: "cmc-leading", "aria-hidden": true },
+					react.createElement(primitives.IconApiOutline14, {})
+				),
 				react.createElement("span", { className: "cmc-title" }, t("compaction.title")),
 				react.createElement("span", { className: "cmc-sep", "aria-hidden": true }),
 				react.createElement("span", { className: "cmc-summary" }, summary)
