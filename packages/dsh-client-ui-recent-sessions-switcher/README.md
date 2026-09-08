@@ -23,10 +23,10 @@ was still running, cleared on refocus.
 
 ## Badge
 
-The counter next to the trigger shows how many sessions need attention (unread
-completed + sessions awaiting input), excluding the currently-selected session.
-It is highlighted green when there are unread completed sessions and orange
-when any session awaits input (orange outranks green).
+The counter next to the trigger shows the total number of active agents
+(working or awaiting input) across all sessions, including the currently
+selected one. It is highlighted green when any idle agent has unread output
+and orange when any agent awaits input (orange outranks green).
 
 ## Layout
 

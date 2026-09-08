@@ -127,13 +127,26 @@ export function apply(ctx) {
       const currentStatus = current
         ? statusOf({ running: current.running === true, completed: current.completed === true, pending: visiblePendingKind(pendingInteractions.get(sessionId)?.kind) })
         : { state: "idle", label: "Idle" };
-      const unreadCount = recent.filter((i) => i.completed && i.id !== sessionId).length;
-      const inputCount = recent.filter((i) => i.pending && i.id !== sessionId).length;
-      const badgeCount = unreadCount + inputCount;
-      const badgeClass = "rss-badge" + (inputCount > 0 ? " rss-badgeWarn" : unreadCount > 0 ? " rss-badgeUnread" : "");
+      // Badge: total active agents (working or awaiting input) across ALL
+      // sessions, including the current one. Orange when any agent awaits
+      // input (outranks green); green when any idle agent has unread output.
+      const badge = React.useMemo(() => {
+        if (list.phase !== "ready") return { count: 0, running: 0, input: 0, unread: 0 };
+        let running = 0, input = 0, unread = 0;
+        for (const id of list.ids) {
+          const s = list.byId[id];
+          if (s === undefined || s.blank || s.origin === "subagent") continue;
+          if (s.running === true) running++;
+          if (visiblePendingKind(pendingInteractions.get(id)?.kind)) input++;
+          if (s.completed === true) unread++;
+        }
+        return { count: running + input, running, input, unread };
+      }, [list, pendingInteractions]);
+      const badgeClass = "rss-badge" + (badge.input > 0 ? " rss-badgeWarn" : badge.unread > 0 ? " rss-badgeUnread" : "");
       const badgeTitle = [
-        unreadCount > 0 ? unreadCount + " unread chat" + (unreadCount === 1 ? "" : "s") : "",
-        inputCount > 0 ? inputCount + " need" + (inputCount === 1 ? "s" : "") + " input" : ""
+        badge.running > 0 ? badge.running + " working" : "",
+        badge.input > 0 ? badge.input + " need" + (badge.input === 1 ? "s" : "") + " input" : "",
+        badge.unread > 0 ? badge.unread + " unread chat" + (badge.unread === 1 ? "" : "s") : ""
       ].filter(Boolean).join(", ");
 
       return React.createElement("div", { className: "rss-root" + (forceUnread ? " rss-forceUnread" : ""), ref: rootRef },
@@ -150,7 +163,7 @@ export function apply(ctx) {
           currentCwd ? React.createElement("span", { className: "rss-cwdSep" }, "/") : null,
           React.createElement("span", { className: "rss-triggerLabel" }, currentTitle || "Switch"),
           React.createElement("span", { className: "rss-chevron" }, open ? "\u25B2" : "\u25BC"),
-          React.createElement("span", { className: badgeClass, title: badgeTitle }, badgeCount > 10 ? "9+" : badgeCount)
+          React.createElement("span", { className: badgeClass, title: badgeTitle }, badge.count > 10 ? "9+" : badge.count)
         ),
         open && React.createElement("div", { className: "rss-menu", role: "listbox" },
           recent.length === 0
