@@ -1,4 +1,5 @@
-// Compaction-micro UI marker — client half (source mirror of lib/client.js).
+// Compaction-micro UI marker — client half (source of the generated
+// lib/client.js bundle).
 //
 // Renders a transcript marker at every dsh-compaction-micro compaction point:
 // "Micro-compaction — N history items (~M tokens)". The fact is read from the
@@ -26,12 +27,26 @@
 // `conversation.chat.node` keyed slot. No change to dsh-compaction-micro is
 // required: visualization lives entirely here.
 //
-// The shipped lib/client.js is this same code wrapped in the client-modules
-// bundle format (window.__ModuleLoader__.load({ id, factory })) with `react`
-// required from the platform seed. Keep the two in sync; lib/client.js is what
-// the browser actually loads.
+// lib/client.js is GENERATED from this file by `npm run build`
+// (scripts/build.mjs): the body below is wrapped in the client-modules bundle
+// format (window.__ModuleLoader__.load({ id, factory })) with `react` and
+// `@deepseek-ai/dsh-client-ui-primitives` required from the platform seed, and
+// the CSS below is injected once at materialization. Do not edit lib/client.js
+// by hand — edit this file and run `npm run build`.
 
 import { IconSkillOutline16 } from "@deepseek-ai/dsh-client-ui-primitives";
+
+// CSS for the marker, injected once at materialization. Uses the same
+// data-plugin-css guard the official client bundles use so re-materialization
+// (HMR / reload) does not duplicate the <style> tag.
+const css = [
+  ".cmc-row{display:flex;align-items:center;min-width:0;contain:size layout;height:calc(24px + var(--dsh-content-font-delta,0px))}",
+  ".cmc-leading{width:calc(16px + var(--dsh-content-font-delta,0px));height:calc(16px + var(--dsh-content-font-delta,0px));color:var(--dsw-alias-label-secondary);flex:none;place-items:center;margin-right:6px;display:inline-grid}",
+  ".cmc-leading svg{width:calc(14px + var(--dsh-content-font-delta,0px));height:calc(14px + var(--dsh-content-font-delta,0px))}",
+  ".cmc-title{flex:none;color:var(--dsw-alias-label-secondary);font-weight:400;font-size:var(--dsh-content-font-size-secondary,13px);line-height:calc(20px + var(--dsh-content-font-delta-secondary,0px));white-space:nowrap}",
+  ".cmc-sep{flex:none;width:2px;height:2px;border-radius:1px;background:var(--dsw-alias-label-caption);margin:0 8px}",
+  ".cmc-summary{min-width:0;color:var(--dsw-alias-label-tertiary);font-size:var(--dsh-content-font-size-secondary,13px);line-height:calc(20px + var(--dsh-content-font-delta-secondary,0px));white-space:nowrap;overflow:hidden;text-overflow:ellipsis}"
+].join("");
 
 const NS = "compaction-micro";
 

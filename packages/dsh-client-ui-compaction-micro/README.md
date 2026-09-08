@@ -24,14 +24,16 @@ visualization stay separate.
 
 ## Layout
 
-- `src/client.js` — source mirror of the browser bundle.
-- `lib/client.js` — the actual browser bundle (client-modules format).
+- `src/client.js` — the source of the browser bundle (logic + CSS rules).
+- `lib/client.js` — the actual browser bundle (client-modules format),
+  **generated** from `src/client.js` by `npm run build` (`scripts/build.mjs`).
 - `lib/index.js` — host half (no host-side behavior; makes the row appear in
   the host composition).
 - `cordis.patch.yml` — inserts the plugin row into the web profile roster.
 
-Keep `src/client.js` and `lib/client.js` in sync; the browser loads
-`lib/client.js`.
+Edit `src/client.js` and run `npm run build` to regenerate `lib/client.js`;
+the browser loads `lib/client.js`. `npm run check` verifies the two are in
+sync (fails when `lib` is stale).
 
 ## Wiring
 

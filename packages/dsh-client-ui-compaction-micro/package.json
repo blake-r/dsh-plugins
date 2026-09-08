@@ -12,11 +12,13 @@
   "files": [
     "lib",
     "src",
+    "scripts",
     "cordis.patch.yml",
     "README.md"
   ],
   "scripts": {
-    "check": "node --check lib/index.js && node --check lib/client.js"
+    "build": "node scripts/build.mjs",
+    "check": "node --check lib/index.js && node --check lib/client.js && node scripts/build.mjs --check"
   },
   "dsh": {
     "bundle": {
