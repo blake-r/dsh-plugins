@@ -1,9 +1,17 @@
 // Compaction-micro UI marker — client half (source mirror of lib/client.js).
 //
 // Renders a transcript marker at every dsh-compaction-micro compaction point:
-// "Context compacted — N history items (~M tokens)". The fact is read from the
+// "Micro-compaction — N history items (~M tokens)". The fact is read from the
 // plugin's `compaction/summary` events (shadowedSeqs / shadowedTokenCount),
 // which are emitted right before each replacement commit.
+//
+// Consecutive micro compactions are collapsed into ONE marker: a run continues
+// while the stream between summaries carries only the plugin's own replacement
+// messages (user/message with source.plugin === "dsh-compaction-micro") — the
+// transcript-adjacent case (several spans folded in one turn/end). Any real
+// content (user/assistant/tool events, injected frames) breaks the run and
+// starts a new marker. The merged marker sums items and tokens across the run;
+// the seq range is deliberately not shown.
 //
 // Why a separate definition instead of reusing the built-in compaction marker:
 // the built-in `compactionDefinition` (dsh-client-ui-chat) is hardwired to the
@@ -26,69 +34,124 @@
 const NS = "compaction-micro";
 
 const en = {
-  "compaction.title": "Context compacted",
+  "compaction.title": "Micro-compaction",
   "compaction.completed": "{items} history items (~{tokens} tokens)",
-  "compaction.range": "seqs {start}\u2013{end}",
   "compaction.unavailable": "Compaction summary unavailable"
 };
 
 const ru = {
-  "compaction.title": "Контекст сжат",
+  "compaction.title": "Микро-сжатие",
   "compaction.completed": "сжато {items} элементов (~{tokens} токенов)",
-  "compaction.range": "seqs {start}\u2013{end}",
   "compaction.unavailable": "Сводка сжатия недоступна"
 };
 
+// ── consecutive-run merge state ─────────────────────────────────────────────
+// The match function is shared across sessions (one ConversationEventRegistry)
+// and session events carry no session id, so the run state lives at module
+// level. The seq-monotonicity guard resets it on session switch or window
+// rebuild: seqs strictly increase within one session's stream, so a
+// non-increasing event means a different session and must not continue the
+// previous run. (Chunk events without a surface seq are ignored by the guard.)
+let lastEventSeq = -1;
+let lastMicroKind = "other"; // "summary" | "replacement" | "other"
+let currentRunId = null;
+
 /**
- * Match one micro-compaction summary event. Only `compaction/summary` events
- * that carry no `compactionId` are claimed — the standard provider always
- * correlates its summaries by compactionId, so those belong to the built-in
- * marker and are never claimed here. Each event gets its own context keyed by
- * its seq, so every compaction produces its own transcript marker.
+ * Match one micro-compaction summary event and group consecutive ones into a
+ * single run. Only `compaction/summary` events that carry no `compactionId`
+ * are claimed — the standard provider always correlates its summaries by
+ * compactionId, so those belong to the built-in marker and are never claimed
+ * here. A summary continues the current run (role "update", same id) when the
+ * previous micro-relevant event was another summary or the plugin's own
+ * replacement message; anything else (real content, injected frames, a
+ * different session) starts a new run (role "start", id "micro-<seq>").
  * @param event - a session event.
  * @returns a match record, or null when the event is not a micro summary.
  */
 const microSummaryMatch = (event) => {
-  if (event.type !== "compaction/summary") return null;
+  if (Number.isSafeInteger(event.seq)) {
+    if (event.seq <= lastEventSeq) {
+      lastMicroKind = "other";
+      currentRunId = null;
+    }
+    lastEventSeq = event.seq;
+  }
+  if (event.type === "user/message") {
+    // For user/message events the event data IS the message (dsh-session
+    // projectMessage: `case "user/message": return event.data`), so the
+    // plugin source sits at data.source, not data.message.source.
+    const source = event.data && event.data.source;
+    lastMicroKind = source !== null && source !== undefined && source.kind === "plugin" && source.plugin === "dsh-compaction-micro"
+      ? "replacement"
+      : "other";
+    return null;
+  }
+  if (event.type !== "compaction/summary") {
+    lastMicroKind = "other";
+    return null;
+  }
   const data = event.data;
-  if (data === null || typeof data !== "object") return null;
-  if (typeof data.compactionId === "string") return null;
-  return { id: "micro-" + event.seq, role: "update" };
+  if (data === null || typeof data !== "object") {
+    lastMicroKind = "other";
+    return null;
+  }
+  if (typeof data.compactionId === "string") {
+    lastMicroKind = "other";
+    return null;
+  }
+  if ((lastMicroKind === "summary" || lastMicroKind === "replacement") && currentRunId !== null) {
+    lastMicroKind = "summary";
+    return { id: currentRunId, role: "update" };
+  }
+  currentRunId = "micro-" + event.seq;
+  lastMicroKind = "summary";
+  return { id: currentRunId, role: "start" };
 };
 
 /**
- * Build the chat-view node for one micro compaction marker.
- * @param context - the assembled business Context (its only match is the summary).
+ * Build the chat-view node for one micro compaction marker (one run of
+ * consecutive summaries). Items and tokens are summed across every summary in
+ * the run; the seq range is deliberately not shown.
+ * @param context - the assembled business Context (its matches are the run's summaries).
  * @returns a chat-target node, or null when there is no summary to render.
  */
 const microCompactionNode = (context) => {
-  const summary = context.matches.find((match) => match.event.type === "compaction/summary");
-  if (summary === undefined) return null;
-  const data = summary.event.data;
-  const shadowedItemCount = Array.isArray(data.shadowedSeqs) && data.shadowedSeqs.every((seq) => Number.isSafeInteger(seq) && seq >= 0)
-    ? data.shadowedSeqs.length
-    : null;
-  const shadowedTokenCount = Number.isSafeInteger(data.shadowedTokenCount) && data.shadowedTokenCount >= 0
-    ? data.shadowedTokenCount
-    : null;
-  const range = data.shadowedRange;
-  const seqRange = range !== null && typeof range === "object" && Number.isSafeInteger(range.start) && Number.isSafeInteger(range.end)
-    ? { start: range.start, end: range.end }
-    : null;
+  const summaries = context.matches.filter((match) => match.event.type === "compaction/summary");
+  if (summaries.length === 0) return null;
+  let shadowedItemCount = 0;
+  let shadowedTokenCount = 0;
+  let valid = true;
+  for (const match of summaries) {
+    const data = match.event.data;
+    if (Array.isArray(data.shadowedSeqs) && data.shadowedSeqs.every((seq) => Number.isSafeInteger(seq) && seq >= 0)) {
+      shadowedItemCount += data.shadowedSeqs.length;
+    } else {
+      valid = false;
+    }
+    if (Number.isSafeInteger(data.shadowedTokenCount) && data.shadowedTokenCount >= 0) {
+      shadowedTokenCount += data.shadowedTokenCount;
+    } else {
+      valid = false;
+    }
+  }
+  if (!valid) {
+    shadowedItemCount = null;
+    shadowedTokenCount = null;
+  }
+  const first = summaries[0];
   return {
     key: context.key,
     kind: "micro-compaction",
     id: context.id,
     target: "chat",
-    anchorSeq: summary.event.seq,
+    anchorSeq: first.event.seq,
     location: context.start?.location ?? context.matches[0]?.location ?? { kind: "unresolved" },
     visibility: "visible",
     data: {
-      seq: summary.event.seq,
-      time: summary.event.time,
+      seq: first.event.seq,
+      time: first.event.time,
       shadowedItemCount,
-      shadowedTokenCount,
-      seqRange
+      shadowedTokenCount
     }
   };
 };
@@ -113,12 +176,10 @@ const MarkerView = ({ node, t }) => {
   const summary = data.shadowedItemCount !== null && data.shadowedTokenCount !== null
     ? t("compaction.completed", { items: data.shadowedItemCount, tokens: data.shadowedTokenCount })
     : t("compaction.unavailable");
-  const range = data.seqRange !== null ? t("compaction.range", { start: data.seqRange.start, end: data.seqRange.end }) : null;
   return React.createElement("div", { className: "cmc-row" },
     React.createElement("span", { className: "cmc-title" }, t("compaction.title")),
     React.createElement("span", { className: "cmc-sep", "aria-hidden": true }),
-    React.createElement("span", { className: "cmc-summary" }, summary),
-    range === null ? null : React.createElement("span", { className: "cmc-range" }, range)
+    React.createElement("span", { className: "cmc-summary" }, summary)
   );
 };
 

@@ -1,7 +1,9 @@
 # dsh-client-ui-compaction-micro
 
 DSH Web UI plugin: renders a transcript marker at every `dsh-compaction-micro`
-compaction point — *"Context compacted — N history items (~M tokens)"*.
+compaction point — *"Micro-compaction — N history items (~M tokens)"*. The seq
+range is not shown; consecutive micro compactions are collapsed into one
+marker that sums items and tokens across the run.
 
 ## What it does
 
