@@ -8,11 +8,13 @@ recently-updated sessions. Clicking an item opens that session.
 ## Archive
 
 Each dropdown row carries an archive action: the `IconArchiveOutline20` glyph
-from `@deepseek-ai/dsh-client-ui-primitives`, shown to the right of the title
-and revealed on row hover (or keyboard focus). Clicking it archives the session
-through the `workspaces` service (`archiveSession`), closes the dropdown, and
-the row disappears. Archived sessions are excluded from the dropdown and from
-the badge counters.
+from `@deepseek-ai/dsh-client-ui-primitives`, sharing a single trailing slot
+with the current-session check mark (`.rss-itemTrailing`). At rest the slot
+shows the check (for the current session) or nothing; hovering the row (or
+focusing the button via keyboard) swaps it for the archive glyph. Clicking it
+archives the session through the `workspaces` service (`archiveSession`),
+closes the dropdown, and the row disappears. Archived sessions are excluded
+from the dropdown and from the badge counters.
 
 ## Status dots
 
@@ -51,7 +53,8 @@ check glyph (`IconCheckOutline16`) marks the row — mirroring dsh's own Menu
 selected-item pattern. The color is applied to the row's main button
 (`.rss-current .rss-itemMain`) so it wins over the button's default label
 color; the check is rendered only for the row whose id equals the active
-`sessionId`.
+`sessionId`, and it occupies the same trailing slot as the archive action (see
+above), fading out on row hover so the archive glyph can take its place.
 
 ## Layout
 

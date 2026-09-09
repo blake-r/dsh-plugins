@@ -41,14 +41,16 @@ window.__ModuleLoader__.load({
 			".rss-item{display:flex;align-items:center;width:100%;border-radius:6px}",
 			".rss-item:hover{background:var(--dsw-alias-interactive-bg-hover)}",
 			".rss-itemMain{display:flex;align-items:center;gap:8px;flex:1;min-width:0;text-align:left;padding:6px 10px;border:none;background:transparent;color:var(--dsw-alias-label-primary);border-radius:6px;cursor:pointer;font-size:13px;line-height:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
-			".rss-itemArchive{flex:none;display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;margin-right:6px;padding:0;border:none;background:transparent;color:var(--dsw-alias-label-tertiary);border-radius:6px;cursor:pointer;opacity:0}",
+			".rss-itemTrailing{position:relative;flex:none;width:20px;height:20px;margin-right:6px}",
+			".rss-itemArchive{position:absolute;inset:0;display:inline-flex;align-items:center;justify-content:flex-end;padding:0;border:none;background:transparent;color:var(--dsw-alias-label-tertiary);border-radius:6px;cursor:pointer;opacity:0;transition:opacity .1s}",
 			".rss-item:hover .rss-itemArchive,.rss-itemArchive:focus-visible{opacity:1}",
 			".rss-itemArchive:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}",
 			".rss-itemCwd{flex:none;color:var(--dsw-alias-label-tertiary);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:110px}",
 			".rss-itemCwdSep{flex:none;color:var(--dsw-alias-label-tertiary);font-size:12px}",
 			".rss-itemLabel{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}",
 			".rss-current .rss-itemMain{color:var(--dsw-alias-state-business-primary);font-weight:500}",
-			".rss-currentCheck{flex:none;color:var(--dsw-alias-state-business-primary)}",
+			".rss-currentCheck{position:absolute;inset:0;display:inline-flex;align-items:center;justify-content:flex-end;color:var(--dsw-alias-state-business-primary);transition:opacity .1s}",
+			".rss-item:hover .rss-currentCheck{opacity:0}",
 			".rss-empty{padding:8px 10px;color:var(--dsw-alias-label-tertiary);font-size:13px}"
 		].join("");
 		const tagId = "@blake-r/dsh-client-ui-recent-sessions-switcher/rss.css";
@@ -239,22 +241,24 @@ window.__ModuleLoader__.load({
 											react.createElement(StatusIndicator, { status: st }),
 											item.cwd ? react.createElement("span", { className: "rss-itemCwd" }, workspaceTitleOf(item.cwd)) : null,
 											item.cwd ? react.createElement("span", { className: "rss-itemCwdSep" }, "/") : null,
-											react.createElement("span", { className: "rss-itemLabel" }, item.title),
-											item.id === sessionId ? react.createElement(primitives.IconCheckOutline16, { className: "rss-currentCheck", size: 16 }) : null
+											react.createElement("span", { className: "rss-itemLabel" }, item.title)
 										),
-										react.createElement("button", {
-											type: "button",
-											className: "rss-itemArchive",
-											"aria-label": "Archive " + item.title,
-											title: "Archive session",
-											onClick: (e) => {
-												setOpen(false);
-												workspaces.archiveSession(item.id).catch((reason) => {
-													console.warn("session archive rejected:", reason);
-												});
+										react.createElement("div", { className: "rss-itemTrailing" },
+											item.id === sessionId ? react.createElement("span", { className: "rss-currentCheck" }, react.createElement(primitives.IconCheckOutline16, { size: 16 })) : null,
+											react.createElement("button", {
+												type: "button",
+												className: "rss-itemArchive",
+												"aria-label": "Archive " + item.title,
+												title: "Archive session",
+												onClick: (e) => {
+													setOpen(false);
+													workspaces.archiveSession(item.id).catch((reason) => {
+														console.warn("session archive rejected:", reason);
+													});
+												},
 											},
-										},
-											react.createElement(primitives.IconArchiveOutline20, { size: 16 })
+												react.createElement(primitives.IconArchiveOutline20, { size: 16 })
+											)
 										)
 									);
 								})

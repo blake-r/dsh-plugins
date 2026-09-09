@@ -26,7 +26,9 @@
 // while the current session was still running, cleared on refocus.
 //
 // Each dropdown row carries an archive action (the primitives archive glyph)
-// that appears on hover and calls the `workspaces` service's archiveSession.
+// that shares the trailing slot with the current-session check mark: the
+// check shows at rest, and hovering the row swaps it for the archive glyph.
+// Clicking the glyph calls the `workspaces` service's archiveSession.
 // Archived sessions are excluded from the dropdown and the badge.
 
 import { IconArchiveOutline20, IconCheckOutline16 } from "@deepseek-ai/dsh-client-ui-primitives";
@@ -199,22 +201,24 @@ export function apply(ctx) {
                     React.createElement(StatusIndicator, { status: st }),
                     item.cwd ? React.createElement("span", { className: "rss-itemCwd" }, workspaceTitleOf(item.cwd)) : null,
                     item.cwd ? React.createElement("span", { className: "rss-itemCwdSep" }, "/") : null,
-                    React.createElement("span", { className: "rss-itemLabel" }, item.title),
-                    item.id === sessionId ? React.createElement(IconCheckOutline16, { className: "rss-currentCheck", size: 16 }) : null
+                    React.createElement("span", { className: "rss-itemLabel" }, item.title)
                   ),
-                  React.createElement("button", {
-                    type: "button",
-                    className: "rss-itemArchive",
-                    "aria-label": "Archive " + item.title,
-                    title: "Archive session",
-                    onClick: (e) => {
-                      setOpen(false);
-                      workspaces.archiveSession(item.id).catch((reason) => {
-                        console.warn("session archive rejected:", reason);
-                      });
+                  React.createElement("div", { className: "rss-itemTrailing" },
+                    item.id === sessionId ? React.createElement("span", { className: "rss-currentCheck" }, React.createElement(IconCheckOutline16, { size: 16 })) : null,
+                    React.createElement("button", {
+                      type: "button",
+                      className: "rss-itemArchive",
+                      "aria-label": "Archive " + item.title,
+                      title: "Archive session",
+                      onClick: (e) => {
+                        setOpen(false);
+                        workspaces.archiveSession(item.id).catch((reason) => {
+                          console.warn("session archive rejected:", reason);
+                        });
+                      },
                     },
-                  },
-                    React.createElement(IconArchiveOutline20, { size: 16 })
+                      React.createElement(IconArchiveOutline20, { size: 16 })
+                    )
                   )
                 );
               })
