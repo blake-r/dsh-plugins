@@ -11,49 +11,61 @@ importers:
   packages/dsh-assembly-rewrite:
     dependencies:
       '@deepseek-ai/cordis':
-        specifier: ^4.0.1
+        specifier: ^4.0.2
         version: 4.0.2
 
   packages/dsh-assembly-tools-prompt-strip:
     dependencies:
       '@deepseek-ai/cordis':
-        specifier: ^4.0.1
+        specifier: ^4.0.2
+        version: 4.0.2
+
+  packages/dsh-client-ui-compaction-micro:
+    dependencies:
+      '@deepseek-ai/cordis':
+        specifier: ^4.0.2
+        version: 4.0.2
+
+  packages/dsh-client-ui-recent-sessions-switcher:
+    dependencies:
+      '@deepseek-ai/cordis':
+        specifier: ^4.0.2
         version: 4.0.2
 
   packages/dsh-command-from-prompt:
     dependencies:
       '@deepseek-ai/cordis':
-        specifier: ^4.0.1
+        specifier: ^4.0.2
         version: 4.0.2
 
   packages/dsh-compaction-micro:
     dependencies:
       '@deepseek-ai/cordis':
-        specifier: ^4.0.1
+        specifier: ^4.0.2
         version: 4.0.2
 
   packages/dsh-provider-websearch-lightpanda:
     dependencies:
       '@deepseek-ai/cordis':
-        specifier: ^4.0.1
+        specifier: ^4.0.2
         version: 4.0.2
 
   packages/dsh-skill-from-tools:
     dependencies:
       '@deepseek-ai/cordis':
-        specifier: ^4.0.1
+        specifier: ^4.0.2
         version: 4.0.2
 
   packages/dsh-tool-filter-root-find:
     dependencies:
       '@deepseek-ai/cordis':
-        specifier: ^4.0.1
+        specifier: ^4.0.2
         version: 4.0.2
 
   packages/dsh-tool-trajectory-recall:
     dependencies:
       '@deepseek-ai/cordis':
-        specifier: ^4.0.1
+        specifier: ^4.0.2
         version: 4.0.2
 
 packages:
