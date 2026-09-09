@@ -47,7 +47,8 @@ window.__ModuleLoader__.load({
 			".rss-itemCwd{flex:none;color:var(--dsw-alias-label-tertiary);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:110px}",
 			".rss-itemCwdSep{flex:none;color:var(--dsw-alias-label-tertiary);font-size:12px}",
 			".rss-itemLabel{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}",
-			".rss-current{color:var(--dsw-alias-state-business-primary);font-weight:500}",
+			".rss-current .rss-itemMain{color:var(--dsw-alias-state-business-primary);font-weight:500}",
+			".rss-currentCheck{flex:none;color:var(--dsw-alias-state-business-primary)}",
 			".rss-empty{padding:8px 10px;color:var(--dsw-alias-label-tertiary);font-size:13px}"
 		].join("");
 		const tagId = "@blake-r/dsh-client-ui-recent-sessions-switcher/rss.css";
@@ -110,9 +111,7 @@ window.__ModuleLoader__.load({
 			const slots = ctx.slots;
 			const sessions = ctx.sessions;
 			const workspaces = ctx.workspaces;
-			slots.inject("conversation.session.header.utilities", () => slots.register(
-				{ name: "conversation.session.header.utilities", id: "recent-sessions-switcher", order: -10 },
-				(props) => {
+			const renderSwitcher = (props) => {
 					const { useSessions, useSessionPendingInteraction, useWorkspaces, sessionId } = props;
 					const list = useSessions((s) => s);
 					const pendingInteractions = useSessionPendingInteraction((s) => s);
@@ -240,7 +239,8 @@ window.__ModuleLoader__.load({
 											react.createElement(StatusIndicator, { status: st }),
 											item.cwd ? react.createElement("span", { className: "rss-itemCwd" }, workspaceTitleOf(item.cwd)) : null,
 											item.cwd ? react.createElement("span", { className: "rss-itemCwdSep" }, "/") : null,
-											react.createElement("span", { className: "rss-itemLabel" }, item.title)
+											react.createElement("span", { className: "rss-itemLabel" }, item.title),
+											item.id === sessionId ? react.createElement(primitives.IconCheckOutline16, { className: "rss-currentCheck", size: 16 }) : null
 										),
 										react.createElement("button", {
 											type: "button",
@@ -260,7 +260,14 @@ window.__ModuleLoader__.load({
 								})
 						)
 					);
-				}
+			};
+			slots.inject("conversation.session.header.utilities", () => slots.register(
+				{ name: "conversation.session.header.utilities", id: "recent-sessions-switcher", order: -10 },
+				renderSwitcher
+			));
+			slots.inject("conversation.hero.utilities", () => slots.register(
+				{ name: "conversation.hero.utilities", id: "recent-sessions-switcher", order: -10 },
+				renderSwitcher
 			));
 		}
 

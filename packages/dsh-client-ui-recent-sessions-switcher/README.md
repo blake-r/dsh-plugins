@@ -42,6 +42,17 @@ agent awaits input (orange outranks green). The highlight fills the whole
 pill: the badge background becomes the state color (success green / warn
 orange) with white text, and the neutral border is dropped.
 
+## Current session
+
+The dropdown row for the currently-selected session is highlighted: its label
+and status text render in the business state color
+(`--dsw-alias-state-business-primary`) with a medium weight, and a trailing
+check glyph (`IconCheckOutline16`) marks the row — mirroring dsh's own Menu
+selected-item pattern. The color is applied to the row's main button
+(`.rss-current .rss-itemMain`) so it wins over the button's default label
+color; the check is rendered only for the row whose id equals the active
+`sessionId`.
+
 ## Layout
 
 - `lib/index.js` — host half (empty `apply`; the plugin is pure UI, the host

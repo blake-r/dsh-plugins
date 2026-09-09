@@ -10,7 +10,9 @@
 // (a session-scoped list slot) and renders a compact switcher: the current
 // session's workspace basename + title, a status dot (running / idle / unread),
 // and a dropdown of the 8 most recently-updated sessions. Clicking an item
-// opens that session via the `sessions` service.
+// opens that session via the `sessions` service. The currently-selected
+// session is highlighted in the dropdown (business-colored label + trailing
+// check icon, mirroring dsh's own Menu selected-item pattern).
 //
 // Status model mirrors dsh's StateDot:
 //   - running   -> "ongoing"  (animated matrix, DeepSeek brand blue #5686fe)
@@ -27,7 +29,7 @@
 // that appears on hover and calls the `workspaces` service's archiveSession.
 // Archived sessions are excluded from the dropdown and the badge.
 
-import { IconArchiveOutline20 } from "@deepseek-ai/dsh-client-ui-primitives";
+import { IconArchiveOutline20, IconCheckOutline16 } from "@deepseek-ai/dsh-client-ui-primitives";
 
 const workspaceTitleOf = (path) => {
   if (!path) return "";
@@ -73,9 +75,7 @@ export function apply(ctx) {
   const slots = ctx.slots;
   const sessions = ctx.sessions;
   const workspaces = ctx.workspaces;
-  slots.inject("conversation.session.header.utilities", () => slots.register(
-    { name: "conversation.session.header.utilities", id: "recent-sessions-switcher", order: -10 },
-    (props) => {
+  const renderSwitcher = (props) => {
       const { useSessions, useSessionPendingInteraction, useWorkspaces, sessionId } = props;
       const list = useSessions((s) => s);
       const pendingInteractions = useSessionPendingInteraction((s) => s);
@@ -199,7 +199,8 @@ export function apply(ctx) {
                     React.createElement(StatusIndicator, { status: st }),
                     item.cwd ? React.createElement("span", { className: "rss-itemCwd" }, workspaceTitleOf(item.cwd)) : null,
                     item.cwd ? React.createElement("span", { className: "rss-itemCwdSep" }, "/") : null,
-                    React.createElement("span", { className: "rss-itemLabel" }, item.title)
+                    React.createElement("span", { className: "rss-itemLabel" }, item.title),
+                    item.id === sessionId ? React.createElement(IconCheckOutline16, { className: "rss-currentCheck", size: 16 }) : null
                   ),
                   React.createElement("button", {
                     type: "button",
@@ -220,5 +221,12 @@ export function apply(ctx) {
         )
       );
     }
+  slots.inject("conversation.session.header.utilities", () => slots.register(
+    { name: "conversation.session.header.utilities", id: "recent-sessions-switcher", order: -10 },
+    renderSwitcher
+  ));
+  slots.inject("conversation.hero.utilities", () => slots.register(
+    { name: "conversation.hero.utilities", id: "recent-sessions-switcher", order: -10 },
+    renderSwitcher
   ));
 }
