@@ -5,6 +5,15 @@ conversation header. It shows the current session's workspace basename and
 title, a status dot (running / idle / unread), and a dropdown of the 8 most
 recently-updated sessions. Clicking an item opens that session.
 
+## Archive
+
+Each dropdown row carries an archive action: the `IconArchiveOutline20` glyph
+from `@deepseek-ai/dsh-client-ui-primitives`, shown to the right of the title
+and revealed on row hover (or keyboard focus). Clicking it archives the session
+through the `workspaces` service (`archiveSession`), closes the dropdown, and
+the row disappears. Archived sessions are excluded from the dropdown and from
+the badge counters.
+
 ## Status dots
 
 Mirrors dsh's `StateDot`:
@@ -48,5 +57,6 @@ orange) with white text, and the neutral border is dropped.
 dsh plugin --profile web add link:<repo>/packages/dsh-client-ui-recent-sessions-switcher
 ```
 
-The package declares `dsh.client` (platform `web`, injects `slots` and
-`sessions`), so `dsh-client-modules` discovers the browser half automatically.
+The package declares `dsh.client` (platform `web`, injects `slots`, `sessions`
+and `workspaces`), so `dsh-client-modules` discovers the browser half
+automatically.

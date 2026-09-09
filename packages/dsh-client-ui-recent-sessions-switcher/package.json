@@ -26,7 +26,8 @@
       "platform": "web",
       "inject": [
         "slots",
-        "sessions"
+        "sessions",
+        "workspaces"
       ]
     }
   },

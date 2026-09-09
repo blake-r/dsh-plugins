@@ -2,9 +2,9 @@
 //
 // This file is the readable source of the browser bundle. The shipped
 // lib/client.js is the same code wrapped in the client-modules bundle format
-// (window.__ModuleLoader__.load({ id, factory })) with `react` required from
-// the platform seed. Keep the two in sync; lib/client.js is what the browser
-// actually loads.
+// (window.__ModuleLoader__.load({ id, factory })) with `react` and
+// `@deepseek-ai/dsh-client-ui-primitives` required from the platform seed.
+// Keep the two in sync; lib/client.js is what the browser actually loads.
 //
 // The plugin registers into the `conversation.session.header.utilities` slot
 // (a session-scoped list slot) and renders a compact switcher: the current
@@ -22,6 +22,12 @@
 // unfocused would otherwise render as "idle, all read". We force the green
 // ("unread") dot with a CSS class: armed the moment the window loses focus
 // while the current session was still running, cleared on refocus.
+//
+// Each dropdown row carries an archive action (the primitives archive glyph)
+// that appears on hover and calls the `workspaces` service's archiveSession.
+// Archived sessions are excluded from the dropdown and the badge.
+
+import { IconArchiveOutline20 } from "@deepseek-ai/dsh-client-ui-primitives";
 
 const workspaceTitleOf = (path) => {
   if (!path) return "";
@@ -61,17 +67,19 @@ const StatusIndicator = ({ status }) => {
   );
 };
 
-export const inject = ["slots", "sessions"];
+export const inject = ["slots", "sessions", "workspaces"];
 
 export function apply(ctx) {
   const slots = ctx.slots;
   const sessions = ctx.sessions;
+  const workspaces = ctx.workspaces;
   slots.inject("conversation.session.header.utilities", () => slots.register(
     { name: "conversation.session.header.utilities", id: "recent-sessions-switcher", order: -10 },
     (props) => {
-      const { useSessions, useSessionPendingInteraction, sessionId } = props;
+      const { useSessions, useSessionPendingInteraction, useWorkspaces, sessionId } = props;
       const list = useSessions((s) => s);
       const pendingInteractions = useSessionPendingInteraction((s) => s);
+      const archivedSessionIds = useWorkspaces((s) => s.archivedSessionIds);
       const [open, setOpen] = React.useState(false);
       const [forceUnread, setForceUnread] = React.useState(false);
       const rootRef = React.useRef(null);
@@ -104,10 +112,11 @@ export function apply(ctx) {
 
       const recent = React.useMemo(() => {
         if (list.phase !== "ready") return [];
+        const archived = new Set(archivedSessionIds);
         const items = [];
         for (const id of list.ids) {
           const s = list.byId[id];
-          if (s === undefined || s.blank || s.origin === "subagent") continue;
+          if (s === undefined || s.blank || s.origin === "subagent" || archived.has(id)) continue;
           items.push({ id, title: s.displayTitle, cwd: s.cwd, updatedAt: s.updatedAt, running: s.running === true, completed: s.completed === true, pending: visiblePendingKind(pendingInteractions.get(id)?.kind) });
         }
         items.sort((a, b) => b.updatedAt - a.updatedAt);
@@ -118,7 +127,7 @@ export function apply(ctx) {
         const priority = items.filter((i) => i.running || i.completed || i.pending);
         const rest = items.filter((i) => !i.running && !i.completed && !i.pending);
         return priority.concat(rest).slice(0, 8);
-      }, [list, pendingInteractions]);
+      }, [list, pendingInteractions, archivedSessionIds]);
 
       const current = list.byId[sessionId];
       currentRunningRef.current = current ? current.running === true : false;
@@ -132,10 +141,11 @@ export function apply(ctx) {
       // input (outranks green); green when any idle agent has unread output.
       const badge = React.useMemo(() => {
         if (list.phase !== "ready") return { count: 0, running: 0, input: 0, unread: 0 };
+        const archived = new Set(archivedSessionIds);
         let running = 0, input = 0, unread = 0;
         for (const id of list.ids) {
           const s = list.byId[id];
-          if (s === undefined || s.blank || s.origin === "subagent") continue;
+          if (s === undefined || s.blank || s.origin === "subagent" || archived.has(id)) continue;
           // One session = at most one active agent. An agent paused on a
           // question/approval keeps the loop phase "running", so it must be
           // counted under `input` only — counting it as running too would
@@ -146,7 +156,7 @@ export function apply(ctx) {
           if (s.completed === true) unread++;
         }
         return { count: running + input, running, input, unread };
-      }, [list, pendingInteractions]);
+      }, [list, pendingInteractions, archivedSessionIds]);
       const badgeClass = "rss-badge" + (badge.input > 0 ? " rss-badgeWarn" : badge.unread > 0 ? " rss-badgeUnread" : "");
       const badgeTitle = [
         badge.running > 0 ? badge.running + " working" : "",
@@ -175,18 +185,36 @@ export function apply(ctx) {
             ? React.createElement("div", { className: "rss-empty" }, "No sessions")
             : recent.map((item) => {
                 const st = statusOf(item);
-                return React.createElement("button", {
+                return React.createElement("div", {
                   key: item.id,
-                  type: "button",
                   role: "option",
                   className: "rss-item" + (item.id === sessionId ? " rss-current" : ""),
-                  onClick: () => { sessions.open(item.id); setOpen(false); },
-                  title: st.label,
                 },
-                  React.createElement(StatusIndicator, { status: st }),
-                  item.cwd ? React.createElement("span", { className: "rss-itemCwd" }, workspaceTitleOf(item.cwd)) : null,
-                  item.cwd ? React.createElement("span", { className: "rss-itemCwdSep" }, "/") : null,
-                  React.createElement("span", { className: "rss-itemLabel" }, item.title)
+                  React.createElement("button", {
+                    type: "button",
+                    className: "rss-itemMain",
+                    onClick: () => { sessions.open(item.id); setOpen(false); },
+                    title: st.label,
+                  },
+                    React.createElement(StatusIndicator, { status: st }),
+                    item.cwd ? React.createElement("span", { className: "rss-itemCwd" }, workspaceTitleOf(item.cwd)) : null,
+                    item.cwd ? React.createElement("span", { className: "rss-itemCwdSep" }, "/") : null,
+                    React.createElement("span", { className: "rss-itemLabel" }, item.title)
+                  ),
+                  React.createElement("button", {
+                    type: "button",
+                    className: "rss-itemArchive",
+                    "aria-label": "Archive " + item.title,
+                    title: "Archive session",
+                    onClick: (e) => {
+                      setOpen(false);
+                      workspaces.archiveSession(item.id).catch((reason) => {
+                        console.warn("session archive rejected:", reason);
+                      });
+                    },
+                  },
+                    React.createElement(IconArchiveOutline20, { size: 16 })
+                  )
                 );
               })
         )
