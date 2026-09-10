@@ -229,8 +229,4 @@ export function apply(ctx) {
     { name: "conversation.session.header.utilities", id: "recent-sessions-switcher", order: -10 },
     renderSwitcher
   ));
-  slots.inject("conversation.hero.utilities", () => slots.register(
-    { name: "conversation.hero.utilities", id: "recent-sessions-switcher", order: -10 },
-    renderSwitcher
-  ));
 }
