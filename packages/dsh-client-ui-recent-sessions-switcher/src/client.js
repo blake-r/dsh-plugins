@@ -46,10 +46,12 @@ const visiblePendingKind = (kind) => {
   return undefined;
 };
 
-// The most recently-updated session that stays visible once `excludeId` is
-// archived. Used to auto-switch the switcher when the current session is
-// archived (dsh clears the selection; we land on the freshest remaining one).
-const freshestSessionId = (list, archived, excludeId) => {
+// The most recently-updated visible session satisfying `predicate` (every
+// visible session when omitted), excluding `excludeId`. Used to auto-switch
+// the switcher when the current session is archived (dsh clears the
+// selection; we land on the freshest remaining one, preferring the same
+// working directory).
+const freshestVisibleSessionId = (list, archived, excludeId, predicate) => {
   if (list.phase !== "ready") return undefined;
   const archivedSet = new Set(archived);
   let bestId;
@@ -58,6 +60,7 @@ const freshestSessionId = (list, archived, excludeId) => {
     if (id === excludeId) continue;
     const s = list.byId[id];
     if (s === undefined || s.blank || s.origin === "subagent" || archivedSet.has(id)) continue;
+    if (predicate !== undefined && !predicate(s)) continue;
     const t = s.updatedAt;
     if (t > bestTime) { bestTime = t; bestId = id; }
   }
@@ -232,11 +235,19 @@ export function apply(ctx) {
                         setOpen(false);
                         workspaces.archiveSession(item.id).then(() => {
                           // Archiving the current session leaves the switcher
-                          // without a current session (dsh clears the selection);
-                          // switch automatically to the freshest remaining one.
+                          // without a current session (dsh clears the selection).
+                          // Switch to the freshest remaining session, preferring
+                          // a session in the same working directory; when none
+                          // exists (or the archived session had no cwd), fall
+                          // back to the freshest one overall.
                           if (item.id === sessionId) {
-                            const freshest = freshestSessionId(list, archivedSessionIds, item.id);
-                            if (freshest !== undefined) sessions.open(freshest);
+                            const archivedCwd = item.cwd;
+                            let target = undefined;
+                            if (archivedCwd) {
+                              target = freshestVisibleSessionId(list, archivedSessionIds, item.id, (s) => s.cwd === archivedCwd);
+                            }
+                            if (target === undefined) target = freshestVisibleSessionId(list, archivedSessionIds, item.id);
+                            if (target !== undefined) sessions.open(target);
                           }
                         }).catch((reason) => {
                           console.warn("session archive rejected:", reason);

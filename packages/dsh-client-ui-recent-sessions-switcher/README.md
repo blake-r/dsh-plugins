@@ -16,12 +16,15 @@ archives the session through the `workspaces` service (`archiveSession`),
 closes the dropdown, and the row disappears. Archived sessions are excluded
 from the dropdown and from the badge counters.
 
-Archiving the **currently-selected** session auto-switches the switcher to the
-freshest remaining session: dsh clears the selection when the current session
-is archived, so once the archive resolves the switcher opens the most
-recently-updated session that is still visible (non-blank, non-subagent,
-non-archived). When no other session remains, the cleared/empty state is left
-as-is.
+Archiving the **currently-selected** session auto-switches the switcher to
+another session: dsh clears the selection when the current session is
+archived, so once the archive resolves the switcher prefers the most
+recently-updated session that stays in the **same working directory** as the
+archived one (non-blank, non-subagent, non-archived). When no such session
+exists — or the archived session had no cwd — it falls back to the most
+recently-updated session overall. When no other session remains, the
+cleared/empty state is left as-is. Archiving a non-current session never
+changes the selection.
 
 ## Status dots
 
