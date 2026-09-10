@@ -75,6 +75,24 @@ window.__ModuleLoader__.load({
 			return undefined;
 		};
 
+		// The most recently-updated session that stays visible once `excludeId` is
+		// archived. Used to auto-switch the switcher when the current session is
+		// archived (dsh clears the selection; we land on the freshest remaining one).
+		const freshestSessionId = (list, archived, excludeId) => {
+			if (list.phase !== "ready") return undefined;
+			const archivedSet = new Set(archived);
+			let bestId;
+			let bestTime = Number.NEGATIVE_INFINITY;
+			for (const id of list.ids) {
+				if (id === excludeId) continue;
+				const s = list.byId[id];
+				if (s === undefined || s.blank || s.origin === "subagent" || archivedSet.has(id)) continue;
+				const t = s.updatedAt;
+				if (t > bestTime) { bestTime = t; bestId = id; }
+			}
+			return bestId;
+		};
+
 		// Status model mirrors dsh's StateDot:
 		//  - pending  -> "warning" (orange, awaiting user input)
 		//  - running  -> "ongoing"  (animated matrix, DeepSeek brand blue #5686fe)
@@ -252,7 +270,15 @@ window.__ModuleLoader__.load({
 												title: "Archive session",
 												onClick: (e) => {
 													setOpen(false);
-													workspaces.archiveSession(item.id).catch((reason) => {
+													workspaces.archiveSession(item.id).then(() => {
+														// Archiving the current session leaves the switcher
+														// without a current session (dsh clears the selection);
+														// switch automatically to the freshest remaining one.
+														if (item.id === sessionId) {
+															const freshest = freshestSessionId(list, archivedSessionIds, item.id);
+															if (freshest !== undefined) sessions.open(freshest);
+														}
+													}).catch((reason) => {
 														console.warn("session archive rejected:", reason);
 													});
 												},
