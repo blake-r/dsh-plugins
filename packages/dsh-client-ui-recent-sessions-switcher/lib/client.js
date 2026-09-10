@@ -266,7 +266,7 @@ window.__ModuleLoader__.load({
 					);
 			};
 			slots.inject("conversation.session.header.utilities", () => slots.register(
-				{ name: "conversation.session.header.utilities", id: "recent-sessions-switcher", order: -10 },
+				{ name: "conversation.session.header.utilities", id: "recent-sessions-switcher", order: -20 },
 				renderSwitcher
 			));
 		}
