@@ -725,7 +725,7 @@ function apply(ctx, config = {}) {
         });
 
         const replacement = session.append("user/message", replacementMessage, {
-          surfaceOp: { op: "replace", start, end },
+          surfaceOp: { op: "replace", startSeq: start, endSeq: end },
           sourceEventSeqs: shadowedSeqs
         });
 
@@ -766,7 +766,7 @@ function apply(ctx, config = {}) {
         });
 
         const replacement = session.append("user/message", replacementMessage, {
-          surfaceOp: { op: "replace", start: attachmentUser, end: attachmentUser },
+          surfaceOp: { op: "replace", startSeq: attachmentUser, endSeq: attachmentUser },
           sourceEventSeqs: shadowedSeqs
         });
 
