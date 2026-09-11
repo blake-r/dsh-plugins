@@ -51,7 +51,31 @@ window.__ModuleLoader__.load({
 			".rss-current .rss-itemMain{color:var(--dsw-alias-state-business-primary);font-weight:500}",
 			".rss-currentCheck{position:absolute;inset:0;display:inline-flex;align-items:center;justify-content:flex-end;color:var(--dsw-alias-state-business-primary);transition:opacity .1s}",
 			".rss-item:hover .rss-currentCheck{opacity:0}",
-			".rss-empty{padding:8px 10px;color:var(--dsw-alias-label-tertiary);font-size:13px}"
+			".rss-empty{padding:8px 10px;color:var(--dsw-alias-label-tertiary);font-size:13px}",
+			// Hero ("new session") dock: `conversation.input.dock` renders above the
+			// prompt card inside dsh's composer stack. dsh marks the conversation root
+			// with a stable `data-phase` attribute ("settling" | "hero" | "active"), so
+			// the dock copy shows only while the phase is `hero` — the header copy owns
+			// the `active` phase.
+			".rss-heroDock{display:none}",
+			// The dock row sits in the hero composer stack directly below dsh's hero
+			// chip row (`wSkVaW_heroWorkspaceRow`: 28px pill chips, 16px inner right
+			// padding). Instead of claiming a line of its own - which left the trigger
+			// floating on its own between the chips and the prompt card - the row
+			// collapses to zero height and the trigger is lifted onto the chip row's
+			// baseline, right-aligned with the chips, styled as a peer pill. The lift
+			// cancels the 8px gap dsh puts between the two rows.
+			"[data-phase=\"hero\"] .rss-heroDock{position:relative;display:block;height:0;overflow:visible}",
+			"[data-phase=\"hero\"] .rss-heroDock .rss-root{position:absolute;right:16px;bottom:var(--rss-hero-dock-lift,8px)}",
+			"[data-phase=\"hero\"] .rss-heroDock .rss-trigger{height:28px;padding:0 8px;gap:4px;border-radius:16px;color:var(--dsw-alias-label-primary);font-weight:500}",
+			"[data-phase=\"hero\"] .rss-heroDock .rss-chevron{color:var(--dsw-alias-label-caption)}",
+			// The trigger now lives on the chip row, so its dropdown must not drop over
+			// the prompt card: it opens upward into the empty hero space.
+			"[data-phase=\"hero\"] .rss-heroDock .rss-menu{top:auto;bottom:calc(100% + 6px)}",
+			// Narrow hero: a long workspace/preset chip pair can reach the right edge
+			// of the chip row, so the label collapses to the clock glyph (dsh does the
+			// same with its own composer-stack triggers on narrow containers).
+			"@media (max-width:860px){[data-phase=\"hero\"] .rss-heroDock .rss-triggerLabel{display:none}}"
 		].join("");
 		const tagId = "@blake-r/dsh-client-ui-recent-sessions-switcher/rss.css";
 		if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=" + JSON.stringify(tagId) + "]") === null) {
@@ -134,8 +158,12 @@ window.__ModuleLoader__.load({
 			const slots = ctx.slots;
 			const sessions = ctx.sessions;
 			const workspaces = ctx.workspaces;
+			// One component serves two registrations: the header utilities row
+			// (active Session) and the hero dock row (new Session). `heroDock` is
+			// injected by the second registration so the trigger label can differ
+			// while the blank Session has no title yet.
 			const renderSwitcher = (props) => {
-					const { useSessions, useSessionPendingInteraction, useWorkspaces, sessionId } = props;
+					const { useSessions, useSessionPendingInteraction, useWorkspaces, sessionId, heroDock } = props;
 					const list = useSessions((s) => s);
 					const pendingInteractions = useSessionPendingInteraction((s) => s);
 					const archivedSessionIds = useWorkspaces((s) => s.archivedSessionIds);
@@ -226,6 +254,15 @@ window.__ModuleLoader__.load({
 						badge.input > 0 ? badge.input + " need" + (badge.input === 1 ? "s" : "") + " input" : "",
 						badge.unread > 0 ? badge.unread + " unread chat" + (badge.unread === 1 ? "" : "s") : ""
 					].filter(Boolean).join(", ");
+					// On the hero dock the bound Session is blank, so there is no title
+					// to pair the workspace with: drop the `cwd /` prefix rather than
+					// render "dsh / Recent sessions" (the hero workspace chip already
+					// names the workspace).
+					const isHeroDock = heroDock === true;
+					const showCwd = currentCwd !== "" && !(isHeroDock && currentTitle === "");
+					// Hero screen with nothing to switch to (and nothing running): show no
+					// control at all rather than an inert trigger that reads "0".
+					if (isHeroDock && recent.length === 0) return null;
 
 					return react.createElement("div", { className: "rss-root" + (forceUnread ? " rss-forceUnread" : ""), ref: rootRef },
 						react.createElement("button", {
@@ -234,12 +271,17 @@ window.__ModuleLoader__.load({
 							onClick: () => setOpen((v) => !v),
 							"aria-haspopup": "listbox",
 							"aria-expanded": open,
-							title: currentStatus.label,
+							title: isHeroDock ? "Recent sessions" : currentStatus.label,
 						},
-							react.createElement(StatusIndicator, { status: currentStatus }),
-							currentCwd ? react.createElement("span", { className: "rss-cwd" }, currentCwd) : null,
-							currentCwd ? react.createElement("span", { className: "rss-cwdSep" }, "/") : null,
-							react.createElement("span", { className: "rss-triggerLabel" }, currentTitle || "Switch"),
+							// The status dot reports the bound Session's state; on the hero
+							// screen no Session is bound, so a plain clock icon stands in and
+							// the trigger reads as one of the hero chips.
+							isHeroDock
+								? react.createElement(primitives.IconClockOutline16, { size: 14 })
+								: react.createElement(StatusIndicator, { status: currentStatus }),
+							showCwd ? react.createElement("span", { className: "rss-cwd" }, currentCwd) : null,
+							showCwd ? react.createElement("span", { className: "rss-cwdSep" }, "/") : null,
+							react.createElement("span", { className: "rss-triggerLabel", title: isHeroDock ? "Recent sessions" : undefined }, currentTitle || (isHeroDock ? "Recent" : "Switch")),
 							react.createElement("span", { className: "rss-chevron" }, open ? "\u25B2" : "\u25BC"),
 							react.createElement("span", { className: badgeClass, title: badgeTitle }, badge.count > 10 ? "9+" : badge.count)
 						),
@@ -302,9 +344,31 @@ window.__ModuleLoader__.load({
 						)
 					);
 			};
+			// The new-Session ("hero") screen renders the header - and with it every
+			// `conversation.session.header.*` slot - empty: dsh hides the header chrome
+			// while the bound Session is blank and renders no header at all when none is
+			// selected. `conversation.input.dock` is the list slot the hero composer
+			// stack renders directly above the prompt card, so the same switcher mounts
+			// there for the new-Session screen. Visibility is decided by CSS off dsh's
+			// stable `data-phase` root attribute, so the dock copy only shows while the
+			// phase is `hero` and does not duplicate the header one afterwards.
+			const renderHeroDock = (props) => react.createElement(
+				"div",
+				{ className: "rss-heroDock" },
+				react.createElement(renderSwitcher, props)
+			);
 			slots.inject("conversation.session.header.utilities", () => slots.register(
 				{ name: "conversation.session.header.utilities", id: "recent-sessions-switcher", order: -20 },
 				renderSwitcher
+			));
+			slots.inject("conversation.input.dock", () => slots.register(
+				{
+					name: "conversation.input.dock",
+					id: "recent-sessions-switcher-hero",
+					order: -20,
+					inject: () => ({ heroDock: true })
+				},
+				renderHeroDock
 			));
 		}
 
