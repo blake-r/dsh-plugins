@@ -1,10 +1,10 @@
 // dsh-skill-from-tools — one skill per tool (no module grouping). Every
 // non-`skill` tool becomes its own skill. The skill `description` carries the
 // SHORT form: first sentence + the parameter schema as a COMPACT JSON literal
-// (no descriptions). The `content` block carries the FULL annotated schema —
-// each field with its description as a comment. The full `parameters` schema
-// stays in the tool registry; only the compact JSON line is rendered in the
-// description.
+// (no descriptions). The `content` block carries the FULL annotated schema under
+// an explicit `Arguments:` heading — each field with its description as a
+// comment. The full `parameters` schema stays in the tool registry; only the
+// compact JSON line is rendered in the description.
 //
 // COMPACT SCHEMA NOTATION (per user spec):
 //   - required field:  `"command":string`
@@ -158,10 +158,18 @@ function firstSentence(text) {
 }
 
 // Full content block for one tool: `## \`<tool>\` tool` + an explicit "invoke as
-// a tool_call" note + the FULL description + the FULL annotated schema + the
-// `tool:<name>` prose guidance section from the assembly (when present). The
-// catalog `description` keeps only the first sentence; the content block
-// carries the complete description and the full prose guidance.
+// a tool_call" note + the FULL description + the `tool:<name>` prose guidance
+// section from the assembly (when present) + the FULL annotated schema under an
+// explicit `Arguments:` heading. The catalog `description` keeps only the first
+// sentence; the content block carries the complete description and the full
+// prose guidance.
+//
+// ARGUMENTS HEADING: the annotated field list would otherwise start right after
+// prose text that may itself mention fields, leaving no marker for where the
+// parameter block begins. The `Arguments:` label is therefore rendered
+// explicitly, on its own line, and omitted only when the tool takes no
+// parameters (the catalog `description` still says `Arguments: {}` there).
+// The label matches the wording used in the `description`.
 //
 // DISAMBIGUATION: the bare word "tool" is ambiguous — a model that reads the
 // skill may not know how to invoke it. The explicit note below pins the
@@ -173,7 +181,7 @@ function toolBlock(tool, fullSchemaText, proseText) {
     `Invoke directly as a tool_call named \`${tool.name}\`.`,
     desc,
     proseText,
-    fullSchemaText
+    fullSchemaText ? `Arguments:\n${fullSchemaText}` : ""
   ].filter(Boolean).join("\n").trim();
 }
 
