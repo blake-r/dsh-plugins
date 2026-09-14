@@ -20,6 +20,7 @@ function normalizeMirror(value) {
       const normalized = {
         name: typeof entry.name === 'string' ? entry.name : '',
         status: typeof entry.status === 'string' ? entry.status : 'cold',
+        ...(isAlias(entry.alias) ? { alias: entry.alias } : {}),
         ...(typeof entry.workspace === 'string' ? { workspace: entry.workspace } : {}),
         ...(typeof entry.preset === 'string' ? { preset: entry.preset } : {}),
         ...(typeof entry.model === 'object' && entry.model !== null
@@ -65,6 +66,11 @@ function normalizeEchoSet(value) {
     }
   }
   return echoSet;
+}
+
+/** Alias is a non-empty short handle ([a-z0-9_а-яё]+, see /alias). */
+function isAlias(value) {
+  return typeof value === 'string' && value.length > 0;
 }
 
 function normalizeMenuSlugs(value) {
@@ -206,7 +212,11 @@ export class ConversationStateStore {
 
   async setMirrorEntry(sessionId, patch) {
     const current = this.#state.mirror[sessionId] ?? {};
-    this.#state.mirror[sessionId] = { ...current, ...patch };
+    // A null alias removes the key (the /alias reset); other keys merge
+    // verbatim, including the placeholderMessageId null sentinel.
+    const next = { ...current, ...patch };
+    if (Object.hasOwn(patch, 'alias') && patch.alias === null) delete next.alias;
+    this.#state.mirror[sessionId] = next;
     await this.#persist();
   }
 

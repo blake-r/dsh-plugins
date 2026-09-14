@@ -8,11 +8,17 @@
 // callback_query; a numbered text reply on the picker message works as the
 // fallback. Both paths land in handlePickerSelection.
 //
-// The remaining commands (/stop, /steer, /enqueue, /compact, /new, /alias,
-// /as, /ps, /ws, /hs, /follow, /unfollow) reply with a "not yet" hint so the
-// router's rule 0 never leaks a command into a session.
+// Stage 6 adds the remaining session commands: /stop, /steer, /enqueue,
+// /compact, /new [workspace] [preset] <prompt>, /alias, and the roster lists
+// /as, /ps, /ws with stable sorting and 1-based ordinal arguments. Delivery
+// is delegated to the router (echo protection, indexing, cold resume);
+// /follow, /unfollow (stage 7) and /hs (stage 7a) still hint "not yet".
 
+import { randomUUID } from 'node:crypto';
+import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { resolveSession, sortedSessions } from './session-list.mjs';
+import { PLUGIN_COMMANDS } from './inbound-router.mjs';
+import { STATUS_I18N_KEY } from './session-mirror.mjs';
 
 const NOT_YET = 'not-yet';
 const NO_SIGNAL = Object.freeze({ aborted: false });
@@ -63,15 +69,29 @@ export class CommandDispatcher {
       const args = rest.join(' ').trim();
 
       switch (name) {
-        case 'to': return this.#to(message, chatKey, args, router);
-        case 'cmd': return this.#cmd(message, chatKey, args, router);
-        case 'skill': return this.#skill(message, chatKey, args, router);
-        case 'cancel': return this.#cancel(message, chatKey, router);
-        case 'start': return this.#start(message);
-        case 'help': return this.#help(message);
-        case 'status': return this.#status(message);
-        case 'version': return this.#version(message);
-        default: return this.#notYet(message, name);
+        // `return await` keeps #router alive across the command's own awaits:
+        // `finally { #router = null }` runs only after the promise settles.
+        case 'to': return await this.#to(message, chatKey, args, router);
+        case 'cmd': return await this.#cmd(message, chatKey, args, router);
+        case 'skill': return await this.#skill(message, chatKey, args, router);
+        case 'cancel': return await this.#cancel(message, chatKey, router);
+        case 'start': return await this.#start(message);
+        case 'help': return await this.#help(message);
+        case 'status': return await this.#status(message);
+        case 'version': return await this.#version(message);
+        case 'as':
+        case 'agents': return await this.#as(message);
+        case 'ps':
+        case 'presets': return await this.#ps(message);
+        case 'ws':
+        case 'workspaces': return await this.#ws(message);
+        case 'stop': return await this.#stop(message, chatKey, args, router);
+        case 'steer': return await this.#steer(message, chatKey, args, router);
+        case 'enqueue': return await this.#enqueue(message, chatKey, args, router);
+        case 'compact': return await this.#compact(message, chatKey, router);
+        case 'new': return await this.#new(message, args, router);
+        case 'alias': return await this.#alias(message, chatKey, args, router);
+        default: return await this.#notYet(message, name);
       }
     } finally {
       this.#router = null;
@@ -99,9 +119,9 @@ export class CommandDispatcher {
         router?.clearPicker(chatKey, pickerMessageId);
       }
       switch (picker?.kind) {
-        case 'to': return this.#selectTo(picker, choice, isCallback, message, chatKey, router);
-        case 'cmd': return this.#selectCmd(picker, choice, isCallback, message, router);
-        case 'skill': return this.#selectSkill(picker, choice, isCallback, message, chatKey, router);
+        case 'to': return await this.#selectTo(picker, choice, isCallback, message, chatKey, router);
+        case 'cmd': return await this.#selectCmd(picker, choice, isCallback, message, router);
+        case 'skill': return await this.#selectSkill(picker, choice, isCallback, message, chatKey, router);
         default: return undefined;
       }
     } finally {
@@ -353,6 +373,108 @@ export class CommandDispatcher {
     }
   }
 
+  // --- workspace / preset registries (stage 6) -------------------------------
+
+  /** Workspaces from ctx.workspaceRegistry in stable sorted order. */
+  #workspaceList() {
+    try {
+      const workspaces = this.#ctx.workspaceRegistry?.list?.() ?? [];
+      const rows = Array.isArray(workspaces)
+        ? workspaces.map((entity) => ({
+            id: String(entity?.id ?? ''),
+            title: String(entity?.title ?? '').trim(),
+            path: String(entity?.path ?? '').trim(),
+          }))
+        : [];
+      return rows.sort((left, right) => {
+        const byTitle = (left.title || left.id).localeCompare(right.title || right.id);
+        if (byTitle !== 0) return byTitle;
+        const byPath = left.path.localeCompare(right.path);
+        if (byPath !== 0) return byPath;
+        return left.id.localeCompare(right.id);
+      });
+    } catch (error) {
+      this.#logger.warn?.('[dsh-im-multiagent] workspace list failed:', error);
+      return [];
+    }
+  }
+
+  /** Presets from agentPresets.list() in stable sorted order. */
+  async #presetList() {
+    const presets = this.#ctx.get('agentPresets');
+    if (!presets?.list) return [];
+    try {
+      const rows = await presets.list();
+      const clean = Array.isArray(rows)
+        ? rows.map((preset) => ({
+            id: String(preset?.id ?? ''),
+            name: String(preset?.name ?? '').trim(),
+            description: String(preset?.description ?? '').trim(),
+          }))
+        : [];
+      return clean.sort((left, right) => {
+        const byName = (left.name || left.id).localeCompare(right.name || right.id);
+        if (byName !== 0) return byName;
+        return left.id.localeCompare(right.id);
+      });
+    } catch (error) {
+      this.#logger.warn?.('[dsh-im-multiagent] preset list failed:', error);
+      return [];
+    }
+  }
+
+  /** 1-based ordinal (from the stable order) or title/path/id match. */
+  async #resolveWorkspace(reference) {
+    const workspaces = this.#workspaceList();
+    const text = String(reference ?? '').trim();
+    if (/^\d+$/.test(text)) return workspaces[Number(text) - 1] ?? null;
+    if (!text) return null;
+    const needle = text.toLowerCase();
+    const byTitle = workspaces.find((workspace) => workspace.title.toLowerCase() === needle);
+    if (byTitle) return byTitle;
+    const byPath = workspaces.find((workspace) => workspace.path === text);
+    if (byPath) return byPath;
+    return workspaces.find((workspace) => workspace.id === text) ?? null;
+  }
+
+  /** Does the token look like a workspace (matches one)? */
+  async #matchWorkspace(reference) {
+    return (await this.#resolveWorkspace(reference)) !== null;
+  }
+
+  /** 1-based ordinal (from the stable order) or id/name match. */
+  async #resolvePreset(reference) {
+    const presets = await this.#presetList();
+    const text = String(reference ?? '').trim();
+    if (/^\d+$/.test(text)) return presets[Number(text) - 1] ?? null;
+    if (!text) return null;
+    const needle = text.toLowerCase();
+    const byId = presets.find((preset) => preset.id.toLowerCase() === needle);
+    if (byId) return byId;
+    return presets.find((preset) => preset.name.toLowerCase() === needle) ?? null;
+  }
+
+  /** Does the token look like a preset (matches one)? */
+  async #matchPreset(reference) {
+    return (await this.#resolvePreset(reference)) !== null;
+  }
+
+  /** The bot's default workspace (config), else null. */
+  async #defaultWorkspace() {
+    const configured = this.#config.defaults?.workspace;
+    if (!configured) return null;
+    return this.#resolveWorkspace(configured);
+  }
+
+  /** The bot's default preset (config), else the presets.defaultId. */
+  async #defaultPresetId() {
+    const configured = this.#config.defaults?.preset;
+    if (configured) {
+      return (await this.#resolvePreset(configured))?.id ?? null;
+    }
+    return this.#ctx.get('agentPresets')?.defaultId ?? null;
+  }
+
   /** The agent's skill registry: its preset service, else the host service. */
   #skillsFor(agent) {
     const presets = this.#ctx.get('agentPresets');
@@ -387,6 +509,248 @@ export class CommandDispatcher {
     return router?.reply(message, '✓');
   }
 
+  // --- /as / /ps / /ws (section 9: stable sorting, 1-based ordinals) ---------
+
+  async #as(message) {
+    const sessions = sortedSessions(this.#mirror.sessions());
+    const lines = sessions.map(({ sessionId, entry }, index) => {
+      const name = entry?.name ?? sessionId;
+      const status = this.#i18n.t(STATUS_I18N_KEY[entry?.status] ?? 'status.cold');
+      const workspace = entry?.workspace ? ` · ${entry.workspace}` : '';
+      return `${index + 1}. ${name} — ${status}${workspace}`;
+    });
+    const header = this.#i18n.t('list.as-header', { n: sessions.length });
+    return this.#reply(message, `${header}\n${lines.join('\n')}`);
+  }
+
+  async #ps(message) {
+    const presets = await this.#presetList();
+    const lines = presets.map((preset, index) => {
+      const name = preset.name ?? preset.id;
+      const description = preset.description ? ` — ${preset.description}` : '';
+      return `${index + 1}. ${name} [${preset.id}]${description}`;
+    });
+    const header = this.#i18n.t('list.ps-header', { n: presets.length });
+    return this.#reply(message, `${header}\n${lines.join('\n')}`);
+  }
+
+  async #ws(message) {
+    const workspaces = this.#workspaceList();
+    const lines = workspaces.map((workspace, index) => (
+      `${index + 1}. ${workspace.title} — ${workspace.path}`
+    ));
+    const header = this.#i18n.t('list.ws-header', { n: workspaces.length });
+    return this.#reply(message, `${header}\n${lines.join('\n')}`);
+  }
+
+  // --- /stop ----------------------------------------------------------------
+
+  async #stop(message, chatKey, args, router) {
+    const sessionId = args
+      ? resolveSession(this.#mirror.sessions(), args)?.sessionId
+      : this.#replySession(message, chatKey);
+    if (!sessionId) return router?.reply(message, this.#i18n.t('hint.cmd-reply'));
+    const agent = this.#ctx.agents?.get?.(sessionId);
+    if (!agent || typeof agent.cancel !== 'function') {
+      return router?.reply(message, this.#i18n.t('hint.no-active-turn'));
+    }
+    agent.cancel({ kind: 'user' }, { keepInbox: true });
+    return router?.reply(message, this.#i18n.t('hint.stop-ok', {
+      name: this.#displayName(sessionId),
+    }));
+  }
+
+  // --- /steer / /enqueue -----------------------------------------------------
+
+  async #steer(message, chatKey, args, router) {
+    const text = String(args ?? '').trim();
+    if (!text) return router?.reply(message, this.#i18n.t('hint.text-only'));
+    const sessionId = this.#replySession(message, chatKey);
+    if (!sessionId) return router?.reply(message, this.#i18n.t('hint.cmd-reply'));
+    if (!(await router?.deliverToSession(sessionId, text, message, chatKey, { mode: 'steer' }))) {
+      return router?.reply(message, this.#i18n.t('hint.session-gone'));
+    }
+    return router?.reply(message, '✓');
+  }
+
+  async #enqueue(message, chatKey, args, router) {
+    const text = String(args ?? '').trim();
+    if (!text) return router?.reply(message, this.#i18n.t('hint.text-only'));
+    const sessionId = this.#replySession(message, chatKey);
+    if (!sessionId) return router?.reply(message, this.#i18n.t('hint.cmd-reply'));
+    const live = this.#ctx.agents?.get?.(sessionId);
+    if (live && this.#pendingCount(live) >= 10) {
+      return router?.reply(message, this.#i18n.t('hint.queue-full'));
+    }
+    if (!(await router?.deliverToSession(sessionId, text, message, chatKey, { mode: 'queue' }))) {
+      return router?.reply(message, this.#i18n.t('hint.session-gone'));
+    }
+    return router?.reply(message, '✓');
+  }
+
+  /** Pending inbox work (Q26): next-turn + next-step, read from agent.inbox. */
+  #pendingCount(agent) {
+    const inbox = agent?.inbox;
+    if (!inbox) return 0;
+    const nextTurn = inbox.nextTurn;
+    const nextStep = inbox.nextStep;
+    return (Array.isArray(nextTurn) ? nextTurn.length : 0)
+      + (Array.isArray(nextStep) ? nextStep.length : 0);
+  }
+
+  // --- /compact --------------------------------------------------------------
+
+  async #compact(message, chatKey, router) {
+    const sessionId = this.#replySession(message, chatKey);
+    if (!sessionId) return router?.reply(message, this.#i18n.t('hint.cmd-reply'));
+    const agent = this.#ctx.agents?.get?.(sessionId);
+    if (!agent) return router?.reply(message, this.#i18n.t('hint.cold-compact'));
+    if (typeof this.#ctx.compaction?.compactNow !== 'function') {
+      return router?.reply(message, this.#i18n.t('hint.cold-compact'));
+    }
+    try {
+      // Never-abort signal for the manual compaction request (Q15).
+      const result = await this.#ctx.compaction.compactNow(agent, AbortSignal.any([]), 'dsh-im-multiagent');
+      if (result === null) return router?.reply(message, this.#i18n.t('hint.compact-nothing'));
+      return router?.reply(message, this.#i18n.t('hint.compact-ok', {
+        n: Array.isArray(result.shadowedSeqs) ? result.shadowedSeqs.length : 0,
+      }));
+    } catch (error) {
+      this.#logger.warn?.('[dsh-im-multiagent] compaction failed:', error);
+      return router?.reply(message, this.#i18n.t('hint.cold-compact'));
+    }
+  }
+
+  // --- /new [workspace] [preset] <prompt> ------------------------------------
+
+  async #new(message, args, router) {
+    const tokens = String(args ?? '').trim().split(/\s+/).filter(Boolean);
+    const { index, workspaceRef, presetRef } = await this.#consumeNewArgs(tokens);
+    const prompt = tokens.slice(index).join(' ').trim();
+    if (!prompt) {
+      return router?.reply(message, this.#i18n.t('hint.new-prompt-required'));
+    }
+    const outcome = await this.#createNewSession(workspaceRef, presetRef, prompt);
+    if (!outcome.ok) {
+      const key = outcome.reason === 'followup'
+        ? 'hint.new-followup-failed'
+        : outcome.reason === 'workspace'
+          ? 'hint.new-workspace-required'
+          : 'hint.new-create-failed';
+      return router?.reply(message, this.#i18n.t(key, {
+        name: outcome.sessionId ?? '',
+      }));
+    }
+    return router?.reply(message, this.#i18n.t('hint.new-ok', { name: outcome.sessionId }));
+  }
+
+  /**
+   * Consume workspace/preset arity from the head of the token list (Q9): a
+   * leading workspace, then a leading preset; a token that matches neither is
+   * left as the prompt start. Returns the first prompt-token index and which
+   * references were consumed.
+   */
+  async #consumeNewArgs(tokens) {
+    let index = 0;
+    let workspaceRef;
+    let presetRef;
+    if (index < tokens.length && await this.#matchWorkspace(tokens[index])) {
+      workspaceRef = tokens[index];
+      index += 1;
+      if (index < tokens.length && await this.#matchPreset(tokens[index])) {
+        presetRef = tokens[index];
+        index += 1;
+      }
+    } else if (index < tokens.length && await this.#matchPreset(tokens[index])) {
+      presetRef = tokens[index];
+      index += 1;
+    }
+    return { index, workspaceRef, presetRef };
+  }
+
+  /**
+   * Resolve and create the session through ctx.agents.create (Q29). A failed
+   * create reports 'create'; a failed first prompt reports 'followup' and the
+   * session stays addressable; a missing workspace reports 'workspace'.
+   */
+  async #createNewSession(workspaceRef, presetRef, prompt) {
+    const workspace = workspaceRef
+      ? await this.#resolveWorkspace(workspaceRef)
+      : await this.#defaultWorkspace();
+    if (!workspace) {
+      return { ok: false, reason: 'workspace' };
+    }
+    let presetId = presetRef
+      ? (await this.#resolvePreset(presetRef))?.id
+      : await this.#defaultPresetId();
+    let agentOptions = {};
+    try {
+      const selection = this.#ctx.agentDefaultModel?.currentSelection?.() ?? {};
+      if (selection.provider) agentOptions.provider = selection.provider;
+      if (selection.model) agentOptions.model = selection.model;
+    } catch {
+      // model selection is optional
+    }
+    const setup = async (agentCtx) => {
+      const presets = this.#ctx.get('agentPresets');
+      if (presets?.mount && presetId) await presets.mount(agentCtx, presetId);
+    };
+    let agent;
+    try {
+      const handle = await this.#ctx.agents.create({
+        agentOptions,
+        meta: { cwd: workspace.path, ...(presetId ? { agentPreset: presetId } : {}) },
+        setup,
+      });
+      agent = handle?.agent ?? handle ?? null;
+    } catch (error) {
+      this.#logger.warn?.('[dsh-im-multiagent] /new create failed:', error);
+      return { ok: false, reason: 'create' };
+    }
+    const sessionId = agent?.session?.id ?? null;
+    if (!agent) return { ok: false, reason: 'create' };
+    if (typeof agent.followup !== 'function') return { ok: true, sessionId };
+    const rpcId = randomUUID();
+    const userMessage = createUserMessage({
+      content: prompt,
+      source: { kind: 'user', rpcId },
+    });
+    try {
+      await this.#mirror.rememberEcho(rpcId);
+      await agent.followup(userMessage);
+    } catch (error) {
+      this.#logger.warn?.('[dsh-im-multiagent] /new first prompt failed:', error);
+      return { ok: false, reason: 'followup', sessionId };
+    }
+    return { ok: true, sessionId };
+  }
+
+  // --- /alias ----------------------------------------------------------------
+
+  async #alias(message, chatKey, args, router) {
+    const sessionId = this.#replySession(message, chatKey);
+    if (!sessionId) return router?.reply(message, this.#i18n.t('hint.cmd-reply'));
+    const name = String(args ?? '').trim();
+    if (!name) {
+      await this.#state.setMirrorEntry(sessionId, { alias: null });
+      return router?.reply(message, this.#i18n.t('hint.alias-ok', { alias: name }));
+    }
+    if (name.length > 32 || !/^[a-z0-9_а-яё]+$/i.test(name)) {
+      return router?.reply(message, this.#i18n.t('hint.alias-invalid'));
+    }
+    const lower = name.toLowerCase();
+    if (PLUGIN_COMMANDS.has(lower) || this.#state.menuSlugFor(lower)) {
+      return router?.reply(message, this.#i18n.t('hint.alias-taken'));
+    }
+    for (const [id, entry] of Object.entries(this.#mirror.sessions())) {
+      if (id !== sessionId && String(entry?.alias ?? '').toLowerCase() === lower) {
+        return router?.reply(message, this.#i18n.t('hint.alias-taken'));
+      }
+    }
+    await this.#state.setMirrorEntry(sessionId, { alias: name });
+    return router?.reply(message, this.#i18n.t('hint.alias-ok', { alias: name }));
+  }
+
   // --- info commands ---------------------------------------------------------
 
   async #start(message) {
@@ -408,8 +772,8 @@ export class CommandDispatcher {
     const sessions = sortedSessions(this.#mirror.sessions());
     const lines = sessions.map(({ sessionId, entry }, index) => {
       const name = entry?.name ?? sessionId;
-      const status = entry?.status ?? 'cold';
-      return `${index + 1}. ${name} — ${this.#i18n.t(`status.${status}`)}`;
+      const status = this.#i18n.t(STATUS_I18N_KEY[entry?.status] ?? 'status.cold');
+      return `${index + 1}. ${name} — ${status}`;
     });
     const header = this.#i18n.t('status.header', { n: sessions.length });
     return this.#reply(message, `${header}\n${lines.join('\n')}`);

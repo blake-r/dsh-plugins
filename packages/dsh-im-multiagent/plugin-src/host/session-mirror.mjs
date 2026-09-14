@@ -409,4 +409,4 @@ export class SessionMirror {
 }
 
 // Re-export for tests and callers that need the status vocabulary.
-export { MIRROR_STATUS as STATUS };
+export { MIRROR_STATUS as STATUS, STATUS_I18N_KEY };

@@ -18,6 +18,7 @@
 // message is written to the MessageIndex so a reply on the user's own message
 // continues the same session.
 
+import { randomUUID } from 'node:crypto';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 
 export const PLUGIN_COMMANDS = Object.freeze(new Set([
@@ -132,9 +133,13 @@ export class InboundRouter {
     });
   }
 
-  /** Public delivery entry used by the command dispatcher (/to <name> <text>). */
-  async deliverToSession(sessionId, text, message, chatKey) {
-    return this.#deliverToSession(sessionId, text, message, chatKey);
+  /**
+   * Public delivery entry used by the command dispatcher (/to <name> <text>,
+   * /steer, /enqueue). The mode forces the delivery kind: 'steer' (next-step)
+   * or 'queue' (next-turn); the default is the configured deliveryMode.
+   */
+  async deliverToSession(sessionId, text, message, chatKey, { mode } = {}) {
+    return this.#deliverToSession(sessionId, text, message, chatKey, mode);
   }
 
   // --- entry point (called by the runtime poll loop) -------------------------
@@ -275,7 +280,7 @@ export class InboundRouter {
     }
   }
 
-  async #deliverToSession(sessionId, text, message, chatKey) {
+  async #deliverToSession(sessionId, text, message, chatKey, forcedMode) {
     const content = String(text ?? '').trim();
     if (!content) {
       return this.#sendHint(message, 'hint.text-only');
@@ -284,8 +289,8 @@ export class InboundRouter {
     if (!agent) {
       return this.#sendHint(message, 'hint.session-gone');
     }
-    const userMessage = createUserMessage({ content });
-    await this.#deliverLive(agent, userMessage);
+    const userMessage = await this.#inject(agent, content, forcedMode);
+    if (!userMessage) return false;
     this.#delivered += 1;
     const telegramMessageId = message?.replyTarget?.replyToMessageId;
     if (telegramMessageId !== undefined) {
@@ -294,6 +299,38 @@ export class InboundRouter {
         sessionId,
         direction: 'in',
       });
+    }
+    return true;
+  }
+
+  /**
+   * Build an echo-protected user message and deliver it to a live agent
+   * (steer or followup). The rpcId is registered in the mirror's echo set so
+   * the session's own `user/message` event is not mirrored back into the
+   * Telegram chat. Returns the message (or null on failure).
+   */
+  async #inject(agent, content, forcedMode) {
+    try {
+      const rpcId = randomUUID();
+      const userMessage = createUserMessage({
+        content,
+        source: { kind: 'user', rpcId },
+      });
+      await this.#mirror.rememberEcho(rpcId);
+      await this.#deliverLive(agent, userMessage, forcedMode);
+      return userMessage;
+    } catch (error) {
+      this.#logger.warn?.('[dsh-im-multiagent] message injection failed:', error);
+      return null;
+    }
+  }
+
+  async #deliverLive(agent, userMessage, forcedMode) {
+    const deliveryMode = forcedMode ?? this.#config.deliveryMode;
+    if (deliveryMode === 'queue') {
+      await agent.followup(userMessage);
+    } else {
+      await agent.steer(userMessage);
     }
   }
 
@@ -306,15 +343,6 @@ export class InboundRouter {
     const agent = this.#ctx.agents.get(sessionId);
     if (agent) return agent;
     return this.#resumeSession(sessionId);
-  }
-
-  async #deliverLive(agent, userMessage) {
-    const deliveryMode = this.#config.deliveryMode === 'queue' ? 'queue' : 'steer';
-    if (deliveryMode === 'queue') {
-      await agent.followup(userMessage);
-    } else {
-      await agent.steer(userMessage);
-    }
   }
 
   /**
