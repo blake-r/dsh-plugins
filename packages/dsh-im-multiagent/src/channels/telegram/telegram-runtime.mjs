@@ -471,6 +471,30 @@ export class TelegramBotClient {
     });
   }
 
+  async editText(target, messageId, text, { replyMarkup, signal } = {}) {
+    if (typeof messageId !== 'string' && !Number.isSafeInteger(messageId)) {
+      throw new TypeError('A Telegram message id is required to edit text');
+    }
+    await this.#api.editMessageText({
+      chatId: target.chatId,
+      messageId,
+      text,
+      replyMarkup,
+      signal: signal ?? this.#signal,
+    });
+  }
+
+  async deleteMessage(target, messageId, { signal } = {}) {
+    if (typeof messageId !== 'string' && !Number.isSafeInteger(messageId)) {
+      throw new TypeError('A Telegram message id is required to delete a message');
+    }
+    await this.#api.deleteMessage({
+      chatId: target.chatId,
+      messageId,
+      signal: signal ?? this.#signal,
+    });
+  }
+
   async addReaction(target, emoji, { signal } = {}) {
     const reactionKey = String(emoji ?? '').trim();
     await this.#api.setMessageReaction({

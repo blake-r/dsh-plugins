@@ -148,9 +148,7 @@ export class SessionMirror {
   async #recoverInterrupted() {
     for (const [sessionId, entry] of Object.entries(this.#state.mirrorEntries())) {
       if (entry.status === MIRROR_STATUS.WORKING || entry.status === MIRROR_STATUS.AWAITING_APPROVAL) {
-        if (entry.placeholderMessageId != null) {
-          await this.#outbound.editText(entry.placeholderMessageId, this.#i18n.t('status.restarted'));
-        }
+        await this.#editPlaceholder(sessionId, entry, this.#i18n.t('status.restarted'));
         await this.#state.setMirrorEntry(sessionId, { status: MIRROR_STATUS.RESTARTED });
       }
     }
@@ -167,9 +165,7 @@ export class SessionMirror {
     const sessionId = agent.session.id;
     this.#disposed.add(sessionId);
     const entry = this.#state.mirrorEntry(sessionId);
-    if (entry?.placeholderMessageId != null) {
-      await this.#outbound.editText(entry.placeholderMessageId, this.#i18n.t('status.closed'));
-    }
+    await this.#editPlaceholder(sessionId, entry, this.#i18n.t('status.closed'));
     await this.#state.setMirrorEntry(sessionId, { status: MIRROR_STATUS.CLOSED });
     this.#turns.delete(sessionId);
   }
@@ -278,7 +274,7 @@ export class SessionMirror {
           }
           await this.#state.setMirrorEntry(sessionId, { placeholderMessageId: null, status: MIRROR_STATUS.IDLE });
         } else if (entry?.placeholderMessageId != null) {
-          await this.#outbound.editText(entry.placeholderMessageId, finalText);
+          await this.#editPlaceholder(sessionId, entry, finalText);
           await this.#state.setMirrorEntry(sessionId, { status: MIRROR_STATUS.IDLE });
         } else {
           const { messageId } = await this.#outbound.sendText(finalText);
@@ -375,9 +371,25 @@ export class SessionMirror {
       await this.#index.put(this.#chatKey, { messageId, sessionId, direction: 'out' });
       await this.#state.setMirrorEntry(sessionId, { placeholderMessageId: messageId, status });
     } else {
-      await this.#outbound.editText(entry.placeholderMessageId, text);
+      await this.#editPlaceholder(sessionId, entry, text);
       await this.#state.setMirrorEntry(sessionId, { status });
     }
+  }
+
+  /**
+   * Edit the session's placeholder message. When the edit falls back to a
+   * fresh send (Q22) the new message id is indexed and persisted so status
+   * tracking and reply routing stay correct.
+   */
+  async #editPlaceholder(sessionId, entry, text) {
+    if (!entry?.placeholderMessageId) return null;
+    const edited = await this.#outbound.editText(entry.placeholderMessageId, text);
+    const messageId = edited?.messageId;
+    if (messageId && String(messageId) !== String(entry.placeholderMessageId)) {
+      await this.#index.put(this.#chatKey, { messageId: String(messageId), sessionId, direction: 'out' });
+      await this.#state.setMirrorEntry(sessionId, { placeholderMessageId: String(messageId) });
+    }
+    return edited;
   }
 
   // --- roster access (used by /as, snapshot, MenuBuilder, RPC) -------------

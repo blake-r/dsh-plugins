@@ -350,6 +350,13 @@ export class TelegramApi {
     }, { signal });
   }
 
+  async deleteMessage({ chatId, messageId, signal }) {
+    return this.#call('deleteMessage', {
+      chat_id: chatId,
+      message_id: messageId,
+    }, { signal });
+  }
+
   async sendChatAction({ chatId, messageThreadId, signal }) {
     return this.#call('sendChatAction', {
       chat_id: chatId,
