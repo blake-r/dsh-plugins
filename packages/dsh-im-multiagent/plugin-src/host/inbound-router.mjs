@@ -151,6 +151,10 @@ export class InboundRouter {
     }
     this.#accepted.add(messageId);
     try {
+      if (message.kind === 'callback') {
+        await this.#acceptCallback(message, chatKey);
+        return;
+      }
       // Group chats: only addressed messages are routed (direct reply on the
       // bot or an @mention), mirroring the dsh-im group rule.
       if (message.kind === 'group' && message.addressed !== true) {
@@ -168,10 +172,32 @@ export class InboundRouter {
     }
   }
 
+  /**
+   * Inline-keyboard callback (stage 4a): a tap on a picker button. The picker
+   * registered under the callback's message id decides the outcome; the query
+   * is always answered so Telegram never shows a loading spinner.
+   */
+  async #acceptCallback(message, chatKey) {
+    const messageId = String(message?.messageId ?? '');
+    const callbackMessageId = String(message?.callbackMessageId ?? '');
+    const picker = callbackMessageId
+      ? this.#pickers.get(chatKey)?.get(callbackMessageId)
+      : undefined;
+    if (picker && picker.expiresAt > Date.now()) {
+      await this.#commands.handlePickerSelection(picker, message, chatKey, { router: this });
+    } else {
+      if (picker) this.#pickers.get(chatKey).delete(callbackMessageId);
+      await this.answerCallback(message, {
+        text: this.#i18n.t('hint.picker-expired'),
+      });
+    }
+    await this.#state.markSeen(messageId);
+  }
+
   #chatKey(message) {
     const conversationId = String(message?.conversationId ?? '').trim();
     if (!conversationId) return null;
-    const kind = message?.kind === 'group' ? 'group' : 'direct';
+    const kind = message?.kind === 'group' || message?.chatKind === 'group' ? 'group' : 'direct';
     return `${kind}:${conversationId}`;
   }
 
@@ -183,18 +209,16 @@ export class InboundRouter {
     // Rule 0: plugin commands.
     if (this.#isPluginCommand(text)) return { kind: 'command', text };
 
-    // Rule 1: reply on an indexed message.
+    // Rule 1: reply on an indexed message (picker selection first — Q25/Q32).
     const replyMessageId = message?.replyTo?.messageId;
     if (replyMessageId) {
-      const entry = this.#index.lookup(chatKey, replyMessageId);
-      if (entry) {
-        const picker = this.#pickers.get(chatKey)?.get(String(replyMessageId));
-        if (picker) {
-          if (picker.expiresAt > Date.now()) return { kind: 'picker-selection', picker };
-          this.#pickers.get(chatKey).delete(String(replyMessageId));
-        } else {
-          return { kind: 'session', sessionId: entry.sessionId };
-        }
+      const picker = this.#pickers.get(chatKey)?.get(String(replyMessageId));
+      if (picker) {
+        if (picker.expiresAt > Date.now()) return { kind: 'picker-selection', picker };
+        this.#pickers.get(chatKey).delete(String(replyMessageId));
+      } else {
+        const entry = this.#index.lookup(chatKey, replyMessageId);
+        if (entry) return { kind: 'session', sessionId: entry.sessionId };
       }
       // Reply on an unknown / old / foreign message: fall through.
     }
@@ -256,17 +280,12 @@ export class InboundRouter {
     if (!content) {
       return this.#sendHint(message, 'hint.text-only');
     }
-    const agent = this.#ctx.agents.get(sessionId);
-    const userMessage = createUserMessage({ content });
-    if (agent) {
-      await this.#deliverLive(agent, userMessage);
-    } else {
-      const resumed = await this.#resumeSession(sessionId);
-      if (!resumed) {
-        return this.#sendHint(message, 'hint.session-gone');
-      }
-      await this.#deliverLive(resumed, userMessage);
+    const agent = await this.ensureLiveAgent(sessionId);
+    if (!agent) {
+      return this.#sendHint(message, 'hint.session-gone');
     }
+    const userMessage = createUserMessage({ content });
+    await this.#deliverLive(agent, userMessage);
     this.#delivered += 1;
     const telegramMessageId = message?.replyTarget?.replyToMessageId;
     if (telegramMessageId !== undefined) {
@@ -276,6 +295,17 @@ export class InboundRouter {
         direction: 'in',
       });
     }
+  }
+
+  /**
+   * Resolve a session to a live agent, resuming a cold (persisted, not
+   * running) session on demand. Shared by the router and the command
+   * dispatcher (/cmd, /skill, /to). Returns the agent or null.
+   */
+  async ensureLiveAgent(sessionId) {
+    const agent = this.#ctx.agents.get(sessionId);
+    if (agent) return agent;
+    return this.#resumeSession(sessionId);
   }
 
   async #deliverLive(agent, userMessage) {
@@ -345,5 +375,48 @@ export class InboundRouter {
   async reply(message, text) {
     if (!this.#bot || !message?.replyTarget) return;
     await this.#bot.sendText(message.replyTarget, text);
+  }
+
+  /**
+   * Reply with inline buttons attached (stage 4a pickers). Returns the bot
+   * send result so the caller can register the picker on the provider id.
+   */
+  async replyWithMarkup(message, text, replyMarkup) {
+    if (!this.#bot || !message?.replyTarget) return undefined;
+    return this.#bot.sendText(message.replyTarget, text, { replyMarkup });
+  }
+
+  /**
+   * Acknowledge an inline-keyboard callback query (only for callback
+   * messages; the bot shows no spinner once answered).
+   */
+  async answerCallback(message, { text } = {}) {
+    if (!this.#bot || message?.kind !== 'callback' || !message.callbackQueryId) return;
+    try {
+      await this.#bot.answerCallbackQuery(message.callbackQueryId, { text });
+    } catch (error) {
+      this.#logger.warn?.('[dsh-im-multiagent] answerCallbackQuery failed:', error);
+    }
+  }
+
+  /**
+   * Remove the inline buttons from a picker message (whole keyboard or
+   * selection-dependent layout). Used after a picker selection settles.
+   */
+  async dismissPicker(message, target) {
+    if (!this.#bot || !target || target.messageId === undefined) return;
+    try {
+      await this.#bot.editMessageReplyMarkup(target, { replyMarkup: { inline_keyboard: [] } });
+    } catch (error) {
+      this.#logger.warn?.('[dsh-im-multiagent] editMessageReplyMarkup failed:', error);
+    }
+  }
+
+  /** Drop one registered picker (one-shot: it settles on the first tap). */
+  clearPicker(chatKey, messageId) {
+    const byMessageId = this.#pickers.get(chatKey);
+    if (!byMessageId) return;
+    byMessageId.delete(String(messageId));
+    if (byMessageId.size === 0) this.#pickers.delete(chatKey);
   }
 }

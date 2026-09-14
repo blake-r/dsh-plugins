@@ -217,6 +217,9 @@ export function normalizeTelegramUpdate(update, {
   loadFileStream = loadFile,
   loadReplyContent,
 }) {
+  if (update?.callback_query) {
+    return normalizeTelegramCallbackQuery(update, { username });
+  }
   const message = update?.message;
   const chatId = message?.chat?.id;
   const senderId = message?.from?.id;
@@ -268,6 +271,53 @@ export function normalizeTelegramUpdate(update, {
     ...(replyTo ? { replyTo } : {}),
     addressed,
     reactionTarget: { chatId, messageId },
+    replyTarget: {
+      chatId,
+      chatType: message.chat.type,
+      replyToMessageId: messageId,
+      messageThreadId,
+    },
+    connectionTestTarget: { chatId, messageThreadId },
+  };
+}
+
+function normalizeTelegramCallbackQuery(update, { username }) {
+  const callback = update.callback_query;
+  const message = callback?.message;
+  const chatId = message?.chat?.id;
+  const senderId = callback?.from?.id;
+  const messageId = message?.message_id;
+  if (!Number.isSafeInteger(update?.update_id) || chatId === undefined || senderId === undefined
+    || !Number.isSafeInteger(messageId)) return null;
+  if (!['private', 'group', 'supergroup'].includes(message.chat?.type)) return null;
+  const direct = message.chat.type === 'private';
+  const messageThreadId = Number.isSafeInteger(message.message_thread_id)
+    ? message.message_thread_id : undefined;
+  const conversationId = messageThreadId === undefined
+    ? String(chatId) : `${chatId}:${messageThreadId}`;
+  return {
+    messageId: String(update.update_id),
+    senderId: String(senderId),
+    contextSource: () => ({
+      senderName: [callback.from?.first_name, callback.from?.last_name]
+        .filter((value) => typeof value === 'string' && value.trim())
+        .map((value) => value.trim()).join(' ') || callback.from?.username,
+      conversationTitle: direct ? undefined : message.chat?.title,
+      chatId: String(chatId),
+      threadId: messageThreadId === undefined ? undefined : String(messageThreadId),
+    }),
+    senderIsBot: callback.from?.is_bot === true,
+    kind: 'callback',
+    chatKind: direct ? 'direct' : 'group',
+    conversationId,
+    content: '',
+    plainText: false,
+    images: [],
+    files: [],
+    addressed: true,
+    callbackQueryId: String(callback.id),
+    callbackData: typeof callback.data === 'string' ? callback.data : '',
+    callbackMessageId: String(messageId),
     replyTarget: {
       chatId,
       chatType: message.chat.type,
@@ -385,7 +435,7 @@ export class TelegramBotClient {
     this.#logger = logger;
   }
 
-  async sendText(target, text) {
+  async sendText(target, text, { replyMarkup } = {}) {
     const chunks = splitTelegramRegularText(text);
     const providerMessageIds = [];
     for (const [index, chunk] of chunks.entries()) {
@@ -394,6 +444,7 @@ export class TelegramBotClient {
         text: chunk,
         replyToMessageId: index === 0 ? target.replyToMessageId : undefined,
         messageThreadId: target.messageThreadId,
+        replyMarkup: index === 0 ? replyMarkup : undefined,
         signal: this.#signal,
       });
       if (Number.isSafeInteger(result?.message_id)) {
@@ -401,6 +452,23 @@ export class TelegramBotClient {
       }
     }
     return { providerMessageIds };
+  }
+
+  async answerCallbackQuery(callbackQueryId, { text, signal } = {}) {
+    await this.#api.answerCallbackQuery({
+      callbackQueryId,
+      text,
+      signal: signal ?? this.#signal,
+    });
+  }
+
+  async editMessageReplyMarkup(target, { replyMarkup, signal } = {}) {
+    await this.#api.editMessageReplyMarkup({
+      chatId: target.chatId,
+      messageId: target.messageId,
+      replyMarkup,
+      signal: signal ?? this.#signal,
+    });
   }
 
   async addReaction(target, emoji, { signal } = {}) {
