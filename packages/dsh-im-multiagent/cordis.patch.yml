@@ -1,0 +1,16 @@
+# @blake-r/dsh-im-multiagent bundle patch.
+#
+# One Telegram chat, all active Harness sessions. The plugin auto-discovers
+# active sessions (host events), mirrors their messages into the chat and
+# routes replies back by reply_to_message. See README.md and
+# .dsh/plans/dsh-im-multiagent-architecture.md (workspace) for the design.
+#
+# The row is disabled by default: the plugin is under construction and must
+# not steal Telegram getUpdates from the live xmanrui-dsh-im bot. Enable by
+# deleting the `disabled: true` line in the deployment profile patch (never
+# by reinstalling the package).
+
+- insert:
+    - id: dsh-im-multiagent
+      name: '@blake-r/dsh-im-multiagent'
+      disabled: true
