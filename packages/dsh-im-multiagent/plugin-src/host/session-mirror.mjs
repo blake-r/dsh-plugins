@@ -93,6 +93,15 @@ export class SessionMirror {
     this.#started = false;
   }
 
+  /**
+   * Current roster: sessionId -> mirror metadata (name, status, workspace,
+   * preset, lastActivityTs, ...). The router uses this for rule 4 (a lone
+   * session is the unambiguous recipient) and for /to-style addressing.
+   */
+  sessions() {
+    return this.#state.mirrorEntries();
+  }
+
   // --- discovery -----------------------------------------------------------
 
   /** Snapshot the roster: persisted + live sessions, then live agents. */

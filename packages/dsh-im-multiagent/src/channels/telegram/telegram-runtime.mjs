@@ -765,6 +765,7 @@ export class TelegramRuntime {
   #createApi;
   #createHttpTransport;
   #commandCatalog;
+  #createBridge;
   #status = createTelegramRuntimeStatus();
   #httpTransport = null;
   #api = null;
@@ -785,6 +786,11 @@ export class TelegramRuntime {
     createApi = (options) => new TelegramApi(options),
     createHttpTransport = createTelegramHttpTransport,
     commandCatalog = SHARED_COMMAND_CATALOG,
+    // [dsh-im-multiagent] marked patch (plan section 2.3): allow a custom
+    // bridge factory so the multiagent InboundRouter can replace the
+    // single-session TelegramHarnessBridge. The factory receives the same
+    // options as the default bridge and must expose accept(message, opts).
+    createBridge = (options) => new TelegramHarnessBridge(options),
   }) {
     if (!config || !token || !harness || !state) {
       throw new TypeError('TelegramRuntime requires config, token, Harness, and state');
@@ -800,6 +806,7 @@ export class TelegramRuntime {
     this.#createApi = createApi;
     this.#createHttpTransport = createHttpTransport;
     this.#commandCatalog = commandCatalog;
+    this.#createBridge = createBridge;
   }
 
   get status() {
@@ -898,7 +905,7 @@ export class TelegramRuntime {
         signal: controller.signal,
         logger: this.#logger,
       });
-      this.#bridge = new TelegramHarnessBridge({
+      this.#bridge = this.#createBridge({
         bot: client,
         harness: this.#harness,
         state: this.#state,
