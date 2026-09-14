@@ -10,7 +10,7 @@ import { dirname } from 'node:path';
 // cursor, deferred) are untouched.
 // ---------------------------------------------------------------------------
 
-const EMPTY_MIRRORING = Object.freeze({ enabled: false, since: null });
+const EMPTY_MIRRORING = Object.freeze({ enabled: true, since: null });
 
 function normalizeMirror(value) {
   const mirror = {};

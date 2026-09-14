@@ -26,6 +26,7 @@
 //   deleteMessage(messageId)
 
 import { AssistantTextAccumulator, textFromHarnessContent } from '../../src/channels/shared/harness-client.mjs';
+import { sortedSessions } from './session-list.mjs';
 
 export const MIRROR_STATUS = Object.freeze({
   COLD: 'cold',
@@ -62,11 +63,13 @@ export class SessionMirror {
   #sessionQuery; // ctx.sessionQuery
   #agents;       // ctx.agents
   #config;       // { maxFinalTextLength }
+  #onSessionsChanged;   // MenuBuilder hook (stage 6a)
+  #onActivity;         // MenuBuilder debounced re-compose hook (stage 6a)
   #turns = new Map();   // sessionId -> turn state
   #disposed = new Set();
   #started = false;
 
-  constructor({ state, index, i18n, outbound, chatKey, sessionQuery, agents, config = {} }) {
+  constructor({ state, index, i18n, outbound, chatKey, sessionQuery, agents, config = {}, onSessionsChanged, onActivity }) {
     this.#state = state;
     this.#index = index;
     this.#i18n = i18n;
@@ -74,6 +77,8 @@ export class SessionMirror {
     this.#chatKey = chatKey;
     this.#sessionQuery = sessionQuery;
     this.#agents = agents;
+    this.#onSessionsChanged = onSessionsChanged;
+    this.#onActivity = onActivity;
     this.#config = {
       maxFinalTextLength: Number.isFinite(config.maxFinalTextLength)
         ? config.maxFinalTextLength
@@ -159,25 +164,135 @@ export class SessionMirror {
   async onAgentCreated({ agent }) {
     this.#disposed.delete(agent.session.id);
     await this.#upsertSession(agent.session.id, { live: true });
+    void this.#onSessionsChanged?.();
   }
 
   async onAgentDisposed({ agent }) {
     const sessionId = agent.session.id;
     this.#disposed.add(sessionId);
     const entry = this.#state.mirrorEntry(sessionId);
-    await this.#editPlaceholder(sessionId, entry, this.#i18n.t('status.closed'));
+    if (this.#mirroringEnabled()) {
+      await this.#editPlaceholder(sessionId, entry, this.#i18n.t('status.closed'));
+    }
     await this.#state.setMirrorEntry(sessionId, { status: MIRROR_STATUS.CLOSED });
     this.#turns.delete(sessionId);
+    void this.#onSessionsChanged?.();
+  }
+
+  // --- mirroring toggle (stage 7) ------------------------------------------
+
+  #mirroringEnabled() {
+    return this.#state.mirroring().enabled === true;
+  }
+
+  /**
+   * /follow snapshot (plan 6.5): an overview line (not indexed) plus the last
+   * assistant message of each session (indexed, reply works), capped at 10
+   * with a "…and N more" tail. Working sessions show the thinking placeholder.
+   */
+  async snapshot() {
+    // Q46 refresh: a repeated /follow deletes the previous snapshot messages
+    // (their ids are persisted in state) before sending a fresh one. The
+    // MessageIndex entries stay — reply routing keeps working, pruning cleans
+    // up the dead records.
+    const previous = this.#state.snapshotIds();
+    if (previous.length > 0) {
+      for (const messageId of previous) {
+        try {
+          await this.#outbound.deleteMessage(messageId);
+        } catch {
+          // Message already gone (edited/deleted in Telegram): ignore.
+        }
+      }
+      await this.#state.setSnapshotIds([]);
+    }
+
+    const sentIds = [];
+    const sessions = sortedSessions(this.#state.mirrorEntries());
+    const cold = sessions.filter(({ entry }) => entry?.status === MIRROR_STATUS.COLD).length;
+    const { messageId: overviewId } = await this.#outbound.sendText(this.#i18n.t('snapshot.overview', {
+      n: sessions.length,
+      m: cold,
+    }));
+    sentIds.push(String(overviewId));
+
+    const CAP = 10;
+    let sent = 0;
+    let skipped = 0;
+    for (const { sessionId, entry } of sessions) {
+      if (sent >= CAP) {
+        skipped += 1;
+        continue;
+      }
+      const text = await this.#snapshotLine(sessionId, entry);
+      if (!text) continue;
+      const { messageId } = await this.#outbound.sendText(text);
+      await this.#index.put(this.#chatKey, { messageId, sessionId, direction: 'out' });
+      sentIds.push(String(messageId));
+      sent += 1;
+    }
+    if (skipped > 0) {
+      const { messageId: moreId } = await this.#outbound.sendText(this.#i18n.t('snapshot.more', { n: skipped }));
+      sentIds.push(String(moreId));
+    }
+    await this.#state.setSnapshotIds(sentIds);
+  }
+
+  async #snapshotLine(sessionId, entry) {
+    const name = entry?.name ?? sessionId;
+    const status = entry?.status ?? MIRROR_STATUS.COLD;
+    if (status === MIRROR_STATUS.WORKING) {
+      return this.#i18n.t('status.placeholder', { name });
+    }
+    const last = await this.#lastAssistantText(sessionId);
+    if (!last) return null;
+    const statusLabel = this.#i18n.t(STATUS_I18N_KEY[status] ?? 'status.cold');
+    return this.#i18n.t('snapshot.per-session', { name, status: statusLabel, text: last });
+  }
+
+  /** Last assistant text from the session surface (cold sessions included). */
+  async #lastAssistantText(sessionId) {
+    try {
+      const surface = await this.#sessionQuery.readSurface?.(sessionId);
+      const events = surface?.events ?? [];
+      for (let i = events.length - 1; i >= 0; i -= 1) {
+        const event = events[i];
+        if (event?.type !== 'assistant/message') continue;
+        const text = textFromHarnessContent(event.data?.message?.content);
+        if (text) return text;
+      }
+    } catch {
+      // Session without a corpus (never started): no last message.
+    }
+    return null;
+  }
+
+  /**
+   * /unfollow finalization (plan 6.5, Q33): every active status placeholder
+   * becomes "⏹ зеркало выключено". The mirror stops processing events, so
+   * this is the last outbound burst.
+   */
+  async finalize() {
+    for (const [sessionId, turn] of this.#turns) {
+      const entry = this.#state.mirrorEntry(sessionId);
+      if (entry?.placeholderMessageId != null) {
+        await this.#editPlaceholder(sessionId, entry, this.#i18n.t('status.mirror-off'));
+      }
+      void turn;
+    }
+    this.#turns.clear();
   }
 
   // --- session/event handling ----------------------------------------------
 
   async onSessionEvent(session, event) {
     if (!this.#started) return;
+    if (!this.#mirroringEnabled()) return;
     const sessionId = session.id;
     if (this.#disposed.has(sessionId)) return;
     const entry = await this.#ensureEntry(sessionId);
     await this.#state.setMirrorEntry(sessionId, { lastActivityTs: Date.now() });
+    void this.#onActivity?.();
     switch (event.type) {
       case 'user/message': return this.#onUserMessage(sessionId, event);
       case 'turn/start': return this.#onTurnStart(sessionId, event);
@@ -311,6 +426,7 @@ export class SessionMirror {
     const title = event.data?.title;
     if (typeof title === 'string' && title) {
       await this.#state.setMirrorEntry(sessionId, { name: title });
+      void this.#onSessionsChanged?.();
     }
   }
 

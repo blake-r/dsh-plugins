@@ -41,6 +41,8 @@ export class InboundRouter {
   #mirror;
   #i18n;
   #commands;
+  #interactions = null;
+  #menuBuilder = null;
   #logger;
   #bot = null;
   #signal = null;
@@ -50,7 +52,7 @@ export class InboundRouter {
   #delivered = 0;
   #rejected = 0;
 
-  constructor({ ctx, config, state, index, mirror, i18n, commands, logger = console }) {
+  constructor({ ctx, config, state, index, mirror, i18n, commands, interactions = null, logger = console }) {
     if (!ctx || !state || !index || !mirror || !i18n || !commands) {
       throw new TypeError('InboundRouter requires ctx, state, index, mirror, i18n, and commands');
     }
@@ -61,6 +63,7 @@ export class InboundRouter {
     this.#mirror = mirror;
     this.#i18n = i18n;
     this.#commands = commands;
+    this.#interactions = interactions;
     this.#logger = logger;
   }
 
@@ -89,6 +92,16 @@ export class InboundRouter {
     this.#bot = bot;
     this.#signal = signal;
     return this;
+  }
+
+  /** MenuBuilder hook: notified on roster/title/alias changes (stage 6a). */
+  withMenuBuilder(builder) {
+    this.#menuBuilder = builder;
+    return this;
+  }
+
+  get menuBuilder() {
+    return this.#menuBuilder;
   }
 
   // --- picker registry (section 4, Q25/Q32; filled by stage 4a) -------------
@@ -168,6 +181,13 @@ export class InboundRouter {
         return;
       }
       const route = this.#route(message, chatKey);
+      // Mirror off (stage 7): only plugin commands are answered; explicit
+      // messages get a hint and are not routed (plan 6.5).
+      if (route.kind !== 'command' && this.#state.mirroring().enabled !== true) {
+        await this.#sendHint(message, 'hint.follow-off');
+        await this.#state.markSeen(messageId);
+        return;
+      }
       await this.#deliver(route, message, chatKey);
       await this.#state.markSeen(messageId);
     } catch (error) {
@@ -251,7 +271,9 @@ export class InboundRouter {
   #isPluginCommand(text) {
     if (!text.startsWith('/')) return false;
     const name = text.slice(1).split(/\s+/, 1)[0].toLowerCase();
-    return PLUGIN_COMMANDS.has(name);
+    if (PLUGIN_COMMANDS.has(name)) return true;
+    // Menu drill-downs (stage 6a): /w_<slug> and /p_<slug>.
+    return /^(w|p)_[a-z0-9_]{1,32}$/.test(name);
   }
 
   #menuSlug(text) {
@@ -272,6 +294,12 @@ export class InboundRouter {
       case 'picker-selection':
         return this.#commands.handlePickerSelection(route.picker, message, chatKey, { router: this });
       case 'session':
+        // A reply on an interaction message (plan 6.8): the pending
+        // question/approval consumes it before it reaches the agent.
+        if (this.#interactions
+          && await this.#interactions.consumeReply(route.sessionId, message, chatKey)) {
+          return;
+        }
         return this.#deliverToSession(route.sessionId, route.text ?? message.content, message, chatKey);
       case 'no-recipient':
         return this.#sendHint(message, 'hint.no-recipient');
@@ -285,6 +313,9 @@ export class InboundRouter {
     if (!content) {
       return this.#sendHint(message, 'hint.text-only');
     }
+    // The sender who started this turn becomes the interaction actor (only
+    // the task initiator may decide an approval / answer a question).
+    this.#interactions?.noteActor(sessionId, String(message?.senderId ?? ''));
     const agent = await this.ensureLiveAgent(sessionId);
     if (!agent) {
       return this.#sendHint(message, 'hint.session-gone');

@@ -495,6 +495,30 @@ export class TelegramBotClient {
     });
   }
 
+  async setMyCommands({ commands, scope, languageCode, signal } = {}) {
+    await this.#api.setMyCommands({
+      commands,
+      scope,
+      languageCode,
+      signal: signal ?? this.#signal,
+    });
+  }
+
+  async deleteMyCommands({ scope, languageCode, signal } = {}) {
+    await this.#api.deleteMyCommands({
+      scope,
+      languageCode,
+      signal: signal ?? this.#signal,
+    });
+  }
+
+  async setChatMenuButton({ menuButton, signal } = {}) {
+    await this.#api.setChatMenuButton({
+      menuButton,
+      signal: signal ?? this.#signal,
+    });
+  }
+
   async addReaction(target, emoji, { signal } = {}) {
     const reactionKey = String(emoji ?? '').trim();
     await this.#api.setMessageReaction({

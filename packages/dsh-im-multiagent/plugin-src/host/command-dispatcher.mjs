@@ -16,6 +16,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
+import { textFromHarnessContent } from '../../src/channels/shared/harness-client.mjs';
 import { resolveSession, sortedSessions } from './session-list.mjs';
 import { PLUGIN_COMMANDS } from './inbound-router.mjs';
 import { STATUS_I18N_KEY } from './session-mirror.mjs';
@@ -91,7 +92,15 @@ export class CommandDispatcher {
         case 'compact': return await this.#compact(message, chatKey, router);
         case 'new': return await this.#new(message, args, router);
         case 'alias': return await this.#alias(message, chatKey, args, router);
-        default: return await this.#notYet(message, name);
+        case 'follow': return await this.#follow(message, args, router);
+        case 'unfollow': return await this.#unfollow(message, router);
+        case 'hs':
+        case 'history': return await this.#hs(message, chatKey, args, router);
+        default:
+          if (/^(w|p)_[a-z0-9_]{1,32}$/.test(name)) {
+            return await this.#drilldown(message, name, router);
+          }
+          return await this.#notYet(message, name);
       }
     } finally {
       this.#router = null;
@@ -543,6 +552,174 @@ export class CommandDispatcher {
     return this.#reply(message, `${header}\n${lines.join('\n')}`);
   }
 
+  // --- mirror toggle (stage 7) ----------------------------------------------
+
+  /**
+   * /follow (or /follow on): enable mirroring and send a snapshot (overview +
+   * last assistant message per session). When already enabled — refresh
+   * (Q46): the snapshot is re-sent; the old snapshot messages stay (reply
+   * routing keeps working, pruning cleans them up).
+   */
+  async #follow(message, args, router) {
+    const arg = String(args ?? '').trim().toLowerCase();
+    if (arg === 'off') {
+      return this.#unfollow(message, router);
+    }
+    if (arg && arg !== 'on') {
+      return router?.reply(message, this.#i18n.t('hint.follow-usage'));
+    }
+    await this.#state.setMirroring(true);
+    await this.#mirror.snapshot();
+    return router?.reply(message, this.#i18n.t('hint.follow-on'));
+  }
+
+  /**
+   * /unfollow (or /follow off): disable mirroring and finalize active status
+   * placeholders. When already disabled — a hint (Q46).
+   */
+  async #unfollow(message, router) {
+    if (this.#state.mirroring().enabled !== true) {
+      return router?.reply(message, this.#i18n.t('hint.follow-not-on'));
+    }
+    await this.#state.setMirroring(false);
+    await this.#mirror.finalize();
+    return router?.reply(message, this.#i18n.t('hint.follow-off'));
+  }
+
+  // --- /hs (stage 7a) -------------------------------------------------------
+
+  /**
+   * /hs [N] [M] — last N messages of a session (plan 6.6, Q3).
+   * Addressing: reply → sessionId from the MessageIndex; without a reply the
+   * first token is a session ordinal (from /as) or name/alias, and the second
+   * token is the message count. Default count 3, max 50. Source is a single
+   * ctx.sessionQuery.readSurface(sessionId) call — no agent resume. The
+   * rendered history is sent through the router so it is indexed (reply
+   * routing works on history lines).
+   */
+  async #hs(message, chatKey, args, router) {
+    const tokens = String(args ?? '').trim().split(/\s+/).filter(Boolean);
+    const replySessionId = this.#replySession(message, chatKey);
+    let sessionId = replySessionId;
+    let count = 3;
+    if (tokens.length > 0) {
+      if (/^\d+$/.test(tokens[0])) {
+        if (replySessionId) {
+          // reply + number → the number is the message count
+          count = Number(tokens[0]);
+        } else {
+          // no reply + number → session ordinal; second token is the count
+          sessionId = resolveSession(this.#mirror.sessions(), tokens[0])?.sessionId;
+          if (tokens.length > 1 && /^\d+$/.test(tokens[1])) count = Number(tokens[1]);
+        }
+      } else {
+        // name/alias; second token is the count
+        sessionId = resolveSession(this.#mirror.sessions(), tokens[0])?.sessionId;
+        if (tokens.length > 1 && /^\d+$/.test(tokens[1])) count = Number(tokens[1]);
+      }
+    }
+    if (!sessionId) return router?.reply(message, this.#i18n.t('hint.hs-usage'));
+    count = Math.max(1, Math.min(50, count));
+
+    let surface;
+    try {
+      surface = await this.#ctx.sessionQuery?.readSurface?.(sessionId);
+    } catch {
+      return router?.reply(message, this.#i18n.t('hint.session-gone'));
+    }
+    if (!surface) return router?.reply(message, this.#i18n.t('hint.session-gone'));
+
+    const events = (surface.events ?? []).filter((event) => {
+      if (event?.type === 'user/message') return textFromHarnessContent(event.data?.content) !== '';
+      if (event?.type === 'assistant/message') return textFromHarnessContent(event.data?.message?.content) !== '';
+      return false;
+    });
+    if (events.length === 0) return router?.reply(message, this.#i18n.t('hint.no-messages'));
+
+    const name = this.#displayName(sessionId);
+    const lines = [];
+    const skipped = Math.max(0, events.length - count);
+    for (const event of events.slice(-count)) {
+      const text = event.type === 'user/message'
+        ? textFromHarnessContent(event.data?.content)
+        : textFromHarnessContent(event.data?.message?.content);
+      const time = this.#formatTime(event.time);
+      lines.push(this.#i18n.t('history.format', { name, time, text }));
+    }
+    const header = skipped > 0
+      ? this.#i18n.t('hint.more-messages', { m: skipped })
+      : null;
+    const body = [header, ...lines].filter(Boolean).join('\n');
+    // Q3: the rendered history is indexed so reply routing works on it.
+    const sent = await router?.replyWithMarkup(message, body);
+    const providerId = sent?.providerMessageIds?.[0] ?? sent?.messageId;
+    if (providerId !== undefined) {
+      await this.#index.put(chatKey, {
+        messageId: String(providerId),
+        sessionId,
+        direction: 'out',
+      });
+    }
+    return undefined;
+  }
+
+  #formatTime(time) {
+    if (!Number.isFinite(Number(time))) return '—';
+    const date = new Date(Number(time));
+    const pad = (value) => String(value).padStart(2, '0');
+    return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  }
+
+  // --- menu drill-downs (stage 6a) ------------------------------------------
+
+  /**
+   * /w_<slug> — sessions of the workspace whose title slugifies to <slug>;
+   * /p_<slug> — preset info + sessions using it. Slugification mirrors
+   * MenuBuilder: lowercase [a-z0-9_], no Cyrillic, base truncated to 30.
+   */
+  async #drilldown(message, name, router) {
+    const [prefix, slug] = name.split('_', 2);
+    if (prefix === 'w') {
+      const workspace = this.#workspaceList().find((row) => this.#slugify(row.title) === slug);
+      if (!workspace) return router?.reply(message, this.#i18n.t('hint.drilldown-miss'));
+      const sessions = sortedSessions(this.#mirror.sessions())
+        .filter(({ entry }) => entry?.workspace === workspace.path || entry?.workspace === workspace.id)
+        .map(({ sessionId, entry }) => {
+          const name = entry?.name ?? sessionId;
+          const status = this.#i18n.t(STATUS_I18N_KEY[entry?.status] ?? 'status.cold');
+          return `- ${name} [${status}]`;
+        });
+      const header = this.#i18n.t('list.ws-drilldown', {
+        title: workspace.title,
+        n: sessions.length,
+      });
+      return router?.reply(message, `${header}\n${sessions.join('\n')}`);
+    }
+    const presets = await this.#presetList();
+    const preset = presets.find((row) => this.#slugify(row.name) === slug || this.#slugify(row.id) === slug);
+    if (!preset) return router?.reply(message, this.#i18n.t('hint.drilldown-miss'));
+    const sessions = sortedSessions(this.#mirror.sessions())
+      .filter(({ entry }) => entry?.preset === preset.id)
+      .map(({ sessionId, entry }) => {
+        const name = entry?.name ?? sessionId;
+        const status = this.#i18n.t(STATUS_I18N_KEY[entry?.status] ?? 'status.cold');
+        return `- ${name} [${status}]`;
+      });
+    const header = this.#i18n.t('list.ps-drilldown', {
+      name: preset.name || preset.id,
+      n: sessions.length,
+    });
+    const description = preset.description ? `\n${preset.description}` : '';
+    return router?.reply(message, `${header}\n${sessions.join('\n')}${description}`);
+  }
+
+  /** MenuBuilder-compatible title slug (null when not slugifiable). */
+  #slugify(title) {
+    const base = String(title ?? '').trim().toLowerCase();
+    if (!base || /[а-яё]/i.test(base) || !/^[a-z0-9_]{1,32}$/.test(base)) return null;
+    return base.slice(0, 30);
+  }
+
   // --- /stop ----------------------------------------------------------------
 
   async #stop(message, chatKey, args, router) {
@@ -733,6 +910,7 @@ export class CommandDispatcher {
     const name = String(args ?? '').trim();
     if (!name) {
       await this.#state.setMirrorEntry(sessionId, { alias: null });
+      void router?.menuBuilder?.onSessionsChanged();
       return router?.reply(message, this.#i18n.t('hint.alias-ok', { alias: name }));
     }
     if (name.length > 32 || !/^[a-z0-9_а-яё]+$/i.test(name)) {
@@ -748,6 +926,7 @@ export class CommandDispatcher {
       }
     }
     await this.#state.setMirrorEntry(sessionId, { alias: name });
+    void router?.menuBuilder?.onSessionsChanged();
     return router?.reply(message, this.#i18n.t('hint.alias-ok', { alias: name }));
   }
 

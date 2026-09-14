@@ -1,17 +1,35 @@
 import { t } from './i18n.mjs';
 
+// Durable localization patch (dsh-im-multiagent, plan 6.8, Q43/Q49): the
+// approval dictionary is extended with Russian synonyms and every user-facing
+// prompt resolves through an injectable translator. The shared dsh-im `t`
+// keeps the Chinese literals as identity keys; an injected translator (the
+// multiagent plugin catalog) resolves short catalog keys instead. Without an
+// injected translator the module behaves exactly like upstream dsh-im.
 const APPROVAL_REPLIES = new Map([
   ['批准', 'allowed-once'],
   ['同意', 'allowed-once'],
   ['yes', 'allowed-once'],
+  // Q43: Russian synonyms for "approve".
+  ['да', 'allowed-once'],
+  ['одобрить', 'allowed-once'],
+  ['подтверждаю', 'allowed-once'],
+  ['разрешаю', 'allowed-once'],
   ['拒绝', 'rejected'],
   ['不同意', 'rejected'],
   ['no', 'rejected'],
+  // Q43: Russian synonyms for "reject".
+  ['нет', 'rejected'],
+  ['отклонить', 'rejected'],
+  ['запрещаю', 'rejected'],
 ]);
 
-const APPROVAL_PROMPT = '请精准回复「批准」或「拒绝」（也支持：同意 / 不同意 / yes / no）。';
-const APPROVAL_AFTER_QUESTION_PROMPT = '请先完成当前问题，再精准回复「批准」或「拒绝」。';
-const APPROVAL_RESOLVED_TEXT = '该审批已处理，无需再次回复。';
+const APPROVAL_PROMPT_ZH = '请精准回复「批准」或「拒绝」（也支持：同意 / 不同意 / yes / no）。';
+const APPROVAL_PROMPT_KEY = 'interaction.approval-prompt';
+const APPROVAL_AFTER_QUESTION_PROMPT_ZH = '请先完成当前问题，再精准回复「批准」或「拒绝」。';
+const APPROVAL_AFTER_QUESTION_PROMPT_KEY = 'interaction.approval-after-question';
+const APPROVAL_RESOLVED_TEXT_ZH = '该审批已处理，无需再次回复。';
+const APPROVAL_RESOLVED_TEXT_KEY = 'interaction.approval-resolved';
 const RESOLVED_ROUTE_TTL_MS = 5 * 60_000;
 const MAX_RESOLVED_ROUTES = 2_048;
 
@@ -21,6 +39,14 @@ function cleanText(value) {
 
 function printableText(value) {
   return cleanText(value).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '');
+}
+
+/**
+ * Resolve a localized prompt: an injected translator maps the short catalog
+ * key; the shared dsh-im `t` maps the Chinese literal (identity in zh mode).
+ */
+function promptText(translate, key, zh, params) {
+  return typeof translate === 'function' ? translate(key, params) : t(zh, params);
 }
 
 export function harnessApprovalDecision(text) {
@@ -60,6 +86,7 @@ export function harnessApprovalText(payload, {
   toolCall,
   requiresMention = false,
   maxArgumentsLength = 6_000,
+  t: translate = null,
 } = {}) {
   if (!validHarnessApproval(payload)) return null;
   const callId = cleanText(payload.callId);
@@ -70,16 +97,18 @@ export function harnessApprovalText(payload, {
   if (!operation || operation.length > maxArgumentsLength) return null;
 
   const lines = [
-    t('DeepSeek Harness 需要你的审批：'),
+    promptText(translate, 'interaction.approval-title', 'DeepSeek Harness 需要你的审批：'),
     '',
-    t('工具：{tool}', { tool: printableText(payload.toolName) }),
-    t('操作参数：'),
+    promptText(translate, 'interaction.tool', '工具：{tool}', { tool: printableText(payload.toolName) }),
+    promptText(translate, 'interaction.operation-params', '操作参数：'),
     operation,
   ];
   const reason = printableText(payload.reason);
-  if (reason) lines.push(t('原因：{reason}', { reason }));
-  lines.push('', t(APPROVAL_PROMPT));
-  if (requiresMention) lines.push('', t('群聊中请 @机器人 后发送审批决定。'));
+  if (reason) lines.push(promptText(translate, 'interaction.reason', '原因：{reason}', { reason }));
+  lines.push('', promptText(translate, APPROVAL_PROMPT_KEY, APPROVAL_PROMPT_ZH));
+  if (requiresMention) {
+    lines.push('', promptText(translate, 'interaction.mention-approval', '群聊中请 @机器人 后发送审批决定。'));
+  }
   return lines.join('\n');
 }
 
@@ -94,26 +123,37 @@ function approvalResult(pending, outcome) {
   };
 }
 
-function approvalOutcomeText(outcome) {
-  if (outcome === 'allowed-once') return t('已批准，仅对本次操作有效。');
-  if (outcome === 'rejected') return t('已拒绝此次操作。');
-  return t(APPROVAL_RESOLVED_TEXT);
+function approvalOutcomeText(outcome, translate) {
+  if (outcome === 'allowed-once') {
+    return promptText(translate, 'interaction.approval-allowed', '已批准，仅对本次操作有效。');
+  }
+  if (outcome === 'rejected') {
+    return promptText(translate, 'interaction.approval-rejected', '已拒绝此次操作。');
+  }
+  return promptText(translate, APPROVAL_RESOLVED_TEXT_KEY, APPROVAL_RESOLVED_TEXT_ZH);
 }
 
 export class HarnessApprovalQueue {
   #label;
   #logger;
+  #t;
   #byId = new Map();
   #routes = new Map();
   #resolvedRoutes = new Map();
 
-  constructor({ label = 'IM', logger = console } = {}) {
+  constructor({ label = 'IM', logger = console, t: translate = null } = {}) {
     this.#label = label;
     this.#logger = logger;
+    this.#t = translate;
   }
 
   hasPending(key) {
     return this.#routes.get(key)?.items.some((pending) => !pending.inactive) === true;
+  }
+
+  /** Session id of the FIFO route head for a chat key (or null). */
+  sessionForRoute(key) {
+    return this.#routes.get(key)?.items[0]?.sessionId ?? null;
   }
 
   claimReply({
@@ -151,11 +191,11 @@ export class HarnessApprovalQueue {
         return null;
       }
       if (!decision) return null;
-      return notice(t(APPROVAL_RESOLVED_TEXT), true);
+      return notice(promptText(this.#t, APPROVAL_RESOLVED_TEXT_KEY, APPROVAL_RESOLVED_TEXT_ZH), true);
     }
     if (pending.actor !== actor || (pending.requiresMention && addressed !== true)) {
       if (!decision) return null;
-      return notice(t('只有发起当前任务的用户可以处理这条审批。'));
+      return notice(promptText(this.#t, 'interaction.approval-actor-only', '只有发起当前任务的用户可以处理这条审批。'));
     }
 
     return {
@@ -170,14 +210,14 @@ export class HarnessApprovalQueue {
               await questionCompletion.catch(() => undefined);
               if (pending.inactive || pending.resolving) return;
               if (typeof isQuestionPending === 'function' && isQuestionPending()) {
-                await send(t(APPROVAL_AFTER_QUESTION_PROMPT));
+                await send(promptText(this.#t, APPROVAL_AFTER_QUESTION_PROMPT_KEY, APPROVAL_AFTER_QUESTION_PROMPT_ZH));
                 return;
               }
             }
             await pending.activationTask?.catch(() => undefined);
             await pending.presentationTask?.catch(() => undefined);
             if (pending.inactive || pending.resolving) {
-              await send(t(APPROVAL_RESOLVED_TEXT));
+              await send(promptText(this.#t, APPROVAL_RESOLVED_TEXT_KEY, APPROVAL_RESOLVED_TEXT_ZH));
               return;
             }
             pending.send = send;
@@ -187,15 +227,15 @@ export class HarnessApprovalQueue {
             if (!presentedWhenClaimed || !pending.presented) {
               if (!pending.presented) await this.#present(pending);
               if (pending.inactive || pending.resolving) return;
-              await send(t(APPROVAL_PROMPT));
+              await send(promptText(this.#t, APPROVAL_PROMPT_KEY, APPROVAL_PROMPT_ZH));
               return;
             }
             if (pending.submitting) {
-              await send(t('审批决定正在提交，请稍候。'));
+              await send(promptText(this.#t, 'interaction.approval-submitting', '审批决定正在提交，请稍候。'));
               return;
             }
             if (!decision) {
-              await send(t(APPROVAL_PROMPT));
+              await send(promptText(this.#t, APPROVAL_PROMPT_KEY, APPROVAL_PROMPT_ZH));
               return;
             }
             await this.#submit(pending, decision);
@@ -253,12 +293,13 @@ export class HarnessApprovalQueue {
     const text = harnessApprovalText(payload, {
       toolCall: interaction.toolCall,
       requiresMention: context.requiresMention === true,
+      t: this.#t,
     });
     if (!text) {
       const rejected = await this.#rejectInteraction(interaction, payload);
       await send(rejected
-        ? t('无法完整展示这次操作，已安全拒绝此次审批。')
-        : t(APPROVAL_RESOLVED_TEXT));
+        ? promptText(this.#t, 'interaction.approval-unrenderable', '无法完整展示这次操作，已安全拒绝此次审批。')
+        : promptText(this.#t, APPROVAL_RESOLVED_TEXT_KEY, APPROVAL_RESOLVED_TEXT_ZH));
       return true;
     }
 
@@ -329,7 +370,7 @@ export class HarnessApprovalQueue {
       }
       if (shouldNotify && delivered) {
         pending.resolutionNotified = true;
-        await send(approvalOutcomeText(resolution.outcome)).catch(() => undefined);
+        await send(approvalOutcomeText(resolution.outcome, this.#t)).catch(() => undefined);
       }
     });
     return true;
@@ -349,14 +390,14 @@ export class HarnessApprovalQueue {
         pending.closedOutcome = 'rejected';
         if ((pending.presented || pending.deliveryCompleted) && !pending.resolutionNotified) {
           pending.resolutionNotified = true;
-          await pending.send(approvalOutcomeText('rejected')).catch(() => undefined);
+          await pending.send(approvalOutcomeText('rejected', this.#t)).catch(() => undefined);
         }
       } catch (error) {
         if (error?.code === 'interaction-not-pending') {
           pending.closedOutcome = 'resolved';
           if ((pending.presented || pending.deliveryCompleted) && !pending.resolutionNotified) {
             pending.resolutionNotified = true;
-            await pending.send(t(APPROVAL_RESOLVED_TEXT)).catch(() => undefined);
+            await pending.send(promptText(this.#t, APPROVAL_RESOLVED_TEXT_KEY, APPROVAL_RESOLVED_TEXT_ZH)).catch(() => undefined);
           }
         } else {
           this.#logger.warn?.(`[dsh-im:${this.#label}] failed to reject a closing approval:`, error);
@@ -385,7 +426,7 @@ export class HarnessApprovalQueue {
         pending.presented = true;
       } else if (pending.closedOutcome && !pending.resolutionNotified) {
         pending.resolutionNotified = true;
-        await pending.send(approvalOutcomeText(pending.closedOutcome)).catch(() => undefined);
+        await pending.send(approvalOutcomeText(pending.closedOutcome, this.#t)).catch(() => undefined);
       }
     } finally {
       if (pending.presentationTask === task) pending.presentationTask = null;
@@ -402,7 +443,7 @@ export class HarnessApprovalQueue {
         const next = this.#remove(pending);
         await this.#transition(next, async () => {
           if (!pending.resolutionNotified) {
-            await send(t(APPROVAL_RESOLVED_TEXT)).catch(() => undefined);
+            await send(promptText(this.#t, APPROVAL_RESOLVED_TEXT_KEY, APPROVAL_RESOLVED_TEXT_ZH)).catch(() => undefined);
           }
         });
         return;
@@ -410,7 +451,7 @@ export class HarnessApprovalQueue {
       if (pending.inactive) return;
       pending.submitting = false;
       this.#logger.error?.(`[dsh-im:${this.#label}] failed to submit an approval:`, error);
-      await pending.send(t('审批提交失败，请重新回复「批准」或「拒绝」。')).catch(() => undefined);
+      await pending.send(promptText(this.#t, 'interaction.approval-submit-failed', '审批提交失败，请重新回复「批准」或「拒绝」。')).catch(() => undefined);
       return;
     }
 
@@ -418,7 +459,7 @@ export class HarnessApprovalQueue {
     const next = this.#remove(pending);
     await this.#transition(next, async () => {
       if (!pending.resolutionNotified) {
-        await send(approvalOutcomeText(outcome)).catch(() => undefined);
+        await send(approvalOutcomeText(outcome, this.#t)).catch(() => undefined);
       }
     });
   }
