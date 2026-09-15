@@ -1,17 +1,42 @@
-// dsh-im-multiagent host plugin entry (stage 1 skeleton).
+// dsh-im-multiagent host plugin entry (stage 8).
 //
-// The full implementation (SessionMirror, InboundRouter, BotChannel,
-// InteractionAdapter, MenuBuilder, CmdSkillPicker, StateStore, Management
-// RPC) lands in later stages of .dsh/plans/dsh-im-multiagent-architecture.md.
-// The cordis row is disabled by default, so this stub is not mounted in the
-// live profile.
+// Wires the production pipeline (SessionMirror, InboundRouter, BotChannel,
+// InteractionAdapter, MenuBuilder, stores) and mounts the loopback management
+// RPC channel "/telegram-multiagent" (plan section 10, Q35). The cordis row
+// stays disabled by default; the client side (plugin-src/client) is owned by
+// a separate workstream.
+
+import { createMultiagentProduction } from './production.mjs';
+import { installMultiagentRpc } from './rpc.mjs';
 
 export const name = 'dsh-im-multiagent';
-export const inject = ['connection', 'credentials', 'agents', 'typersGateway'];
+export const inject = ['connection', 'credentials', 'agents', 'typersGateway', 'sessionQuery', 'slots'];
+
+let applied = false;
 
 export async function apply(ctx, config = {}) {
-  ctx.logger?.warn?.(
-    '[dsh-im-multiagent] skeleton plugin: implementation not yet mounted',
+  if (applied) return;
+  applied = true;
+  const logger = typeof ctx.logger === 'function'
+    ? ctx.logger(name)
+    : (ctx.logger ?? console);
+  if (!ctx?.credentials) {
+    logger.warn?.(
+      '[dsh-im-multiagent] credentials service is missing; production and management RPC are not mounted',
+    );
+    return;
+  }
+  const production = await createMultiagentProduction(ctx, config);
+  installMultiagentRpc(ctx, {
+    mirror: production.mirror,
+    index: production.index,
+    configStore: production.configStore,
+    getRuntimeConfig: production.getRuntimeConfig,
+    applyRuntimeConfig: production.applyRuntimeConfig,
+  });
+  ctx.effect(() => () => production.close(), 'dsh-im-multiagent: close');
+  const botCount = production.configStore.list().length;
+  logger.info?.(
+    `[dsh-im-multiagent] started: chatKey=${production.chatKey}, bots=${botCount}`,
   );
-  void config;
 }
