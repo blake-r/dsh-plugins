@@ -1,5 +1,5 @@
 // micro-compaction.js
-// Cordis plugin for the kb preset: per-request trajectory re-composition.
+// Cordis plugin: per-request trajectory re-composition.
 //
 // After every completed agent request (anchored on the `turn/end` event), every
 // assistant-turn session since our last content re-installation is re-composed

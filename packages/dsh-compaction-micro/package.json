@@ -1,7 +1,7 @@
 {
   "name": "@blake-r/dsh-compaction-micro",
   "version": "0.2.0",
-  "description": "Per-request trajectory re-composition for the kb preset.",
+  "description": "Per-request trajectory re-composition.",
   "type": "module",
   "main": "src/dsh-compaction-micro.mjs",
   "exports": {

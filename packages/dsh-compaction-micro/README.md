@@ -1,6 +1,6 @@
 # @blake-r/dsh-compaction-micro
 
-Per-request trajectory re-composition for the kb preset.
+Per-request trajectory re-composition.
 
 ## Install
 
