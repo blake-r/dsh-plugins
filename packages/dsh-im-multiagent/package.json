@@ -5,20 +5,34 @@
   "type": "module",
   "main": "plugin-src/host/index.mjs",
   "exports": {
-    ".": "./plugin-src/host/index.mjs"
+    ".": "./plugin-src/host/index.mjs",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
   },
   "files": [
     "plugin-src",
     "src",
+    "lib",
+    "scripts",
     "cordis.patch.yml",
     "README.md"
   ],
   "scripts": {
-    "check": "node --check plugin-src/host/index.mjs"
+    "build": "node scripts/build.mjs",
+    "build:client": "node scripts/build.mjs",
+    "check": "node --check plugin-src/host/index.mjs && node --check plugin-src/client/index.js && node scripts/build.mjs --check"
   },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "slots",
+        "connection",
+        "locale"
+      ]
     }
   },
   "dependencies": {
