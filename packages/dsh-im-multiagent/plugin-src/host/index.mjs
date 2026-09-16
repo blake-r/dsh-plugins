@@ -10,7 +10,7 @@ import { createMultiagentProduction } from './production.mjs';
 import { installMultiagentRpc } from './rpc.mjs';
 
 export const name = 'dsh-im-multiagent';
-export const inject = ['connection', 'credentials', 'agents', 'typersGateway', 'sessionQuery', 'slots'];
+export const inject = ['connection', 'credentials', 'agents', 'sessionQuery', 'workspaceRegistry'];
 
 let applied = false;
 
