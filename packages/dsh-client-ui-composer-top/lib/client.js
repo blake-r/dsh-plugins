@@ -37,9 +37,33 @@ window.__ModuleLoader__.load({
 			//    already fit; these add a hard viewport bound for short windows.
 			"[data-question-key] > *{max-height:min(60vh,520px,calc(100dvh - 140px))!important}",
 			"[data-approval-scroll]{max-height:min(var(--dsh-composer-text-max-height),calc(100dvh - 140px))!important}",
-			// 5. Trajectory overlay: the seat covers the message area from the
-			//    top edge instead of the bottom.
-			"[data-conversation-composer-overlay] [data-composer-seat]{top:0!important;bottom:auto!important}"
+			// 5. Trajectory overlay: the stock overlay layout floats the
+			//    composer seat (position:absolute) over the trajectory view.
+			//    With the seat pinned at the top that hides the trajectory
+			//    toolbar and the first rows under the composer card. Keep the
+			//    seat in-flow (sticky, order:-1) so the trajectory starts
+			//    below it, and drop the stock bottom clearance (it was meant
+			//    for the bottom-anchored composer). The trajectory ledger
+			//    derives its bottom clearance from --dsh-composer-height
+			//    (set inline on the scroll body by the seat ResizeObserver);
+			//    zero it so the table and details panel don't keep a dead
+			//    strip at the bottom.
+			"[data-conversation-scroll]:has([data-conversation-composer-overlay]) > [data-composer-seat]{position:sticky!important;top:0!important;bottom:auto!important}",
+			"[data-conversation-scroll]:has([data-conversation-composer-overlay]){--dsh-composer-height:0px!important}",
+			"[data-conversation-scroll]:has([data-conversation-composer-overlay]) [data-trajectory-scroll]{padding-bottom:0!important}",
+			// 6. Command/skill dropdowns (slash menu + popupSelect) open
+			//    downward: the stock menus are bottom-anchored
+			//    (bottom:calc(100% + 4px)) and grow upward — with the seat
+			//    pinned at the top they slide under the Chat/Trajectory header
+			//    and get clipped by the scroll container. Move the overlay
+			//    anchor to the card's bottom edge (100% of the zero-height
+			//    anchor then means "below the card") and re-anchor the menus
+			//    below the card. The popupSelect card is the overlay's only
+			//    aria-labelled child (the slash menu carries data-trigger-menu,
+			//    the feedback entry renders a hidden probe).
+			"[data-phase=active] [data-composer-card] > :has(> [data-slot=\"conversation.input.overlay\"]){inset:auto 0 0 0!important}",
+			"[data-phase=active] [data-composer-card] [data-trigger-menu]{bottom:auto!important;top:calc(100% + 4px)!important}",
+			"[data-phase=active] [data-composer-card] [data-slot=\"conversation.input.overlay\"] > [aria-label]{bottom:auto!important;top:calc(100% + 4px)!important}"
 		].join("");
 
 		const tagId = "@blake-r/dsh-client-ui-composer-top/composer-top.css";
