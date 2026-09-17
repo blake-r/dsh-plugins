@@ -1,0 +1,35 @@
+{
+  "name": "@blake-r/dsh-client-ui-composer-top",
+  "version": "0.1.0",
+  "description": "DSH Web UI plugin: pins the composer (prompt input) to the top of the conversation area, under the header. User dialogs (question cards, permission approvals) hang from the top edge and stay within the visible area; dock panels move below the input; the scroll-to-bottom button stays at the bottom edge.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "node --check lib/index.js && node --check lib/client.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
