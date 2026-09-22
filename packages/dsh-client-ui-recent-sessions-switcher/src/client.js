@@ -112,8 +112,8 @@ export function apply(ctx) {
       const { useSessions, useSessionPendingInteraction, useWorkspaces, sessionId, heroDock } = props;
       const list = useSessions((s) => s);
       const pendingInteractions = useSessionPendingInteraction((s) => s);
-      const workspaces = useWorkspaces((s) => s);
-      const archivedSessionIds = workspaces.archivedSessionIds;
+      const workspaceSnapshot = useWorkspaces((s) => s);
+      const archivedSessionIds = workspaceSnapshot.archivedSessionIds;
       const [open, setOpen] = React.useState(false);
       const [forceUnread, setForceUnread] = React.useState(false);
       const rootRef = React.useRef(null);
@@ -150,13 +150,13 @@ export function apply(ctx) {
       // resolution (workspace browser search rows, hero workspace chip).
       const workspaceBySession = React.useMemo(() => {
         const map = new Map();
-        for (const workspace of workspaces.items) {
+        for (const workspace of workspaceSnapshot.items) {
           for (const sessionId of workspace.sessionIds) {
             if (!map.has(sessionId)) map.set(sessionId, workspace.title);
           }
         }
         return map;
-      }, [workspaces.items]);
+      }, [workspaceSnapshot.items]);
       const workspaceLabelOf = (s) => workspaceBySession.get(s.id) ?? workspaceTitleOf(s.cwd);
 
       const recent = React.useMemo(() => {
