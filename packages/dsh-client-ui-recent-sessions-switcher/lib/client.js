@@ -166,7 +166,8 @@ window.__ModuleLoader__.load({
 					const { useSessions, useSessionPendingInteraction, useWorkspaces, sessionId, heroDock } = props;
 					const list = useSessions((s) => s);
 					const pendingInteractions = useSessionPendingInteraction((s) => s);
-					const archivedSessionIds = useWorkspaces((s) => s.archivedSessionIds);
+					const workspaces = useWorkspaces((s) => s);
+					const archivedSessionIds = workspaces.archivedSessionIds;
 					const [open, setOpen] = react.useState(false);
 					const [forceUnread, setForceUnread] = react.useState(false);
 					const rootRef = react.useRef(null);
@@ -202,6 +203,21 @@ window.__ModuleLoader__.load({
 						};
 					}, [open]);
 
+					// Workspace display name for a session: the Workspace's user-chosen
+					// `title` when the session is accounted to one (the title may differ from
+					// the directory basename), otherwise the cwd basename. Mirrors dsh's own
+					// resolution (workspace browser search rows, hero workspace chip).
+					const workspaceBySession = react.useMemo(() => {
+						const map = new Map();
+						for (const workspace of workspaces.items) {
+							for (const sessionId of workspace.sessionIds) {
+								if (!map.has(sessionId)) map.set(sessionId, workspace.title);
+							}
+						}
+						return map;
+					}, [workspaces.items]);
+					const workspaceLabelOf = (s) => workspaceBySession.get(s.id) ?? workspaceTitleOf(s.cwd);
+
 					const recent = react.useMemo(() => {
 						if (list.phase !== "ready") return [];
 						const archived = new Set(archivedSessionIds);
@@ -209,7 +225,7 @@ window.__ModuleLoader__.load({
 						for (const id of list.ids) {
 							const s = list.byId[id];
 							if (s === undefined || s.blank || s.origin === "subagent" || archived.has(id)) continue;
-							items.push({ id, title: s.displayTitle, cwd: s.cwd, updatedAt: s.updatedAt, running: s.running === true, completed: s.completed === true, pending: visiblePendingKind(pendingInteractions.get(id)?.kind) });
+							items.push({ id, title: s.displayTitle, workspace: workspaceLabelOf(s), cwd: s.cwd, updatedAt: s.updatedAt, running: s.running === true, completed: s.completed === true, pending: visiblePendingKind(pendingInteractions.get(id)?.kind) });
 						}
 						items.sort((a, b) => b.updatedAt - a.updatedAt);
 						// Always include every active (running), unread (completed), or
@@ -219,12 +235,12 @@ window.__ModuleLoader__.load({
 						const priority = items.filter((i) => i.running || i.completed || i.pending);
 						const rest = items.filter((i) => !i.running && !i.completed && !i.pending);
 						return priority.concat(rest).slice(0, 8);
-					}, [list, pendingInteractions, archivedSessionIds]);
+					}, [list, pendingInteractions, archivedSessionIds, workspaceBySession]);
 
 					const current = list.byId[sessionId];
 					currentRunningRef.current = current ? current.running === true : false;
 					const currentTitle = current && !current.blank ? current.displayTitle : "";
-					const currentCwd = current && current.cwd ? workspaceTitleOf(current.cwd) : "";
+					const currentWorkspace = current && current.cwd ? workspaceLabelOf(current) : "";
 					const currentStatus = current
 						? statusOf({ running: current.running === true, completed: current.completed === true, pending: visiblePendingKind(pendingInteractions.get(sessionId)?.kind) })
 						: { state: "idle", label: "Idle" };
@@ -259,7 +275,7 @@ window.__ModuleLoader__.load({
 					// render "dsh / Recent sessions" (the hero workspace chip already
 					// names the workspace).
 					const isHeroDock = heroDock === true;
-					const showCwd = currentCwd !== "" && !(isHeroDock && currentTitle === "");
+					const showCwd = currentWorkspace !== "" && !(isHeroDock && currentTitle === "");
 					// Hero screen with nothing to switch to (and nothing running): show no
 					// control at all rather than an inert trigger that reads "0".
 					if (isHeroDock && recent.length === 0) return null;
@@ -279,7 +295,7 @@ window.__ModuleLoader__.load({
 							isHeroDock
 								? react.createElement(primitives.IconClockOutline16, { size: 14 })
 								: react.createElement(StatusIndicator, { status: currentStatus }),
-							showCwd ? react.createElement("span", { className: "rss-cwd" }, currentCwd) : null,
+							showCwd ? react.createElement("span", { className: "rss-cwd" }, currentWorkspace) : null,
 							showCwd ? react.createElement("span", { className: "rss-cwdSep" }, "/") : null,
 							react.createElement("span", { className: "rss-triggerLabel", title: isHeroDock ? "Recent sessions" : undefined }, currentTitle || (isHeroDock ? "Recent" : "Switch")),
 							react.createElement("span", { className: "rss-chevron" }, open ? "\u25B2" : "\u25BC"),
@@ -302,8 +318,8 @@ window.__ModuleLoader__.load({
 											title: st.label,
 										},
 											react.createElement(StatusIndicator, { status: st }),
-											item.cwd ? react.createElement("span", { className: "rss-itemCwd" }, workspaceTitleOf(item.cwd)) : null,
-											item.cwd ? react.createElement("span", { className: "rss-itemCwdSep" }, "/") : null,
+											item.workspace ? react.createElement("span", { className: "rss-itemCwd" }, item.workspace) : null,
+											item.workspace ? react.createElement("span", { className: "rss-itemCwdSep" }, "/") : null,
 											react.createElement("span", { className: "rss-itemLabel" }, item.title)
 										),
 										react.createElement("div", { className: "rss-itemTrailing" },

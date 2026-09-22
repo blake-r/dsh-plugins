@@ -1,9 +1,19 @@
 # dsh-client-ui-recent-sessions-switcher
 
 A DeepSeek Harness Web UI plugin: a compact recent-sessions switcher in the
-conversation header. It shows the current session's workspace basename and
+conversation header. It shows the current session's workspace name and
 title, a status dot (running / idle / unread), and a dropdown of the 8 most
 recently-updated sessions. Clicking an item opens that session.
+
+## Workspace names
+
+Each row (and the header trigger) labels a session with its **workspace
+name**, not the directory basename: a session accounted to a Workspace shows
+that Workspace's user-chosen `title` (which may differ from the directory
+name — e.g. a Workspace titled `goals` rooted at `.../Goals`), mirroring
+dsh's own resolution in the workspace browser and the hero workspace chip.
+Sessions not accounted to any Workspace (no matching `cwd`) fall back to the
+`cwd` basename.
 
 ## New-session screen
 
