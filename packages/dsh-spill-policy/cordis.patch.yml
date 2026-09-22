@@ -1,0 +1,17 @@
+# @blake-r/dsh-spill-policy bundle patch.
+# Declaring `dsh.bundle` in package.json makes `dsh plugin add` treat this
+# package as a profile layer: it is added to `dsh.profile.bundles`
+# automatically and this patch is applied as a layer. The user's profile
+# patch is applied after this bundle, so per-profile overrides still win.
+
+# This package is the deployment's replacement spill policy: the base
+# @deepseek-ai/dsh-spill-policy row (maxInlineBytes=50000) is disabled here
+# and the tighter replacement row is inserted. The web profile's
+# cordis.patch.yml (applied after this bundle layer) supplies the
+# maxInlineBytes/excludeTools config.
+- id: spill-policy
+  disabled: true
+
+- insert:
+    - id: dsh-spill-policy
+      name: '@blake-r/dsh-spill-policy'

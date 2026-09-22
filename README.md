@@ -25,6 +25,7 @@ dsh-plugins/
 | [dsh-assembly-tools-prompt-strip](packages/dsh-assembly-tools-prompt-strip/README.md) | Drop the `tool:<name>` prose guidance sections from the system prompt. |
 | [dsh-command-from-prompt](packages/dsh-command-from-prompt/README.md) | Generic "command = user prompt" slash-command plugin. |
 | [dsh-compaction-micro](packages/dsh-compaction-micro/README.md) | Per-request trajectory re-composition. |
+| [dsh-spill-policy](packages/dsh-spill-policy/README.md) | Replacement spill policy: bound oversized model-facing tool results to a head/tail preview plus a spill notice. |
 | [dsh-provider-websearch-lightpanda](packages/dsh-provider-websearch-lightpanda/README.md) | WebRuntime provider pair backed by the lightpanda MCP server. |
 | [dsh-skill-from-tools](packages/dsh-skill-from-tools/README.md) | One skill per tool (no module grouping), short form. |
 | [dsh-tool-filter-root-find](packages/dsh-tool-filter-root-find/README.md) | Gates tool calls that sweep the whole disk or home directory. |
