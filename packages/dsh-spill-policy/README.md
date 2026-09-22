@@ -23,15 +23,15 @@ Divergence from base `@deepseek-ai/dsh-spill-policy`:
 ## Mount
 
 The bundle patch disables the base `spill-policy` row and inserts
-`dsh-spill-policy`. The web profile supplies the deployment config:
+`dsh-spill-policy`. The row carries no config: the defaults live in the
+plugin code (`maxInlineBytes: 4096`, `excludeTools: ["read", "skill"]`) and
+apply whenever no config is specified. A profile patch applied after this
+bundle layer can still override the values:
 
 ```yaml
 - id: dsh-spill-policy
   config:
-    maxInlineBytes: 4096
-    excludeTools:
-      - read
-      - skill
+    maxInlineBytes: 8192
 ```
 
 Plus the `link:` dependency in `home/profiles/web/package.json` and the entry

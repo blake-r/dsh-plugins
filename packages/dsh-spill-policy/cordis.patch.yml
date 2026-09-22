@@ -6,9 +6,10 @@
 
 # This package is the deployment's replacement spill policy: the base
 # @deepseek-ai/dsh-spill-policy row (maxInlineBytes=50000) is disabled here
-# and the tighter replacement row is inserted. The web profile's
-# cordis.patch.yml (applied after this bundle layer) supplies the
-# maxInlineBytes/excludeTools config.
+# and the tighter replacement row is inserted. The row carries no config:
+# the plugin's code defaults (maxInlineBytes=4096, excludeTools read/skill)
+# apply, and a profile patch applied after this bundle layer can still
+# override them.
 - id: spill-policy
   disabled: true
 
