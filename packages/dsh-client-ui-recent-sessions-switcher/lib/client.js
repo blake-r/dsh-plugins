@@ -125,11 +125,66 @@ window.__ModuleLoader__.load({
 		//  - running  -> "ongoing"  (animated matrix, DeepSeek brand blue #5686fe)
 		//  - completed-> "done"     (green, idle with unread output)
 		//  - else     -> "idle"     (transparent dot with silver outline)
+		// Green ("done") additionally requires the session's subtree to be
+		// finished: a parent whose subagents are still running renders idle.
 		const statusOf = (s) => {
 			if (s.pending) return { state: "warning", label: "Needs input" };
 			if (s.running) return { state: "ongoing", label: "Working" };
-			if (s.completed) return { state: "done", label: "Idle, unread output" };
+			if (s.completed && s.finished) return { state: "done", label: "Idle, unread output" };
 			return { state: "idle", label: "Idle, all read" };
+		};
+
+		// Total active-agent picture across ALL sessions (visible and subagent of any
+		// parent, archived included — archiving does not stop an agent) plus, per
+		// session, whether a running descendant exists. A session is "finished" only
+		// when it is not running and none of its subagent descendants (transitively)
+		// are running; green is reserved for that state, so a parent whose subagents
+		// are still working never turns green. One session = at most one active agent:
+		// an agent paused on a question/approval keeps its loop phase "running", so it
+		// counts under input only — and pending counts only for a running agent (a
+		// stopped agent leaves a stale pending interaction behind). A running session
+		// whose parent is missing from the registry cannot be attributed to any
+		// ancestor, so no session is then treated as finished (its green would be a
+		// lie); the badge is safe regardless (a running session blocks green globally).
+		const deriveActivity = (list, pendingInteractions, archivedSessionIds) => {
+			const result = {
+				running: 0, input: 0, unread: 0,
+				runningSubagents: 0, inputSubagents: 0,
+				hasRunningDescendant: new Map(),
+				unattributedRunning: false
+			};
+			if (list.phase !== "ready") return result;
+			const byId = list.byId;
+			const archived = new Set(archivedSessionIds);
+			const runningSessions = [];
+			for (const id of list.ids) {
+				const s = byId[id];
+				if (s === undefined || s.blank) continue;
+				const isSubagent = s.origin === "subagent";
+				const pending = visiblePendingKind(pendingInteractions.get(id)?.kind);
+				if (pending && s.running === true) {
+					if (isSubagent) result.inputSubagents++;
+					else result.input++;
+				} else if (s.running === true) {
+					if (isSubagent) result.runningSubagents++;
+					else result.running++;
+				}
+				if (!isSubagent && !archived.has(id) && s.completed === true) result.unread++;
+				if (s.running === true) runningSessions.push(s);
+			}
+			// Mark every ancestor of a running session as "has a running descendant".
+			for (const s of runningSessions) {
+				let cur = s;
+				while (cur.parentId !== undefined) {
+					const parentId = cur.parentId;
+					const parent = byId[parentId];
+					if (parent === undefined) { result.unattributedRunning = true; break; }
+					if (result.hasRunningDescendant.has(parentId)) break;
+					result.hasRunningDescendant.set(parentId, true);
+					cur = parent;
+				}
+			}
+			return result;
 		};
 
 		// Renders the same animated matrix StateDot uses for "ongoing" in dsh.
@@ -178,6 +233,9 @@ window.__ModuleLoader__.load({
 					// was unfocused would otherwise render as "idle, all read". We force the
 					// green ("unread") dot with a CSS class: armed the moment the window loses
 					// focus while the current session was still running, cleared on refocus.
+					// The class is applied only when the current session's subtree is
+					// finished, so a parent whose subagents are still working stays silver
+					// even while the window is unfocused.
 					react.useEffect(() => {
 						const onBlur = () => { if (currentRunningRef.current) setForceUnread(true); };
 						const onFocus = () => setForceUnread(false);
@@ -218,6 +276,15 @@ window.__ModuleLoader__.load({
 					}, [workspaceSnapshot.items]);
 					const workspaceLabelOf = (s) => workspaceBySession.get(s.id) ?? workspaceTitleOf(s.cwd);
 
+					// Active-agent picture across all sessions (see deriveActivity) and the
+					// per-session "finished" predicate used to gate green on the trigger dot,
+					// the dropdown rows and the forced-unread class.
+					const activity = react.useMemo(
+						() => deriveActivity(list, pendingInteractions, archivedSessionIds),
+						[list, pendingInteractions, archivedSessionIds]
+					);
+					const finished = (s) => s !== undefined && s.running !== true && !activity.unattributedRunning && !activity.hasRunningDescendant.get(s.id);
+
 					const recent = react.useMemo(() => {
 						if (list.phase !== "ready") return [];
 						const archived = new Set(archivedSessionIds);
@@ -225,7 +292,7 @@ window.__ModuleLoader__.load({
 						for (const id of list.ids) {
 							const s = list.byId[id];
 							if (s === undefined || s.blank || s.origin === "subagent" || archived.has(id)) continue;
-							items.push({ id, title: s.displayTitle, workspace: workspaceLabelOf(s), cwd: s.cwd, updatedAt: s.updatedAt, running: s.running === true, completed: s.completed === true, pending: visiblePendingKind(pendingInteractions.get(id)?.kind) });
+							items.push({ id, title: s.displayTitle, workspace: workspaceLabelOf(s), cwd: s.cwd, updatedAt: s.updatedAt, running: s.running === true, completed: s.completed === true, pending: visiblePendingKind(pendingInteractions.get(id)?.kind), finished: finished(s) });
 						}
 						items.sort((a, b) => b.updatedAt - a.updatedAt);
 						// Always include every active (running), unread (completed), or
@@ -235,40 +302,31 @@ window.__ModuleLoader__.load({
 						const priority = items.filter((i) => i.running || i.completed || i.pending);
 						const rest = items.filter((i) => !i.running && !i.completed && !i.pending);
 						return priority.concat(rest).slice(0, 8);
-					}, [list, pendingInteractions, archivedSessionIds, workspaceBySession]);
+					}, [list, pendingInteractions, archivedSessionIds, workspaceBySession, activity]);
 
 					const current = list.byId[sessionId];
 					currentRunningRef.current = current ? current.running === true : false;
+					const currentFinished = finished(current);
 					const currentTitle = current && !current.blank ? current.displayTitle : "";
 					const currentWorkspace = current && current.cwd ? workspaceLabelOf(current) : "";
 					const currentStatus = current
-						? statusOf({ running: current.running === true, completed: current.completed === true, pending: visiblePendingKind(pendingInteractions.get(sessionId)?.kind) })
+						? statusOf({ running: current.running === true, completed: current.completed === true, pending: visiblePendingKind(pendingInteractions.get(sessionId)?.kind), finished: currentFinished })
 						: { state: "idle", label: "Idle" };
 					// Badge: total active agents (working or awaiting input) across ALL
-					// sessions, including the current one. Orange when any agent awaits
-					// input (outranks green); green when any idle agent has unread output.
-					const badge = react.useMemo(() => {
-						if (list.phase !== "ready") return { count: 0, running: 0, input: 0, unread: 0 };
-						const archived = new Set(archivedSessionIds);
-						let running = 0, input = 0, unread = 0;
-						for (const id of list.ids) {
-							const s = list.byId[id];
-							if (s === undefined || s.blank || s.origin === "subagent" || archived.has(id)) continue;
-							// One session = at most one agent. An agent paused on a
-							// question/approval keeps its loop phase "running", so it must be
-							// counted under `input` only — otherwise the badge inflates by one.
-							const pending = visiblePendingKind(pendingInteractions.get(id)?.kind);
-							if (pending) input++;
-							else if (s.running === true) running++;
-							if (s.completed === true) unread++;
-						}
-						return { count: running + input, running, input, unread };
-					}, [list, pendingInteractions, archivedSessionIds]);
-					const badgeClass = "rss-badge" + (badge.input > 0 ? " rss-badgeWarn" : badge.unread > 0 ? " rss-badgeUnread" : "");
+					// sessions, including the current one and every running subagent. Orange
+					// when any agent awaits input (outranks green); green only when some idle
+					// agent has unread output AND nothing anywhere is running or awaiting
+					// input — so a finished parent whose subagents are still working never
+					// turns green.
+					const { running, input, unread, runningSubagents, inputSubagents } = activity;
+					const totalRunning = running + runningSubagents;
+					const totalInput = input + inputSubagents;
+					const totalActive = totalRunning + totalInput;
+					const badgeClass = "rss-badge" + (totalInput > 0 ? " rss-badgeWarn" : unread > 0 && totalActive === 0 ? " rss-badgeUnread" : "");
 					const badgeTitle = [
-						badge.running > 0 ? badge.running + " working" : "",
-						badge.input > 0 ? badge.input + " need" + (badge.input === 1 ? "s" : "") + " input" : "",
-						badge.unread > 0 ? badge.unread + " unread chat" + (badge.unread === 1 ? "" : "s") : ""
+						totalRunning > 0 ? totalRunning + " working" + (runningSubagents > 0 ? " (" + runningSubagents + " in subagents)" : "") : "",
+						totalInput > 0 ? totalInput + " need" + (totalInput === 1 ? "s" : "") + " input" : "",
+						unread > 0 ? unread + " unread chat" + (unread === 1 ? "" : "s") : ""
 					].filter(Boolean).join(", ");
 					// On the hero dock the bound Session is blank, so there is no title
 					// to pair the workspace with: drop the `cwd /` prefix rather than
@@ -280,7 +338,7 @@ window.__ModuleLoader__.load({
 					// control at all rather than an inert trigger that reads "0".
 					if (isHeroDock && recent.length === 0) return null;
 
-					return react.createElement("div", { className: "rss-root" + (forceUnread ? " rss-forceUnread" : ""), ref: rootRef },
+					return react.createElement("div", { className: "rss-root" + (forceUnread && currentFinished ? " rss-forceUnread" : ""), ref: rootRef },
 						react.createElement("button", {
 							type: "button",
 							className: "rss-trigger",
@@ -299,7 +357,7 @@ window.__ModuleLoader__.load({
 							showCwd ? react.createElement("span", { className: "rss-cwdSep" }, "/") : null,
 							react.createElement("span", { className: "rss-triggerLabel", title: isHeroDock ? "Recent sessions" : undefined }, currentTitle || (isHeroDock ? "Recent" : "Switch")),
 							react.createElement("span", { className: "rss-chevron" }, open ? "\u25B2" : "\u25BC"),
-							react.createElement("span", { className: badgeClass, title: badgeTitle }, badge.count > 10 ? "9+" : badge.count)
+							react.createElement("span", { className: badgeClass, title: badgeTitle }, totalActive > 10 ? "9+" : totalActive)
 						),
 						open && react.createElement("div", { className: "rss-menu", role: "listbox" },
 							recent.length === 0

@@ -99,23 +99,48 @@ Mirrors dsh's `StateDot`:
 - **completed** — green dot (idle with unread output)
 - **idle** — transparent dot with a silver outline
 
+Green ("done") is gated on the agent **and its entire subagent subtree**
+having finished. A session whose own loop ended while any of its subagents
+(transitively, by `parentId`) are still running renders **idle** (silver), not
+green — work is still in progress. A session whose subagent lineage is
+unresolvable (a running descendant's parent is missing from the registry) is
+conservatively treated as not finished.
+
 Because dsh's `completed` heuristic stays `false` for the currently-selected
 session, a session that finished while the window was unfocused would otherwise
 render as "idle, all read". The plugin forces the green ("unread") dot with a
 CSS class: armed the moment the window loses focus while the current session
-was still running, cleared on refocus.
+was still running, cleared on refocus. The class is applied only when the
+current session's subtree is finished, so a parent whose subagents are still
+working stays silver even while the window is unfocused. Known limitation: if
+the window regains focus while the subagents are still running, the armed flag
+is cleared and the green does not reappear until the next blur-complete cycle.
 
 ## Badge
 
 The counter next to the trigger shows the total number of active agents
-(working or awaiting input) across all sessions, including the currently
-selected one. Each session counts at most one agent: an agent paused on a
-question/approval keeps its loop phase "running", so it is counted under
-"awaiting input" only, never as both working and awaiting input. It is
-highlighted green when any idle agent has unread output and orange when any
-agent awaits input (orange outranks green). The highlight fills the whole
-pill: the badge background becomes the state color (success green / warn
-orange) with white text, and the neutral border is dropped.
+(working or awaiting input) across **all** sessions — the current one, every
+other visible session, and every running subagent (including subagents of
+archived sessions; archiving does not stop an agent). Each session counts at
+most one agent: an agent paused on a question/approval keeps its loop phase
+"running", so it is counted under "awaiting input" only, never as both working
+and awaiting input. A pending interaction counts only while its agent is still
+running (a stopped agent leaves a stale pending interaction behind). The badge
+is highlighted orange when any agent awaits input (outranks green) and green
+only when some idle agent has unread output **and nothing anywhere is running
+or awaiting input** — so a finished parent whose subagents are still working
+never turns the badge green. The tooltip breaks the count down as
+"working (in subagents), needs input, unread chats"; the counter caps at `9+`.
+
+Because green means "everything is quiet", a running session in one conversation
+also suppresses the green that a completed conversation in another would
+otherwise earn. That is intentional: green signals "no agent work is happening
+anywhere".
+
+Known green gaps (not fixed, matching dsh's own `completed` heuristic): a
+session that was selected when its loop ended does not arm `completed`, and a
+reload or host restart loses the in-memory running state entirely, so neither
+case shows green even after subagents finish.
 
 ## Current session
 
