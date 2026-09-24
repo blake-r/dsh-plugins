@@ -711,7 +711,7 @@ function apply(ctx, config = {}) {
           id: newMessageId(),
           role: "user",
           content: deepFreeze(blocks),
-          source: { kind: "plugin", plugin: "dsh-compaction-micro" }
+          source: { kind: "plugin:dsh-compaction-micro" }
         });
 
         // Arm the token-meter's shadow-price claim: the `compaction/summary`
@@ -756,7 +756,7 @@ function apply(ctx, config = {}) {
           id: newMessageId(),
           role: "user",
           content: blocks,
-          source: { kind: "plugin", plugin: "dsh-compaction-micro" }
+          source: { kind: "plugin:dsh-compaction-micro" }
         });
 
         session.append("compaction/summary", {

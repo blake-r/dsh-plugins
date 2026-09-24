@@ -55,7 +55,7 @@ any hit's full original content.
 
 The same search exposed as a human-facing slash command: `/recall
 <keyword|regex>`. Its result is appended to the session as a user message
-(`source: { kind: "plugin", plugin: "recall", form: "recall" }`) so the next
+(`source: { kind: "plugin:recall", form: "recall" }`) so the next
 model turn sees it. Per the "full inline or file artifact" rule, an index
 estimated at more than 1000 tokens is spilled to the `spillStore` file
 artifact first (when available), appending only a short notice with the artifact

@@ -573,7 +573,7 @@ async function executeRecallCommand(invocation) {
         id: crypto.randomUUID(),
         role: "user",
         content: [{ type: "text", text }],
-        source: { kind: "plugin", plugin: "recall", form: "recall" }
+        source: { kind: "plugin:recall", form: "recall" }
       }, opts);
     });
   } catch (error) {
