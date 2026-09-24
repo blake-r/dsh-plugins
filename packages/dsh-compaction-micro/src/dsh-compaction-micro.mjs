@@ -24,7 +24,7 @@
 //                        frames and the last (not-yet-answered) user message stay
 //                        live.
 // The boundary is OUR nearest replacement (`user/message` with
-// `source.plugin === "dsh-compaction-micro"`); everything at or before it is
+// `source.kind === "plugin:dsh-compaction-micro"`); everything at or before it is
 // already folded and never re-wrapped. User messages, injected frames
 // (workspace instructions, skill catalog, system-prompt snapshots, prior
 // checkpoints) and earlier compaction replacements are left as live surface
@@ -54,6 +54,9 @@
 // This plugin emits a `compaction/summary` event with `shadowedTokenCount` =
 // Σ `estimateMessage` over the whole replaced span — the gross cost of the
 // removed nodes, NOT subtracting the price of the new elide/replacement text.
+// Each summary is bracketed by a v4 compaction lifecycle (`compaction/start`
+// ... `compaction/end`, `turn: null` because the plugin runs after `turn/end`)
+// so the strict read validation accepts it.
 // That summary event MUST stay gross: the token-meter's surface fold subtracts
 // the replacement itself (`deltaTokens = estimateMessage(replacement) −
 // claim.tokens`), so a net summary would double-subtract. The plugin's own
@@ -554,7 +557,7 @@ function apply(ctx, config = {}) {
    *
    *   1. Walk the surface from the head backward to find OUR nearest content
    *      re-installation — the `user/message` replacement this plugin committed
-   *      (`source.kind === "plugin"`, `source.plugin === "dsh-compaction-micro"`).
+   *      (`source.kind === "plugin:dsh-compaction-micro"`).
    *      Everything at or before it is already folded; everything after it is
    *      still live.
    *   2. From that boundary forward, split the live tail into consecutive
@@ -580,7 +583,7 @@ function apply(ctx, config = {}) {
       const event = session.eventAt ? session.eventAt(seq) : undefined;
       if (event === undefined || event === null || event.type !== "user/message") continue;
       const source = event.data && event.data.source;
-      if (source !== null && source !== undefined && source.kind === "plugin" && source.plugin === "dsh-compaction-micro") {
+      if (source !== null && source !== undefined && source.kind === "plugin:dsh-compaction-micro") {
         boundaryIdx = i + 1;
         break;
       }
@@ -717,8 +720,15 @@ function apply(ctx, config = {}) {
         // Arm the token-meter's shadow-price claim: the `compaction/summary`
         // event immediately before the replace states the heuristic price of the
         // exact replaced range, so the meter's surface fold subtracts it and the
-        // UI's Messages figure shrinks with this compaction.
-        session.append("compaction/summary", {
+        // UI's Messages figure shrinks with this compaction. The replace is
+        // bracketed by a v4 compaction lifecycle (`compaction/start` ...
+        // `compaction/end`, `turn: null` because it runs after `turn/end`) so
+        // the strict read validation accepts the summary.
+        const compactionId = newMessageId();
+        const lifecycle = { compactionId, turn: null };
+        const startEvent = session.append("compaction/start", lifecycle);
+        const summaryEvent = session.append("compaction/summary", {
+          compactionId,
           shadowedRange: { start, end },
           shadowedSeqs: [...shadowedSeqs],
           shadowedTokenCount
@@ -726,8 +736,9 @@ function apply(ctx, config = {}) {
 
         const replacement = session.append("user/message", replacementMessage, {
           surfaceOp: { op: "replace", startSeq: start, endSeq: end },
-          sourceEventSeqs: shadowedSeqs
+          sourceEventSeqs: [startEvent.seq, summaryEvent.seq, ...shadowedSeqs]
         });
+        session.append("compaction/end", lifecycle);
 
         // Net freed tokens: the gross shadowed span minus the price of the
         // replacement text we re-installed (mirrors the token-meter's fold,
@@ -759,7 +770,11 @@ function apply(ctx, config = {}) {
           source: { kind: "plugin:dsh-compaction-micro" }
         });
 
-        session.append("compaction/summary", {
+        const compactionId = newMessageId();
+        const lifecycle = { compactionId, turn: null };
+        const startEvent = session.append("compaction/start", lifecycle);
+        const summaryEvent = session.append("compaction/summary", {
+          compactionId,
           shadowedRange: { start: attachmentUser, end: attachmentUser },
           shadowedSeqs: [...shadowedSeqs],
           shadowedTokenCount
@@ -767,8 +782,9 @@ function apply(ctx, config = {}) {
 
         const replacement = session.append("user/message", replacementMessage, {
           surfaceOp: { op: "replace", startSeq: attachmentUser, endSeq: attachmentUser },
-          sourceEventSeqs: shadowedSeqs
+          sourceEventSeqs: [startEvent.seq, summaryEvent.seq, ...shadowedSeqs]
         });
+        session.append("compaction/end", lifecycle);
 
         const netSaved = shadowedTokenCount - estimateMessage(replacementMessage);
         log("info", `folded ${attachments.length} attachment(s) in user message seq ${attachmentUser} into seq ${replacement.seq}; saved ${netSaved} tokens`);
