@@ -291,9 +291,16 @@ window.__ModuleLoader__.load({
 			// injected by the second registration so the trigger label can differ
 			// while the blank Session has no title yet.
 			const renderSwitcher = (props) => {
-					const { useSessions, useSessionPendingInteraction, useWorkspaces, sessionId, heroDock } = props;
+					const { useSessions, useSessionStatus, useWorkspaces, sessionId, heroDock } = props;
 					const list = useSessions((s) => s);
-					const pendingInteractions = useSessionPendingInteraction((s) => s);
+					// dsh 0.1.7-rc.2 replaced the root `sessionPendingInteraction` hook with
+					// `sessionStatus`; each entry carries the session's pending interaction.
+					const status = useSessionStatus((s) => s);
+					const pendingInteractions = react.useMemo(() => {
+						const map = new Map();
+						for (const [id, st] of status) map.set(id, st.pendingInteraction);
+						return map;
+					}, [status]);
 					const workspaceSnapshot = useWorkspaces((s) => s);
 					const archivedSessionIds = workspaceSnapshot.archivedSessionIds;
 					const [open, setOpen] = react.useState(false);
@@ -418,7 +425,7 @@ window.__ModuleLoader__.load({
 							// screen no Session is bound, so a plain clock icon stands in and
 							// the trigger reads as one of the hero chips.
 							isHeroDock
-								? react.createElement(primitives.IconClockOutline16, { size: 14 })
+								? react.createElement(primitives.IconClockOutlineMedium, { size: 14 })
 								: react.createElement(StatusIndicator, { status: currentStatus }),
 							showCwd ? react.createElement("span", { className: "rss-cwd" }, currentWorkspace) : null,
 							showCwd ? react.createElement("span", { className: "rss-cwdSep" }, "/") : null,
@@ -448,7 +455,7 @@ window.__ModuleLoader__.load({
 											react.createElement("span", { className: "rss-itemLabel" }, item.title)
 										),
 										react.createElement("div", { className: "rss-itemTrailing" },
-											item.id === sessionId ? react.createElement("span", { className: "rss-currentCheck" }, react.createElement(primitives.IconCheckOutline16, { size: 16 })) : null,
+											item.id === sessionId ? react.createElement("span", { className: "rss-currentCheck" }, react.createElement(primitives.IconCheckOutlineMedium, { size: 16 })) : null,
 											react.createElement("button", {
 												type: "button",
 												className: "rss-itemArchive",
@@ -477,7 +484,7 @@ window.__ModuleLoader__.load({
 													});
 												},
 											},
-												react.createElement(primitives.IconArchiveOutline20, { size: 16 })
+												react.createElement(primitives.IconArchiveOutlineMedium, { size: 16 })
 											)
 										)
 									);

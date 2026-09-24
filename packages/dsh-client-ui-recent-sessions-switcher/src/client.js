@@ -65,7 +65,7 @@
 // Clicking the glyph calls the `workspaces` service's archiveSession.
 // Archived sessions are excluded from the dropdown and the badge.
 
-import { IconArchiveOutline20, IconCheckOutline16, IconClockOutline16 } from "@deepseek-ai/dsh-client-ui-primitives";
+import { IconArchiveOutlineMedium, IconCheckOutlineMedium, IconClockOutlineMedium } from "@deepseek-ai/dsh-client-ui-primitives";
 
 const workspaceTitleOf = (path) => {
   if (!path) return "";
@@ -254,9 +254,16 @@ export function apply(ctx) {
   // second registration so the trigger label can differ while the blank Session
   // has no title yet.
   const renderSwitcher = (props) => {
-      const { useSessions, useSessionPendingInteraction, useWorkspaces, sessionId, heroDock } = props;
+      const { useSessions, useSessionStatus, useWorkspaces, sessionId, heroDock } = props;
       const list = useSessions((s) => s);
-      const pendingInteractions = useSessionPendingInteraction((s) => s);
+      // dsh 0.1.7-rc.2 replaced the root `sessionPendingInteraction` hook with
+      // `sessionStatus`; each entry carries the session's pending interaction.
+      const status = useSessionStatus((s) => s);
+      const pendingInteractions = React.useMemo(() => {
+        const map = new Map();
+        for (const [id, st] of status) map.set(id, st.pendingInteraction);
+        return map;
+      }, [status]);
       const workspaceSnapshot = useWorkspaces((s) => s);
       const archivedSessionIds = workspaceSnapshot.archivedSessionIds;
       const [open, setOpen] = React.useState(false);
@@ -372,7 +379,7 @@ export function apply(ctx) {
           // on the hero screen, so a clock icon stands in and the trigger reads
           // as one of the hero chips.
           isHeroDock
-            ? React.createElement(IconClockOutline16, { size: 14 })
+            ? React.createElement(IconClockOutlineMedium, { size: 14 })
             : React.createElement(StatusIndicator, { status: currentStatus }),
           showCwd ? React.createElement("span", { className: "rss-cwd" }, currentWorkspace) : null,
           showCwd ? React.createElement("span", { className: "rss-cwdSep" }, "/") : null,
@@ -402,7 +409,7 @@ export function apply(ctx) {
                     React.createElement("span", { className: "rss-itemLabel" }, item.title)
                   ),
                   React.createElement("div", { className: "rss-itemTrailing" },
-                    item.id === sessionId ? React.createElement("span", { className: "rss-currentCheck" }, React.createElement(IconCheckOutline16, { size: 16 })) : null,
+                    item.id === sessionId ? React.createElement("span", { className: "rss-currentCheck" }, React.createElement(IconCheckOutlineMedium, { size: 16 })) : null,
                     React.createElement("button", {
                       type: "button",
                       className: "rss-itemArchive",
@@ -431,7 +438,7 @@ export function apply(ctx) {
                         });
                       },
                     },
-                      React.createElement(IconArchiveOutline20, { size: 16 })
+                      React.createElement(IconArchiveOutlineMedium, { size: 16 })
                     )
                   )
                 );
