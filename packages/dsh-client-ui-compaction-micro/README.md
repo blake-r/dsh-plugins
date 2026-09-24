@@ -10,14 +10,16 @@ run.
 ## What it does
 
 `dsh-compaction-micro` emits a `compaction/summary` event (with
-`shadowedSeqs` / `shadowedTokenCount` / `shadowedRange`) right before each
+`shadowedSeqs` / `shadowedTokenCount` / `shadowedRange`, bracketed by a v4
+`compaction/start` ... `compaction/end` lifecycle) right before each
 replacement commit. The built-in UI compaction marker is hardwired to the
-standard provider (`source.plugin === "compact"` and a `compactionId`), so the
+standard provider (`source.kind === "compact"` and a `compactionId`), so the
 micro provider's replacements render nothing in the transcript. This plugin
-claims exactly the micro-style summaries — `compaction/summary` events that
-carry **no** `compactionId` (the standard provider always emits one, so there
-is no overlap) — and renders its own marker via the `conversation.chat.node`
-keyed slot.
+claims exactly the micro-style summaries — `compaction/summary` events whose
+data carries the micro shadow-price fields but none of the standard provider's
+summary content (`summary` / `provider` / `model` are always present on
+standard summaries, so there is no overlap) — and renders its own marker via
+the `conversation.chat.node` keyed slot.
 
 No change to `dsh-compaction-micro` is required: implementation and
 visualization stay separate.

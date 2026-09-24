@@ -46,13 +46,14 @@ let currentRunId = null;
 
 /**
  * Match one micro-compaction summary event and group consecutive ones into a
- * single run. Only `compaction/summary` events that carry no `compactionId`
- * are claimed — the standard provider always correlates its summaries by
- * compactionId, so those belong to the built-in marker and are never claimed
- * here. A summary continues the current run (role "update", same id) when the
- * previous micro-relevant event was another summary or the plugin's own
- * replacement message; anything else (real content, injected frames, a
- * different session) starts a new run (role "start", id "micro-<seq>").
+ * single run. Only `compaction/summary` events carrying the micro shadow-price
+ * fields are claimed — the standard provider always emits its summary content
+ * (`summary`/`provider`/`model`), so those belong to the built-in marker and
+ * are never claimed here. A summary continues the current run (role "update",
+ * same id) when the previous micro-relevant event was another summary or the
+ * plugin's own replacement message; anything else (real content, injected
+ * frames, a different session) starts a new run (role "start", id
+ * "micro-<seq>").
  * @param event - a session event.
  * @returns a match record, or null when the event is not a micro summary.
  */
@@ -69,7 +70,7 @@ const microSummaryMatch = (event) => {
 		// projectMessage: `case "user/message": return event.data`), so the
 		// plugin source sits at data.source, not data.message.source.
 		const source = event.data && event.data.source;
-		lastMicroKind = source !== null && source !== undefined && source.kind === "plugin" && source.plugin === "dsh-compaction-micro"
+		lastMicroKind = source !== null && source !== undefined && source.kind === "plugin:dsh-compaction-micro"
 			? "replacement"
 			: "other";
 		return null;
@@ -83,7 +84,12 @@ const microSummaryMatch = (event) => {
 		lastMicroKind = "other";
 		return null;
 	}
-	if (typeof data.compactionId === "string") {
+	// The micro plugin brackets its summaries with a v4 compaction lifecycle
+	// (compactionId), so a compactionId no longer distinguishes micro from
+	// standard summaries. The standard provider always emits its summary
+	// content (`summary` blocks, `provider`, `model`); the micro plugin emits
+	// only the shadow-price fields, so their presence is the discriminator.
+	if (data.summary !== undefined || data.provider !== undefined || data.model !== undefined) {
 		lastMicroKind = "other";
 		return null;
 	}
