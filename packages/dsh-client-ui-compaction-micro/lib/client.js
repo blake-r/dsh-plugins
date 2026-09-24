@@ -50,8 +50,10 @@ let currentRunId = null;
  * fields are claimed — the standard provider always emits its summary content
  * (`summary`/`provider`/`model`), so those belong to the built-in marker and
  * are never claimed here. A summary continues the current run (role "update",
- * same id) when the previous micro-relevant event was another summary or the
- * plugin's own replacement message; anything else (real content, injected
+ * same id) when the previous micro-relevant event was another summary, the
+ * plugin's own replacement message, or one of the plugin's lifecycle markers
+ * (`compaction/start` / `compaction/end`, which bracket every micro summary
+ * and are treated as transparent); anything else (real content, injected
  * frames, a different session) starts a new run (role "start", id
  * "micro-<seq>").
  * @param event - a session event.
@@ -73,6 +75,16 @@ const microSummaryMatch = (event) => {
 		lastMicroKind = source !== null && source !== undefined && source.kind === "plugin:dsh-compaction-micro"
 			? "replacement"
 			: "other";
+		return null;
+	}
+	if (event.type === "compaction/start" || event.type === "compaction/end") {
+		// The micro plugin brackets every compaction with a v4 lifecycle
+		// (compaction/start ... compaction/end, turn: null), so between two
+		// consecutive summaries the stream carries the plugin's own lifecycle
+		// markers. They are invisible metadata, not transcript content — leave
+		// the run state untouched so the run keeps collapsing. A standard
+		// provider compaction still breaks the run at its own summary (which
+		// always carries summary/provider/model and is never claimed here).
 		return null;
 	}
 	if (event.type !== "compaction/summary") {

@@ -6,7 +6,7 @@
 //   - drop the leading documentation comment block and the
 //     `import ... from "@deepseek-ai/dsh-client-ui-primitives"` line
 //   - `React.createElement` -> `react.createElement`
-//   - `IconSkillOutline16` -> `primitives.IconSkillOutline16`
+//   - `IconSkillOutlineMedium` -> `primitives.IconSkillOutlineMedium`
 //   - `export const inject` -> `const inject`, `export function apply` -> `function apply`
 //   - 2-space indentation -> tabs (matches the bundle template)
 // then the body is wrapped in the module-loader format with `react` and
@@ -64,7 +64,7 @@ const build = (src) => {
 		.replace(/^(\/\/[^\n]*\n)+/, "")
 		.replace(/^import .*@deepseek-ai\/dsh-client-ui-primitives.*\n/m, "")
 		.replaceAll("React.createElement", "react.createElement")
-		.replaceAll("IconSkillOutline16", "primitives.IconSkillOutline16")
+		.replaceAll("IconSkillOutlineMedium", "primitives.IconSkillOutlineMedium")
 		.replace("export const inject", "const inject")
 		.replace("export function apply", "function apply")
 		.replace(/^\n+/, "")

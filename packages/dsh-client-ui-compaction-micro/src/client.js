@@ -7,10 +7,12 @@
 // which are emitted right before each replacement commit.
 //
 // Consecutive micro compactions are collapsed into ONE marker: a run continues
-// while the stream between summaries carries only the plugin's own replacement
-// messages (user/message with source.kind === "plugin:dsh-compaction-micro") —
-// the transcript-adjacent case (several spans folded in one turn/end). Any real
-// content (user/assistant/tool events, injected frames) breaks the run and
+// while the stream between summaries carries only the plugin's own events —
+// its replacement messages (user/message with source.kind ===
+// "plugin:dsh-compaction-micro") and its v4 lifecycle bracket
+// (compaction/start ... compaction/end) — the transcript-adjacent case
+// (several spans folded in one turn/end). Any real content (user/assistant/tool
+// events, injected frames, standard-provider summaries) breaks the run and
 // starts a new marker. The merged marker sums items and tokens across the run;
 // the seq range is deliberately not shown.
 //
@@ -82,8 +84,10 @@ let currentRunId = null;
  * fields are claimed — the standard provider always emits its summary content
  * (`summary`/`provider`/`model`), so those belong to the built-in marker and
  * are never claimed here. A summary continues the current run (role "update",
- * same id) when the previous micro-relevant event was another summary or the
- * plugin's own replacement message; anything else (real content, injected
+ * same id) when the previous micro-relevant event was another summary, the
+ * plugin's own replacement message, or one of the plugin's lifecycle markers
+ * (`compaction/start` / `compaction/end`, which bracket every micro summary
+ * and are treated as transparent); anything else (real content, injected
  * frames, a different session) starts a new run (role "start", id
  * "micro-<seq>").
  * @param event - a session event.
@@ -105,6 +109,16 @@ const microSummaryMatch = (event) => {
     lastMicroKind = source !== null && source !== undefined && source.kind === "plugin:dsh-compaction-micro"
       ? "replacement"
       : "other";
+    return null;
+  }
+  if (event.type === "compaction/start" || event.type === "compaction/end") {
+    // The micro plugin brackets every compaction with a v4 lifecycle
+    // (compaction/start ... compaction/end, turn: null), so between two
+    // consecutive summaries the stream carries the plugin's own lifecycle
+    // markers. They are invisible metadata, not transcript content — leave
+    // the run state untouched so the run keeps collapsing. A standard
+    // provider compaction still breaks the run at its own summary (which
+    // always carries summary/provider/model and is never claimed here).
     return null;
   }
   if (event.type !== "compaction/summary") {
