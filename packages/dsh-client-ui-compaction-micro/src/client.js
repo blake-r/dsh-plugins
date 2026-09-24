@@ -37,7 +37,7 @@
 // the CSS below is injected once at materialization. Do not edit lib/client.js
 // by hand — edit this file and run `npm run build`.
 
-import { IconSkillOutline16 } from "@deepseek-ai/dsh-client-ui-primitives";
+import { IconSkillOutlineMedium } from "@deepseek-ai/dsh-client-ui-primitives";
 
 // CSS for the marker, injected once at materialization. Uses the same
 // data-plugin-css guard the official client bundles use so re-materialization
@@ -204,7 +204,7 @@ const MarkerView = ({ node, t }) => {
     : t("compaction.unavailable");
   return React.createElement("div", { className: "cmc-row" },
     React.createElement("span", { className: "cmc-leading", "aria-hidden": true },
-      React.createElement(IconSkillOutline16, {})
+      React.createElement(IconSkillOutlineMedium, {})
     ),
     React.createElement("span", { className: "cmc-title" }, t("compaction.title")),
     React.createElement("span", { className: "cmc-sep", "aria-hidden": true }),
