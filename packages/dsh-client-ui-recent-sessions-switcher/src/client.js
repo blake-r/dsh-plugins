@@ -243,12 +243,13 @@ const StatusIndicator = ({ status }) => {
   );
 };
 
-export const inject = ["slots", "sessions", "workspaces"];
+export const inject = ["slots", "sessions", "workspaces", "uiWorkspace"];
 
 export function apply(ctx) {
   const slots = ctx.slots;
   const sessions = ctx.sessions;
   const workspaces = ctx.workspaces;
+  const uiWorkspace = ctx.uiWorkspace;
   // One component serves two registrations: the header utilities row (active
   // Session) and the hero dock row (new Session). `heroDock` is injected by the
   // second registration so the trigger label can differ while the blank Session
@@ -400,7 +401,7 @@ export function apply(ctx) {
                   React.createElement("button", {
                     type: "button",
                     className: "rss-itemMain",
-                    onClick: () => { sessions.open(item.id); setOpen(false); },
+                    onClick: () => { uiWorkspace.openSession(item.id); setOpen(false); },
                     title: st.label,
                   },
                     React.createElement(StatusIndicator, { status: st }),
@@ -431,7 +432,7 @@ export function apply(ctx) {
                               target = freshestVisibleSessionId(list, archivedSessionIds, item.id, (s) => s.cwd === archivedCwd);
                             }
                             if (target === undefined) target = freshestVisibleSessionId(list, archivedSessionIds, item.id);
-                            if (target !== undefined) sessions.open(target);
+                            if (target !== undefined) uiWorkspace.openSession(target);
                           }
                         }).catch((reason) => {
                           console.warn("session archive rejected:", reason);
