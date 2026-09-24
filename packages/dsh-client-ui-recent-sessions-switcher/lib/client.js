@@ -125,38 +125,51 @@ window.__ModuleLoader__.load({
 		//  - running  -> "ongoing"  (animated matrix, DeepSeek brand blue #5686fe)
 		//  - completed-> "done"     (green, idle with unread output)
 		//  - else     -> "idle"     (transparent dot with silver outline)
-		// Green ("done") additionally requires the session's subtree to be
-		// finished: a parent whose subagents are still running renders idle.
+		// A session whose own loop is idle but whose subagent descendants are
+		// active renders as active too: "Working (subagents)" (ongoing) while any
+		// descendant runs, "Needs input (subagent)" (warning) while any descendant
+		// awaits input — the same priority order the badge uses (input outranks
+		// running). Green ("done") additionally requires the session's subtree to
+		// be finished: a parent whose subagents are still running renders active,
+		// never green.
 		const statusOf = (s) => {
 			if (s.pending) return { state: "warning", label: "Needs input" };
 			if (s.running) return { state: "ongoing", label: "Working" };
+			if (s.hasPendingDescendant) return { state: "warning", label: "Needs input (subagent)" };
+			if (s.hasRunningDescendant) return { state: "ongoing", label: "Working (subagents)" };
 			if (s.completed && s.finished) return { state: "done", label: "Idle, unread output" };
 			return { state: "idle", label: "Idle, all read" };
 		};
 
-		// Total active-agent picture across ALL sessions (visible and subagent of any
-		// parent, archived included — archiving does not stop an agent) plus, per
-		// session, whether a running descendant exists. A session is "finished" only
-		// when it is not running and none of its subagent descendants (transitively)
-		// are running; green is reserved for that state, so a parent whose subagents
-		// are still working never turns green. One session = at most one active agent:
-		// an agent paused on a question/approval keeps its loop phase "running", so it
-		// counts under input only — and pending counts only for a running agent (a
-		// stopped agent leaves a stale pending interaction behind). A running session
+		// Total active-agent picture across ALL sessions (visible and subagent of
+		// any parent, archived included — archiving does not stop an agent) plus,
+		// per session, whether a running or input-awaiting descendant exists. A
+		// session is "finished" only when it is not running and none of its
+		// subagent descendants (transitively) are running; green is reserved for
+		// that state, so a parent whose subagents are still working never turns
+		// green. One session = at most one active agent: an agent paused on a
+		// question/approval keeps its loop phase "running", so it counts under
+		// input only — and pending counts only for a running agent (a stopped
+		// agent leaves a stale pending interaction behind). A running session
 		// whose parent is missing from the registry cannot be attributed to any
-		// ancestor, so no session is then treated as finished (its green would be a
-		// lie); the badge is safe regardless (a running session blocks green globally).
+		// ancestor, so no session is then treated as finished (its green would be
+		// a lie). `unreadFinished` counts visible (non-subagent, non-archived)
+		// sessions that are both server-completed and finished — the exact set
+		// the badge's green lights for; unrelated activity elsewhere does not
+		// suppress it (the finished gate is per-session, not global).
 		const deriveActivity = (list, pendingInteractions, archivedSessionIds) => {
 			const result = {
-				running: 0, input: 0, unread: 0,
+				running: 0, input: 0, unreadFinished: 0,
 				runningSubagents: 0, inputSubagents: 0,
 				hasRunningDescendant: new Map(),
+				hasPendingDescendant: new Map(),
 				unattributedRunning: false
 			};
 			if (list.phase !== "ready") return result;
 			const byId = list.byId;
 			const archived = new Set(archivedSessionIds);
 			const runningSessions = [];
+			const pendingRunningSessions = [];
 			for (const id of list.ids) {
 				const s = byId[id];
 				if (s === undefined || s.blank) continue;
@@ -165,11 +178,11 @@ window.__ModuleLoader__.load({
 				if (pending && s.running === true) {
 					if (isSubagent) result.inputSubagents++;
 					else result.input++;
+					pendingRunningSessions.push(s);
 				} else if (s.running === true) {
 					if (isSubagent) result.runningSubagents++;
 					else result.running++;
 				}
-				if (!isSubagent && !archived.has(id) && s.completed === true) result.unread++;
 				if (s.running === true) runningSessions.push(s);
 			}
 			// Mark every ancestor of a running session as "has a running descendant".
@@ -184,7 +197,67 @@ window.__ModuleLoader__.load({
 					cur = parent;
 				}
 			}
+			// Mark every ancestor of an input-awaiting (pending && running) session
+			// as "has a pending descendant" — a subset of the running walk above,
+			// kept separate so the parent renders "Needs input (subagent)" rather
+			// than "Working (subagents)".
+			for (const s of pendingRunningSessions) {
+				let cur = s;
+				while (cur.parentId !== undefined) {
+					const parentId = cur.parentId;
+					const parent = byId[parentId];
+					if (parent === undefined) break;
+					if (result.hasPendingDescendant.has(parentId)) break;
+					result.hasPendingDescendant.set(parentId, true);
+					cur = parent;
+				}
+			}
+			// Finished-with-unread count: visible, non-archived, server-completed
+			// and not running with no running descendant and no unattributed
+			// running.
+			for (const id of list.ids) {
+				const s = byId[id];
+				if (s === undefined || s.blank || s.origin === "subagent" || archived.has(id)) continue;
+				if (s.completed !== true || s.running === true) continue;
+				if (result.unattributedRunning || result.hasRunningDescendant.get(id)) continue;
+				result.unreadFinished++;
+			}
 			return result;
+		};
+
+		// Pure badge view from the activity picture. Orange (input) outranks
+		// green; green lights when some visible session is finished with unread
+		// output; the number reads the finished-unread count while green (so a
+		// green pill never shows "0"), else the total active count. Both branches
+		// cap at "9+".
+		const badgeView = (activity) => {
+			const { running, input, unreadFinished, runningSubagents, inputSubagents } = activity;
+			const totalRunning = running + runningSubagents;
+			const totalInput = input + inputSubagents;
+			const totalActive = totalRunning + totalInput;
+			const cls = "rss-badge" + (totalInput > 0 ? " rss-badgeWarn" : unreadFinished > 0 ? " rss-badgeUnread" : "");
+			const title = [
+				totalRunning > 0 ? totalRunning + " working" + (runningSubagents > 0 ? " (" + runningSubagents + " in subagents)" : "") : "",
+				totalInput > 0 ? totalInput + " need" + (totalInput === 1 ? "s" : "") + " input" : "",
+				unreadFinished > 0 ? unreadFinished + " finished with unread output" + (unreadFinished === 1 ? "" : "s") : ""
+			].filter(Boolean).join(", ");
+			const shown = unreadFinished > 0 ? unreadFinished : totalActive;
+			const number = shown > 10 ? "9+" : shown;
+			return { cls, title, number };
+		};
+
+		// Pure dropdown cap: active/flagged sessions first, then the most
+		// recently updated others, capped at 8 — but the current session is
+		// always rendered, even when it falls outside the cap (a selected parent
+		// whose subagents are working must stay reachable and visible with its
+		// activity icon).
+		const capRecent = (items, sessionId) => {
+			const priority = items.filter((i) => i.running || i.completed || i.pending || i.hasRunningDescendant || i.hasPendingDescendant);
+			const rest = items.filter((i) => !i.running && !i.completed && !i.pending && !i.hasRunningDescendant && !i.hasPendingDescendant);
+			const restCapped = rest.slice(0, Math.max(0, 8 - priority.length));
+			const currentItem = items.find((i) => i.id === sessionId);
+			if (currentItem !== undefined && !priority.includes(currentItem) && !restCapped.includes(currentItem)) restCapped.push(currentItem);
+			return priority.concat(restCapped);
 		};
 
 		// Renders the same animated matrix StateDot uses for "ongoing" in dsh.
@@ -292,17 +365,17 @@ window.__ModuleLoader__.load({
 						for (const id of list.ids) {
 							const s = list.byId[id];
 							if (s === undefined || s.blank || s.origin === "subagent" || archived.has(id)) continue;
-							items.push({ id, title: s.displayTitle, workspace: workspaceLabelOf(s), cwd: s.cwd, updatedAt: s.updatedAt, running: s.running === true, completed: s.completed === true, pending: visiblePendingKind(pendingInteractions.get(id)?.kind), finished: finished(s) });
+							items.push({ id, title: s.displayTitle, workspace: workspaceLabelOf(s), cwd: s.cwd, updatedAt: s.updatedAt, running: s.running === true, completed: s.completed === true, pending: visiblePendingKind(pendingInteractions.get(id)?.kind), finished: finished(s), hasRunningDescendant: activity.hasRunningDescendant.get(id) === true, hasPendingDescendant: activity.hasPendingDescendant.get(id) === true });
 						}
 						items.sort((a, b) => b.updatedAt - a.updatedAt);
-						// Always include every active (running), unread (completed), or
-						// input-requiring (pending) session; fill the remaining slots up to 8
-						// with the most recently-updated others. Within each group the sort
-						// above (by last-modified time) is preserved.
-						const priority = items.filter((i) => i.running || i.completed || i.pending);
-						const rest = items.filter((i) => !i.running && !i.completed && !i.pending);
-						return priority.concat(rest).slice(0, 8);
-					}, [list, pendingInteractions, archivedSessionIds, workspaceBySession, activity]);
+						// Always include every active (running), unread (completed),
+						// input-requiring (pending), or descendant-active session; fill
+						// the remaining slots up to 8 with the most recently-updated
+						// others. The current session is always rendered even beyond the
+						// cap (see capRecent). Within each group the sort above (by
+						// last-modified time) is preserved.
+						return capRecent(items, sessionId);
+					}, [list, pendingInteractions, archivedSessionIds, workspaceBySession, activity, sessionId]);
 
 					const current = list.byId[sessionId];
 					currentRunningRef.current = current ? current.running === true : false;
@@ -310,24 +383,18 @@ window.__ModuleLoader__.load({
 					const currentTitle = current && !current.blank ? current.displayTitle : "";
 					const currentWorkspace = current && current.cwd ? workspaceLabelOf(current) : "";
 					const currentStatus = current
-						? statusOf({ running: current.running === true, completed: current.completed === true, pending: visiblePendingKind(pendingInteractions.get(sessionId)?.kind), finished: currentFinished })
+						? statusOf({ running: current.running === true, completed: current.completed === true, pending: visiblePendingKind(pendingInteractions.get(sessionId)?.kind), finished: currentFinished, hasRunningDescendant: activity.hasRunningDescendant.get(sessionId) === true, hasPendingDescendant: activity.hasPendingDescendant.get(sessionId) === true })
 						: { state: "idle", label: "Idle" };
-					// Badge: total active agents (working or awaiting input) across ALL
-					// sessions, including the current one and every running subagent. Orange
-					// when any agent awaits input (outranks green); green only when some idle
-					// agent has unread output AND nothing anywhere is running or awaiting
-					// input — so a finished parent whose subagents are still working never
-					// turns green.
-					const { running, input, unread, runningSubagents, inputSubagents } = activity;
-					const totalRunning = running + runningSubagents;
-					const totalInput = input + inputSubagents;
-					const totalActive = totalRunning + totalInput;
-					const badgeClass = "rss-badge" + (totalInput > 0 ? " rss-badgeWarn" : unread > 0 && totalActive === 0 ? " rss-badgeUnread" : "");
-					const badgeTitle = [
-						totalRunning > 0 ? totalRunning + " working" + (runningSubagents > 0 ? " (" + runningSubagents + " in subagents)" : "") : "",
-						totalInput > 0 ? totalInput + " need" + (totalInput === 1 ? "s" : "") + " input" : "",
-						unread > 0 ? unread + " unread chat" + (unread === 1 ? "" : "s") : ""
-					].filter(Boolean).join(", ");
+					// Badge: total active agents (working or awaiting input) across
+					// ALL sessions, including the current one and every running
+					// subagent. Orange when any agent awaits input (outranks green);
+					// green when some visible session is finished (its whole subtree
+					// done) with unread output — unrelated activity elsewhere no
+					// longer blocks it, and a finished parent whose own subagents are
+					// still working never turns the badge green. The number reads the
+					// finished-unread count while green, else the total active count
+					// (see badgeView).
+					const badge = badgeView(activity);
 					// On the hero dock the bound Session is blank, so there is no title
 					// to pair the workspace with: drop the `cwd /` prefix rather than
 					// render "dsh / Recent sessions" (the hero workspace chip already
@@ -357,7 +424,7 @@ window.__ModuleLoader__.load({
 							showCwd ? react.createElement("span", { className: "rss-cwdSep" }, "/") : null,
 							react.createElement("span", { className: "rss-triggerLabel", title: isHeroDock ? "Recent sessions" : undefined }, currentTitle || (isHeroDock ? "Recent" : "Switch")),
 							react.createElement("span", { className: "rss-chevron" }, open ? "\u25B2" : "\u25BC"),
-							react.createElement("span", { className: badgeClass, title: badgeTitle }, totalActive > 10 ? "9+" : totalActive)
+							react.createElement("span", { className: badge.cls, title: badge.title }, badge.number)
 						),
 						open && react.createElement("div", { className: "rss-menu", role: "listbox" },
 							recent.length === 0

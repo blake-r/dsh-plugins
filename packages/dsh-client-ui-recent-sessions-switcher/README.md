@@ -101,10 +101,15 @@ Mirrors dsh's `StateDot`:
 
 Green ("done") is gated on the agent **and its entire subagent subtree**
 having finished. A session whose own loop ended while any of its subagents
-(transitively, by `parentId`) are still running renders **idle** (silver), not
-green — work is still in progress. A session whose subagent lineage is
-unresolvable (a running descendant's parent is missing from the registry) is
-conservatively treated as not finished.
+(transitively, by `parentId`) are still running renders as **Working
+(subagents)** (animated matrix), not green — work is still in progress. A
+session whose subagent lineage is unresolvable (a running descendant's parent
+is missing from the registry) is conservatively treated as not finished.
+
+A session whose own loop is idle but whose subagent descendants are active
+renders as active too: **Working (subagents)** (animated matrix) while any
+descendant runs, **Needs input (subagent)** (orange) while any descendant
+awaits input — the same priority order the badge uses (input outranks running).
 
 Because dsh's `completed` heuristic stays `false` for the currently-selected
 session, a session that finished while the window was unfocused would otherwise
@@ -127,20 +132,26 @@ most one agent: an agent paused on a question/approval keeps its loop phase
 and awaiting input. A pending interaction counts only while its agent is still
 running (a stopped agent leaves a stale pending interaction behind). The badge
 is highlighted orange when any agent awaits input (outranks green) and green
-only when some idle agent has unread output **and nothing anywhere is running
-or awaiting input** — so a finished parent whose subagents are still working
-never turns the badge green. The tooltip breaks the count down as
-"working (in subagents), needs input, unread chats"; the counter caps at `9+`.
+when **some visible session is finished — its whole subagent subtree done —
+with unread output**. The finished gate is per-session, so a finished parent
+whose own subagents are still working never turns the badge green, while
+unrelated activity elsewhere no longer suppresses the green another session
+earned. The number reads the finished-unread count while green (a green pill
+never shows "0"), else the total active count; both branches cap at `9+`. The
+tooltip breaks the count down as "working (in subagents), needs input, finished
+with unread output".
 
-Because green means "everything is quiet", a running session in one conversation
-also suppresses the green that a completed conversation in another would
-otherwise earn. That is intentional: green signals "no agent work is happening
-anywhere".
+Because green is per-session, a running session in one conversation no longer
+suppresses the green that a completed conversation in another earns: the badge
+lights for genuinely finished agents with unread output regardless of unrelated
+activity.
 
-Known green gaps (not fixed, matching dsh's own `completed` heuristic): a
-session that was selected when its loop ended does not arm `completed`, and a
-reload or host restart loses the in-memory running state entirely, so neither
-case shows green even after subagents finish.
+Known green gaps (matching dsh's own `completed` heuristic): a session that was
+selected when its loop ended does not arm `completed` — a selected parent whose
+subtree finishes while it stays selected renders idle until switched away (the
+forceUnread CSS path covers only the window-blur case) — and a reload or host
+restart loses the in-memory running state entirely, so neither case shows green
+even after subagents finish.
 
 ## Current session
 
@@ -153,6 +164,12 @@ selected-item pattern. The color is applied to the row's main button
 color; the check is rendered only for the row whose id equals the active
 `sessionId`, and it occupies the same trailing slot as the archive action (see
 above), fading out on row hover so the archive glyph can take its place.
+
+The dropdown always renders the current session, even when it falls outside the
+8-slot cap: a selected parent whose subagents are working must stay reachable
+(and visible with its activity icon) no matter how many fresher sessions
+compete for the slots. Active, unread, input-requiring, and descendant-active
+sessions are prioritized ahead of the most recently-updated others.
 
 ## Layout
 
