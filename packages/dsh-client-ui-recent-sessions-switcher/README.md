@@ -97,40 +97,37 @@ Mirrors dsh's `StateDot`:
   or a question awaiting the user)
 - **running** — animated matrix (DeepSeek brand blue `#5686fe`)
 - **completed** — green dot (idle with unread output)
-- **failed last request** — red dot (idle with the last request errored; see
-  below)
+- **failed last request** — red dot (idle with the last request errored or the
+  last turn abandoned; see below)
 - **idle** — transparent dot with a silver outline
 
-Red ("error") reports a session whose last request failed. The signal is the
-host's `api-session/error` event: agent-loop uncontained errors — including LLM
-request failures — and background-activation failures (a session that never got
-to run). It is a fact, not an unread reminder: it includes the currently
-selected session, outranks green but not orange, and an errored session is
-excluded from the green count (no double counting). The registry is in-memory,
-so a page reload forgets errors until a new failure occurs (same limitation as
-`completionUnread`).
+Red and green are **derived from the session journal's tail**, read through the
+session-controller remote (`projections` for the log cursor, then `page` for
+the last turn window). The state is a fact about the journal, not an unread
+reminder, and survives page reloads: a reload recomputes it honestly from the
+journals (no localStorage).
 
-Green ("done") is gated on the agent **and its entire subagent subtree**
-having finished. A session whose own loop ended while any of its subagents
-(transitively, by `parentId`) are still running renders as **Working
-(subagents)** (animated matrix), not green — work is still in progress. A
-session whose subagent lineage is unresolvable (a running descendant's parent
-is missing from the registry) is conservatively treated as not finished.
+Red reports a session whose last turn is **unfinished** (a `turn/start` with no
+following `turn/end` while the session is not running — an abandoned turn) or
+whose last `turn/end` reason is `error` or `max-tokens`. A journal that ends
+inside an open turn is balanced by the server with synthetic `interrupted`
+closers sharing the last real event's timestamp; the plugin recognizes that
+signature and still reports the turn as open (red), while a genuinely
+interrupted turn (its `turn/end` carries its own later time) renders silver.
+`aborted` / `interrupted` turns are neither red nor green.
 
-A session whose own loop is idle but whose subagent descendants are active
-renders as active too: **Working (subagents)** (animated matrix) while any
-descendant runs, **Needs input (subagent)** (orange) while any descendant
-awaits input — the same priority order the badge uses (input outranks running).
+Green reports a last `turn/end` reason of `completed`. Both red and green
+require the session to be idle, exclude the currently-selected session, and
+clear once the session has been viewed: leaving a session acknowledges it
+(in-memory set, added on session switch, deleted when the session runs again,
+reset on page reload). A session whose journal holds only the title event (no
+turns, no messages) is treated as blank and excluded from the dropdown.
 
-Because dsh's `completed` heuristic stays `false` for the currently-selected
-session, a session that finished while the window was unfocused would otherwise
-render as "idle, all read". The plugin forces the green ("unread") dot with a
-CSS class: armed the moment the window loses focus while the current session
-was still running, cleared on refocus. The class is applied only when the
-current session's subtree is finished, so a parent whose subagents are still
-working stays silver even while the window is unfocused. Known limitation: if
-the window regains focus while the subagents are still running, the armed flag
-is cleared and the green does not reappear until the next blur-complete cycle.
+One in-memory fallback remains: the host's `api-session/error` event for a
+session whose journal is empty (background-activation failure) marks it red
+until reload — there is no journal content to acknowledge. For sessions with
+content the same event only supplies a title message; the color comes from the
+journal.
 
 ## Badge
 
@@ -143,27 +140,19 @@ most one agent: an agent paused on a question/approval keeps its loop phase
 and awaiting input. A pending interaction counts only while its agent is still
 running (a stopped agent leaves a stale pending interaction behind). The badge
 is highlighted orange when any agent awaits input (outranks red and green), red
-when **some visible session's last request failed** (outranks green), and green
-when **some visible session is finished — its whole subagent subtree done —
-with unread output**. The finished gate is per-session, so a finished parent
-whose own subagents are still working never turns the badge green, while
-unrelated activity elsewhere no longer suppresses the green another session
-earned. The number reads the winning count (a green pill never shows "0"), else
-the total active count; both branches cap at `9+`. The tooltip breaks the count
-down as "working (in subagents), needs input, failed last request (with the
-first error message), finished with unread output".
+when **some visible session's journal tail flags it** (last turn abandoned,
+errored, or max-tokens — see "Status dots"; outranks green), and green when
+**some visible session finished cleanly with unread output**. The number reads
+the winning count (a green pill never shows "0"), else the total active count;
+both branches cap at `9+`. The tooltip breaks the count down as "working (in
+subagents), needs input, failed last request (with the first error message),
+finished with unread output".
 
 Because green is per-session, a running session in one conversation no longer
 suppresses the green that a completed conversation in another earns: the badge
 lights for genuinely finished agents with unread output regardless of unrelated
-activity.
-
-Known green gaps (matching dsh's own `completed` heuristic): a session that was
-selected when its loop ended does not arm `completed` — a selected parent whose
-subtree finishes while it stays selected renders idle until switched away (the
-forceUnread CSS path covers only the window-blur case) — and a reload or host
-restart loses the in-memory running state entirely, so neither case shows green
-even after subagents finish.
+activity. Both red and green exclude the currently-selected session and clear
+once the session has been viewed (in-memory acknowledge, reset on reload).
 
 ## Current session
 
@@ -180,9 +169,8 @@ above), fading out on row hover so the archive glyph can take its place.
 The dropdown always renders the current session, even when it falls outside the
 8-slot cap: a selected parent whose subagents are working must stay reachable
 (and visible with its activity icon) no matter how many fresher sessions
-compete for the slots. Active, unread, failed-last-request, input-requiring,
-and descendant-active sessions are prioritized ahead of the most recently
-updated others.
+compete for the slots. Active, red, input-requiring, and descendant-active
+sessions are prioritized ahead of the most recently updated others.
 
 ## Layout
 
