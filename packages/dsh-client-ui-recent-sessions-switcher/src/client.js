@@ -30,6 +30,14 @@
 // runs, "Needs input (subagent)" (warning) while any descendant awaits input —
 // the same priority order the badge uses (input outranks running).
 //
+// "Finished with unread output" is dsh's client-side `completionUnread` status
+// (the same heuristic dsh's own StateDot and workspace browser use): the wire
+// session summary carries no `completed` flag anymore, so the old
+// `s.completed` read was dead — green never lit. `completionUnread` is set
+// when a session stops running outside the main view and cleared when it runs
+// again; it is in-memory, so a page reload loses unread reminders until a new
+// session finishes while the page is open (mirrors dsh's own StateDot).
+//
 // Green ("done") requires the session AND its entire subagent subtree to have
 // finished: a parent whose loop ended while any of its subagents (transitively)
 // are still running renders "Working (subagents)", not green. The badge's green
@@ -122,10 +130,12 @@ const statusOf = (s) => {
 // running session whose parent is missing from the registry cannot be
 // attributed to any ancestor, so no session is then treated as finished (its
 // green would be a lie). `unreadFinished` counts visible (non-subagent,
-// non-archived) sessions that are both server-completed and finished — the
+// non-archived) sessions that are both completion-unread and finished — the
 // exact set the badge's green lights for; unrelated activity elsewhere does not
-// suppress it (the finished gate is per-session, not global).
-const deriveActivity = (list, pendingInteractions, archivedSessionIds) => {
+// suppress it (the finished gate is per-session, not global). Running state
+// prefers the live `sessionStatus` value over the list row (dsh's own
+// workspace browser does the same).
+const deriveActivity = (list, statuses, archivedSessionIds) => {
   const result = {
     running: 0, input: 0, unreadFinished: 0,
     runningSubagents: 0, inputSubagents: 0,
@@ -142,16 +152,18 @@ const deriveActivity = (list, pendingInteractions, archivedSessionIds) => {
     const s = byId[id];
     if (s === undefined || s.blank) continue;
     const isSubagent = s.origin === "subagent";
-    const pending = visiblePendingKind(pendingInteractions.get(id)?.kind);
-    if (pending && s.running === true) {
+    const status = statuses.get(id);
+    const running = status?.running ?? (s.running === true);
+    const pending = visiblePendingKind(status?.pendingInteraction?.kind);
+    if (pending && running) {
       if (isSubagent) result.inputSubagents++;
       else result.input++;
       pendingRunningSessions.push(s);
-    } else if (s.running === true) {
+    } else if (running) {
       if (isSubagent) result.runningSubagents++;
       else result.running++;
     }
-    if (s.running === true) runningSessions.push(s);
+    if (running) runningSessions.push(s);
   }
   // Mark every ancestor of a running session as "has a running descendant".
   for (const s of runningSessions) {
@@ -180,14 +192,16 @@ const deriveActivity = (list, pendingInteractions, archivedSessionIds) => {
       cur = parent;
     }
   }
-  // Finished-with-unread count: visible, non-archived, server-completed and
+  // Finished-with-unread count: visible, non-archived, completion-unread and
   // not running with no running descendant and no unattributed running.
   for (const id of list.ids) {
     const s = byId[id];
     if (s === undefined || s.blank || s.origin === "subagent" || archived.has(id)) continue;
-    if (s.completed !== true || s.running === true) continue;
+    const status = statuses.get(id);
+    const running = status?.running ?? (s.running === true);
+    if (running) continue;
     if (result.unattributedRunning || result.hasRunningDescendant.get(id)) continue;
-    result.unreadFinished++;
+    if (status?.completionUnread === true) result.unreadFinished++;
   }
   return result;
 };
@@ -258,13 +272,10 @@ export function apply(ctx) {
       const { useSessions, useSessionStatus, useWorkspaces, sessionId, heroDock } = props;
       const list = useSessions((s) => s);
       // dsh 0.1.7-rc.2 replaced the root `sessionPendingInteraction` hook with
-      // `sessionStatus`; each entry carries the session's pending interaction.
+      // `sessionStatus`; each entry carries the session's pending interaction,
+      // live running state and the completionUnread ("finished with unread
+      // output") heuristic dsh's own StateDot uses.
       const status = useSessionStatus((s) => s);
-      const pendingInteractions = React.useMemo(() => {
-        const map = new Map();
-        for (const [id, st] of status) map.set(id, st.pendingInteraction);
-        return map;
-      }, [status]);
       const workspaceSnapshot = useWorkspaces((s) => s);
       const archivedSessionIds = workspaceSnapshot.archivedSessionIds;
       const [open, setOpen] = React.useState(false);
@@ -314,12 +325,15 @@ export function apply(ctx) {
 
       // Active-agent picture across all sessions (see deriveActivity) and the
       // per-session "finished" predicate used to gate green on the trigger dot,
-      // the dropdown rows and the forced-unread class.
+      // the dropdown rows and the forced-unread class. Running state prefers
+      // the live `sessionStatus` value over the list row (dsh's own workspace
+      // browser does the same).
       const activity = React.useMemo(
-        () => deriveActivity(list, pendingInteractions, archivedSessionIds),
-        [list, pendingInteractions, archivedSessionIds]
+        () => deriveActivity(list, status, archivedSessionIds),
+        [list, status, archivedSessionIds]
       );
-      const finished = (s) => s !== undefined && s.running !== true && !activity.unattributedRunning && !activity.hasRunningDescendant.get(s.id);
+      const runningOf = (s) => s !== undefined && (status.get(s.id)?.running ?? (s.running === true));
+      const finished = (s) => s !== undefined && !runningOf(s) && !activity.unattributedRunning && !activity.hasRunningDescendant.get(s.id);
 
       const recent = React.useMemo(() => {
         if (list.phase !== "ready") return [];
@@ -328,7 +342,7 @@ export function apply(ctx) {
         for (const id of list.ids) {
           const s = list.byId[id];
           if (s === undefined || s.blank || s.origin === "subagent" || archived.has(id)) continue;
-          items.push({ id, title: s.displayTitle, workspace: workspaceLabelOf(s), cwd: s.cwd, updatedAt: s.updatedAt, running: s.running === true, completed: s.completed === true, pending: visiblePendingKind(pendingInteractions.get(id)?.kind), finished: finished(s), hasRunningDescendant: activity.hasRunningDescendant.get(id) === true, hasPendingDescendant: activity.hasPendingDescendant.get(id) === true });
+          items.push({ id, title: s.displayTitle, workspace: workspaceLabelOf(s), cwd: s.cwd, updatedAt: s.updatedAt, running: runningOf(s), completed: status.get(id)?.completionUnread === true, pending: runningOf(s) ? visiblePendingKind(status.get(id)?.pendingInteraction?.kind) : undefined, finished: finished(s), hasRunningDescendant: activity.hasRunningDescendant.get(id) === true, hasPendingDescendant: activity.hasPendingDescendant.get(id) === true });
         }
         items.sort((a, b) => b.updatedAt - a.updatedAt);
         // Always include every active (running), unread (completed),
@@ -338,7 +352,7 @@ export function apply(ctx) {
         // capRecent). Within each group the sort above (by last-modified time)
         // is preserved.
         return capRecent(items, sessionId);
-      }, [list, pendingInteractions, archivedSessionIds, workspaceBySession, activity, sessionId]);
+      }, [list, status, archivedSessionIds, workspaceBySession, activity, sessionId]);
 
       const current = list.byId[sessionId];
       currentRunningRef.current = current ? current.running === true : false;
@@ -346,7 +360,7 @@ export function apply(ctx) {
       const currentTitle = current && !current.blank ? current.displayTitle : "";
       const currentWorkspace = current && current.cwd ? workspaceLabelOf(current) : "";
       const currentStatus = current
-        ? statusOf({ running: current.running === true, completed: current.completed === true, pending: visiblePendingKind(pendingInteractions.get(sessionId)?.kind), finished: currentFinished, hasRunningDescendant: activity.hasRunningDescendant.get(sessionId) === true, hasPendingDescendant: activity.hasPendingDescendant.get(sessionId) === true })
+        ? statusOf({ running: runningOf(current), completed: status.get(sessionId)?.completionUnread === true, pending: runningOf(current) ? visiblePendingKind(status.get(sessionId)?.pendingInteraction?.kind) : undefined, finished: currentFinished, hasRunningDescendant: activity.hasRunningDescendant.get(sessionId) === true, hasPendingDescendant: activity.hasPendingDescendant.get(sessionId) === true })
         : { state: "idle", label: "Idle" };
       // Badge: total active agents (working or awaiting input) across ALL
       // sessions, including the current one and every running subagent. Orange
