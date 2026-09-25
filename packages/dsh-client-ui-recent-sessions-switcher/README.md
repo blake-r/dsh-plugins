@@ -97,7 +97,18 @@ Mirrors dsh's `StateDot`:
   or a question awaiting the user)
 - **running** — animated matrix (DeepSeek brand blue `#5686fe`)
 - **completed** — green dot (idle with unread output)
+- **failed last request** — red dot (idle with the last request errored; see
+  below)
 - **idle** — transparent dot with a silver outline
+
+Red ("error") reports a session whose last request failed. The signal is the
+host's `api-session/error` event: agent-loop uncontained errors — including LLM
+request failures — and background-activation failures (a session that never got
+to run). It is a fact, not an unread reminder: it includes the currently
+selected session, outranks green but not orange, and an errored session is
+excluded from the green count (no double counting). The registry is in-memory,
+so a page reload forgets errors until a new failure occurs (same limitation as
+`completionUnread`).
 
 Green ("done") is gated on the agent **and its entire subagent subtree**
 having finished. A session whose own loop ended while any of its subagents
@@ -131,15 +142,16 @@ most one agent: an agent paused on a question/approval keeps its loop phase
 "running", so it is counted under "awaiting input" only, never as both working
 and awaiting input. A pending interaction counts only while its agent is still
 running (a stopped agent leaves a stale pending interaction behind). The badge
-is highlighted orange when any agent awaits input (outranks green) and green
+is highlighted orange when any agent awaits input (outranks red and green), red
+when **some visible session's last request failed** (outranks green), and green
 when **some visible session is finished — its whole subagent subtree done —
 with unread output**. The finished gate is per-session, so a finished parent
 whose own subagents are still working never turns the badge green, while
 unrelated activity elsewhere no longer suppresses the green another session
-earned. The number reads the finished-unread count while green (a green pill
-never shows "0"), else the total active count; both branches cap at `9+`. The
-tooltip breaks the count down as "working (in subagents), needs input, finished
-with unread output".
+earned. The number reads the winning count (a green pill never shows "0"), else
+the total active count; both branches cap at `9+`. The tooltip breaks the count
+down as "working (in subagents), needs input, failed last request (with the
+first error message), finished with unread output".
 
 Because green is per-session, a running session in one conversation no longer
 suppresses the green that a completed conversation in another earns: the badge
@@ -168,8 +180,9 @@ above), fading out on row hover so the archive glyph can take its place.
 The dropdown always renders the current session, even when it falls outside the
 8-slot cap: a selected parent whose subagents are working must stay reachable
 (and visible with its activity icon) no matter how many fresher sessions
-compete for the slots. Active, unread, input-requiring, and descendant-active
-sessions are prioritized ahead of the most recently-updated others.
+compete for the slots. Active, unread, failed-last-request, input-requiring,
+and descendant-active sessions are prioritized ahead of the most recently
+updated others.
 
 ## Layout
 
@@ -186,6 +199,6 @@ sessions are prioritized ahead of the most recently-updated others.
 dsh plugin --profile web add link:<repo>/packages/dsh-client-ui-recent-sessions-switcher
 ```
 
-The package declares `dsh.client` (platform `web`, injects `slots`, `sessions`
-and `workspaces`), so `dsh-client-modules` discovers the browser half
-automatically.
+The package declares `dsh.client` (platform `web`, injects `slots`, `sessions`,
+`workspaces`, `uiWorkspace` and `remote`), so `dsh-client-modules` discovers the
+browser half automatically.

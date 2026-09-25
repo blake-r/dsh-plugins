@@ -37,6 +37,7 @@ window.__ModuleLoader__.load({
 			".rss-badge{flex:none;min-width:16px;height:16px;padding:0 4px;border-radius:8px;background:transparent;border:1px solid var(--dsw-alias-border-l2,#c0c4cc);color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:14px;font-weight:600;text-align:center}",
 			".rss-badgeUnread{background:var(--dsw-alias-state-success-primary);border-color:transparent;color:#fff}",
 			".rss-badgeWarn{background:var(--dsw-alias-state-warn-primary);border-color:transparent;color:#fff}",
+			".rss-badgeError{background:var(--dsw-alias-state-error-primary);border-color:transparent;color:#fff}",
 			".rss-menu{position:absolute;top:calc(100% + 6px);right:0;z-index:30;min-width:220px;max-width:320px;max-height:320px;overflow-y:auto;padding:4px;background:var(--dsw-alias-bg-overlay);border:.5px solid var(--dsw-alias-border-l2);border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.18)}",
 			".rss-item{display:flex;align-items:center;width:100%;border-radius:6px}",
 			".rss-item:hover{background:var(--dsw-alias-interactive-bg-hover)}",
@@ -93,6 +94,14 @@ window.__ModuleLoader__.load({
 			return trimmed.slice(separator + 1);
 		};
 
+		// In-memory registry of sessions whose last request failed. Populated from the
+		// host's `api-session/error` event (agent-loop uncontained errors, including
+		// LLM request failures, and background-activation failures) and cleared when
+		// the session runs again or disappears from the list. Same reload limitation
+		// as `completionUnread`: a page reload forgets errors. The two registrations
+		// (header + hero dock) share this single map and one subscription.
+		const sessionErrors = new Map();
+
 		// Pending-interaction kinds that dsh surfaces as the orange ("warning") dot.
 		const visiblePendingKind = (kind) => {
 			if (kind === "approval" || kind === "plan-review" || kind === "question") return kind;
@@ -137,6 +146,7 @@ window.__ModuleLoader__.load({
 			if (s.running) return { state: "ongoing", label: "Working" };
 			if (s.hasPendingDescendant) return { state: "warning", label: "Needs input (subagent)" };
 			if (s.hasRunningDescendant) return { state: "ongoing", label: "Working (subagents)" };
+			if (s.errored && s.finished) return { state: "error", label: "Last request failed" };
 			if (s.completed && s.finished) return { state: "done", label: "Idle, unread output" };
 			return { state: "idle", label: "Idle, all read" };
 		};
@@ -161,7 +171,7 @@ window.__ModuleLoader__.load({
 		// own workspace browser does the same).
 		const deriveActivity = (list, statuses, archivedSessionIds) => {
 			const result = {
-				running: 0, input: 0, unreadFinished: 0,
+				running: 0, input: 0, unreadFinished: 0, errored: 0, firstError: undefined,
 				runningSubagents: 0, inputSubagents: 0,
 				hasRunningDescendant: new Map(),
 				hasPendingDescendant: new Map(),
@@ -216,8 +226,12 @@ window.__ModuleLoader__.load({
 					cur = parent;
 				}
 			}
-			// Finished-with-unread count: visible, non-archived, completion-unread and
-			// not running with no running descendant and no unattributed running.
+			// Finished-with-unread / failed-last-request count: visible, non-archived,
+			// not running with no running descendant and no unattributed running. An
+			// errored session is excluded from green (no double count) and reported as
+			// `errored` instead; `firstError` carries the first error message for the
+			// red pill's title. Red is a fact (includes the current session), green is
+			// an unread reminder (excludes it).
 			for (const id of list.ids) {
 				const s = byId[id];
 				if (s === undefined || s.blank || s.origin === "subagent" || archived.has(id)) continue;
@@ -225,28 +239,34 @@ window.__ModuleLoader__.load({
 				const running = status?.running ?? (s.running === true);
 				if (running) continue;
 				if (result.unattributedRunning || result.hasRunningDescendant.get(id)) continue;
+				const errorMessage = sessionErrors.get(id);
+				if (errorMessage !== undefined) {
+					result.errored++;
+					if (result.firstError === undefined && errorMessage.trim() !== "") result.firstError = errorMessage.length > 200 ? errorMessage.slice(0, 200) + "…" : errorMessage;
+					continue;
+				}
 				if (status?.completionUnread === true) result.unreadFinished++;
 			}
 			return result;
 		};
 
-		// Pure badge view from the activity picture. Orange (input) outranks
-		// green; green lights when some visible session is finished with unread
-		// output; the number reads the finished-unread count while green (so a
-		// green pill never shows "0"), else the total active count. Both branches
-		// cap at "9+".
+		// Pure badge view from the activity picture. Orange (input) outranks red
+		// (failed last request), which outranks green (unread); the number reads the
+		// winning count (so a green pill never shows "0"), else the total active
+		// count. Both branches cap at "9+".
 		const badgeView = (activity) => {
-			const { running, input, unreadFinished, runningSubagents, inputSubagents } = activity;
+			const { running, input, unreadFinished, errored, runningSubagents, inputSubagents, firstError } = activity;
 			const totalRunning = running + runningSubagents;
 			const totalInput = input + inputSubagents;
 			const totalActive = totalRunning + totalInput;
-			const cls = "rss-badge" + (totalInput > 0 ? " rss-badgeWarn" : unreadFinished > 0 ? " rss-badgeUnread" : "");
+			const cls = "rss-badge" + (totalInput > 0 ? " rss-badgeWarn" : errored > 0 ? " rss-badgeError" : unreadFinished > 0 ? " rss-badgeUnread" : "");
 			const title = [
 				totalRunning > 0 ? totalRunning + " working" + (runningSubagents > 0 ? " (" + runningSubagents + " in subagents)" : "") : "",
 				totalInput > 0 ? totalInput + " need" + (totalInput === 1 ? "s" : "") + " input" : "",
+				errored > 0 ? errored + " failed last request" + (errored === 1 ? "" : "s") + (firstError !== undefined ? ", Last error: " + firstError : "") : "",
 				unreadFinished > 0 ? unreadFinished + " finished with unread output" + (unreadFinished === 1 ? "" : "s") : ""
 			].filter(Boolean).join(", ");
-			const shown = unreadFinished > 0 ? unreadFinished : totalActive;
+			const shown = totalInput > 0 ? totalActive : errored > 0 ? errored : unreadFinished > 0 ? unreadFinished : totalActive;
 			const number = shown > 10 ? "9+" : shown;
 			return { cls, title, number };
 		};
@@ -257,8 +277,8 @@ window.__ModuleLoader__.load({
 		// whose subagents are working must stay reachable and visible with its
 		// activity icon).
 		const capRecent = (items, sessionId) => {
-			const priority = items.filter((i) => i.running || i.completed || i.pending || i.hasRunningDescendant || i.hasPendingDescendant);
-			const rest = items.filter((i) => !i.running && !i.completed && !i.pending && !i.hasRunningDescendant && !i.hasPendingDescendant);
+			const priority = items.filter((i) => i.running || i.completed || i.errored || i.pending || i.hasRunningDescendant || i.hasPendingDescendant);
+			const rest = items.filter((i) => !i.running && !i.completed && !i.errored && !i.pending && !i.hasRunningDescendant && !i.hasPendingDescendant);
 			const restCapped = rest.slice(0, Math.max(0, 8 - priority.length));
 			const currentItem = items.find((i) => i.id === sessionId);
 			if (currentItem !== undefined && !priority.includes(currentItem) && !restCapped.includes(currentItem)) restCapped.push(currentItem);
@@ -276,6 +296,9 @@ window.__ModuleLoader__.load({
 			if (status.state === "warning") {
 				return react.createElement("span", { className: "rss-dot", style: { background: "var(--dsw-alias-state-warn-primary)" } });
 			}
+			if (status.state === "error") {
+				return react.createElement("span", { className: "rss-dot", style: { background: "var(--dsw-alias-state-error-primary)" } });
+			}
 			if (status.state === "done") {
 				return react.createElement("span", { className: "rss-dot", style: { background: "var(--dsw-alias-state-success-primary)" } });
 			}
@@ -285,13 +308,23 @@ window.__ModuleLoader__.load({
 			);
 		};
 
-		const inject = ["slots", "sessions", "workspaces", "uiWorkspace"];
+		const inject = ["slots", "sessions", "workspaces", "uiWorkspace", "remote"];
 
 		function apply(ctx) {
 			const slots = ctx.slots;
 			const sessions = ctx.sessions;
 			const workspaces = ctx.workspaces;
 			const uiWorkspace = ctx.uiWorkspace;
+			const remote = ctx.remote;
+			// One subscription feeds both registrations: the host emits
+			// `api-session/error(sessionId, message)` on agent-loop uncontained errors
+			// (including LLM request failures) and on background-activation failures.
+			ctx.effect(() => {
+				if (remote === undefined || typeof remote.$on !== "function") return;
+				return remote.$on("api-session/error", (sessionId, message) => {
+					if (typeof sessionId === "string" && typeof message === "string") sessionErrors.set(sessionId, message);
+				});
+			});
 			// One component serves two registrations: the header utilities row
 			// (active Session) and the hero dock row (new Session). `heroDock` is
 			// injected by the second registration so the trigger label can differ
@@ -344,6 +377,21 @@ window.__ModuleLoader__.load({
 						};
 					}, [open]);
 
+					// Error-registry hygiene: a session that runs again is no longer failed,
+					// and a session that vanished from the list cannot stay failed. Runs on
+					// every status/list change (the error event itself is followed by the
+					// idle status event, which re-renders and lets the red badge appear).
+					react.useEffect(() => {
+						for (const [id, running] of status) {
+							if (running === true) sessionErrors.delete(id);
+						}
+						if (list.phase === "ready") {
+							for (const id of sessionErrors.keys()) {
+								if (!(id in list.byId)) sessionErrors.delete(id);
+							}
+						}
+					}, [status, list]);
+
 					// Workspace display name for a session: the Workspace's user-chosen
 					// `title` when the session is accounted to one (the title may differ from
 					// the directory basename), otherwise the cwd basename. Mirrors dsh's own
@@ -378,7 +426,7 @@ window.__ModuleLoader__.load({
 						for (const id of list.ids) {
 							const s = list.byId[id];
 							if (s === undefined || s.blank || s.origin === "subagent" || archived.has(id)) continue;
-							items.push({ id, title: s.displayTitle, workspace: workspaceLabelOf(s), cwd: s.cwd, updatedAt: s.updatedAt, running: runningOf(s), completed: status.get(id)?.completionUnread === true, pending: runningOf(s) ? visiblePendingKind(status.get(id)?.pendingInteraction?.kind) : undefined, finished: finished(s), hasRunningDescendant: activity.hasRunningDescendant.get(id) === true, hasPendingDescendant: activity.hasPendingDescendant.get(id) === true });
+							items.push({ id, title: s.displayTitle, workspace: workspaceLabelOf(s), cwd: s.cwd, updatedAt: s.updatedAt, running: runningOf(s), completed: status.get(id)?.completionUnread === true, errored: sessionErrors.has(id), pending: runningOf(s) ? visiblePendingKind(status.get(id)?.pendingInteraction?.kind) : undefined, finished: finished(s), hasRunningDescendant: activity.hasRunningDescendant.get(id) === true, hasPendingDescendant: activity.hasPendingDescendant.get(id) === true });
 						}
 						items.sort((a, b) => b.updatedAt - a.updatedAt);
 						// Always include every active (running), unread (completed),
@@ -396,7 +444,7 @@ window.__ModuleLoader__.load({
 					const currentTitle = current && !current.blank ? current.displayTitle : "";
 					const currentWorkspace = current && current.cwd ? workspaceLabelOf(current) : "";
 					const currentStatus = current
-						? statusOf({ running: runningOf(current), completed: status.get(sessionId)?.completionUnread === true, pending: runningOf(current) ? visiblePendingKind(status.get(sessionId)?.pendingInteraction?.kind) : undefined, finished: currentFinished, hasRunningDescendant: activity.hasRunningDescendant.get(sessionId) === true, hasPendingDescendant: activity.hasPendingDescendant.get(sessionId) === true })
+						? statusOf({ running: runningOf(current), completed: status.get(sessionId)?.completionUnread === true, errored: sessionErrors.has(sessionId), pending: runningOf(current) ? visiblePendingKind(status.get(sessionId)?.pendingInteraction?.kind) : undefined, finished: currentFinished, hasRunningDescendant: activity.hasRunningDescendant.get(sessionId) === true, hasPendingDescendant: activity.hasPendingDescendant.get(sessionId) === true })
 						: { state: "idle", label: "Idle" };
 					// Badge: total active agents (working or awaiting input) across
 					// ALL sessions, including the current one and every running
