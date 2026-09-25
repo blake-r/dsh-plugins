@@ -41,9 +41,9 @@
  *     slice: the first `headLines` non-empty lines and the last `tailLines`
  *     non-empty line(s), each capped at `lineCap` bytes. A per-line ellipsis
  *     plus "[truncated N bytes]" tag marks a capped line; a "[truncated N
- *     lines]" marker separates head from tail when lines were skipped. The two
- *     notice lines ("[Saved at <locator>]" and a stats line) sit at the top and
- *     double as the head/tail separator. lineCap is derived from the cap minus
+ *     lines]" marker separates head from tail when lines were skipped. A single
+ *     header line ("[Saved at <locator>] [<stats>]") sits at the top and doubles
+ *     as the head/tail separator. lineCap is derived from the cap minus
  *     a worst-case overhead so the replacement never exceeds maxInlineBytes by
  *     construction (the best-effort guard below stays as a safety net).
  *
@@ -274,9 +274,10 @@ export function artifactExtension(kind){
  * undefined when the worst-case overhead alone already exceeds `cap` (the
  * caller then keeps the inline content).
  *
- * Layout (top to bottom): "[Saved at <locator>]" notice, a stats line, the
- * first `headLines` non-empty lines, a "[truncated N lines]" marker when lines
- * were skipped, then the last `tailLines` non-empty lines. Each sampled line is
+ * Layout (top to bottom): a single header line "[Saved at <locator>] [<kind> ·
+ * N bytes · M lines · <summary>]", the first `headLines` non-empty lines, a
+ * "[truncated N lines]" marker when lines were skipped, then the last
+ * `tailLines` non-empty lines. Each sampled line is
  * capped at `lineCap` bytes; a capped line gains a "\u2026 [truncated N bytes]"
  * suffix. lineCap is derived so the result never exceeds `cap` by construction.
  */
@@ -284,14 +285,18 @@ export function composeReplacement({ cap, headLines, tailLines, content, structu
 	const totalBytes = Buffer.byteLength(content, "utf8");
 	const lines = content.split("\n").length;
 	const label = kindLabel(structured?.kind, structured?.value);
-	const rest = structured ? summarizeStructured(structured.kind, structured.value) : "";
+	// Whitespace in the structural summary is collapsed so the header always
+	// stays on one line (JSON keys / CSV headers may contain real newlines).
+	const rest = structured ? summarizeStructured(structured.kind, structured.value).replace(/\s+/g, " ") : "";
 	const notice1 = `[Saved at ${locator}]`;
 	const lineWord = lines === 1 ? "line" : "lines";
 	const notice2 = `[${label} \u00b7 ${totalBytes} bytes \u00b7 ${lines} ${lineWord}${rest ? ` \u00b7 ${rest}` : ""}]`;
+	const header = `${notice1} ${notice2}`;
 
 	const previewLineCount = headLines + tailLines;
 	// Worst-case per-line cap suffix and middle marker (digit counts bounded by
-	// the byte/line counts), plus the newlines between every element.
+	// the byte/line counts), plus the space inside the header and the newlines
+	// between every element (byte-identical to the old two-notice accounting).
 	const lineSuffixMax = Buffer.byteLength(`\u2026 [truncated ${"0".repeat(String(totalBytes).length)} bytes]`, "utf8");
 	const markerMax = Buffer.byteLength(`[truncated ${"0".repeat(String(lines).length)} lines]`, "utf8");
 	const overhead =
@@ -312,7 +317,7 @@ export function composeReplacement({ cap, headLines, tailLines, content, structu
 		return cut > 0 ? `${taken.text}\u2026 [truncated ${cut} bytes]` : line;
 	};
 
-	const parts = [notice1, notice2];
+	const parts = [header];
 	for (const l of head) parts.push(render(l));
 	if (skipped > 0) parts.push(`[truncated ${skipped} lines]`);
 	for (const l of tail) parts.push(render(l));

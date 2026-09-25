@@ -7,8 +7,8 @@ Replacement spill policy for DeepSeek Harness (dsh).
 Bounds the model-facing result of oversized tool calls: instead of the full
 output, the model sees a minimal preview — the first `headLines` non-empty
 lines and the last `tailLines` non-empty line(s), each capped at `lineCap`
-bytes — plus two notice lines pointing at the full artifact in the spill store
-(`ctx.spillStore`, `@deepseek-ai/dsh-spill-local`). The model reads the
+bytes — plus a single header line pointing at the full artifact in the spill
+store (`ctx.spillStore`, `@deepseek-ai/dsh-spill-local`). The model reads the
 artifact back via `read` when it actually needs the data.
 
 Divergence from base `@deepseek-ai/dsh-spill-policy`:
@@ -21,8 +21,8 @@ Divergence from base `@deepseek-ai/dsh-spill-policy`:
   full.
 - The preview is a MINIMAL sample, not a budget-filling head/tail slice. A
   capped line gains a "… [truncated N bytes]" suffix; skipped middle lines are
-  summarized by a "[truncated N lines]" marker. The notice sits at the top in
-  two lines — "[Saved at <locator>]" and a stats line — and doubles as the
+  summarized by a "[truncated N lines]" marker. A single header line —
+  "[Saved at <locator>] [<stats>]" — sits at the top and doubles as the
   head/tail separator.
 - `lineCap` is derived from `maxInlineBytes` minus a worst-case overhead, so
   the replacement never exceeds `maxInlineBytes` by construction.
@@ -32,8 +32,7 @@ Divergence from base `@deepseek-ai/dsh-spill-policy`:
 For an oversized result the replacement reads (top to bottom):
 
 ```
-[Saved at spill/xxx.jsonl]
-[JSONL · 112788 bytes · 5000 lines · 5000 records · first-record keys: a, b]
+[Saved at spill/xxx.jsonl] [JSONL · 112788 bytes · 5000 lines · 5000 records · first-record keys: a, b]
 {"a": 1, "b": 2}
 {"a": 2, "b": 3}
 [truncated 4997 lines]
@@ -43,13 +42,14 @@ For an oversized result the replacement reads (top to bottom):
 A single line longer than `lineCap` is capped with an ellipsis and a byte count:
 
 ```
-[Saved at spill/data.json]
-[JSON object · 4029 bytes · 1 line · keys: a, b, c]
+[Saved at spill/data.json] [JSON object · 4029 bytes · 1 line · keys: a, b, c]
 {"a":1,"b":2,"c":[0,1,2,...,348,… [truncated 2725 bytes]
 ```
 
-Plain-text results carry no summary in the stats line: `[txt · N bytes · M
-lines]`.
+Plain-text results carry no summary in the stats line: `[Saved at <locator>]
+[txt · N bytes · M lines]`. Whitespace in the structural summary is collapsed
+to single spaces, so the header always stays on one line even when JSON keys or
+CSV headers contain newlines.
 
 ## Mount
 
