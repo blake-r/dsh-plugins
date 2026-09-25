@@ -8,19 +8,18 @@
  *
  *   - This plugin: same shape but a much tighter byte cap (maxInlineBytes,
  *     default 4096). The model first judges volume from a short head/tail
- *     preview plus the notice ("N bytes omitted", total byte/line counts), then
- *     reads the full artifact back via read when it actually needs the data.
+ *     preview plus the notice (total byte/line counts), then reads the full
+ *     artifact back via read when it actually needs the data.
  *
  *   - Structured results are classified before saving but the artifact is saved
  *     VERBATIM, never reformatted: the model can still inspect the original
  *     formatting(e.g.whether a downloaded JSON was minified).Classification only drives
  *       * the artifact extension(.json/.jsonl/.yaml/.csv/.tsv/.xml/.html/.txt fallback),and
- *       * a first-level structural summary in the replacement
- *         ("[JSON array · N records · first-record keys: ...]" /
- *         "[JSON object · keys: ...]" / "[JSONL · N records ...]" /
- *         "[CSV/TSV · R rows · C columns · header ...]" /
- *         "[XML · root <...>]" / "[HTML · title: ... · lang: ...]" /
- *         "[YAML ...]"),
+ *       * a first-level structural summary folded into the stats line of the
+ *         replacement ("[JSONL · N bytes · M lines · N records · first-record
+ *         keys: ...]" / "[JSON object · ... · keys: ...]" / "[CSV · ... · R rows
+ *         · C columns · header ...]" / "[XML · ... · root <...>]" / "[HTML · ...
+ *         · title: ... · lang: ...]" / "[YAML ...]"),
  *         so volume can be judged without reading anything.
  *     MCP tools wrap their result in a content-block envelope
  *     ([{"type":"text","text":"..."}]); such envelopes are unwrapped before
@@ -38,11 +37,15 @@
  *     a read -> spill -> read again loop; skill results are instructions the model
  *     needs verbatim.
  *
- *   - The omission marker ("[... N bytes omitted ...]") is reserved in the
- *     preview budget: omittedBytes never exceeds totalBytes, so its digit count
- *     is bounded by String(totalBytes).length. The replacement therefore never
- *     exceeds maxInlineBytes by construction (the best-effort guard below stays
- *     as a safety net).
+ *   - The oversized preview is a MINIMAL sample, not a budget-filling head/tail
+ *     slice: the first `headLines` non-empty lines and the last `tailLines`
+ *     non-empty line(s), each capped at `lineCap` bytes. A per-line ellipsis
+ *     plus "[truncated N bytes]" tag marks a capped line; a "[truncated N
+ *     lines]" marker separates head from tail when lines were skipped. The two
+ *     notice lines ("[Saved at <locator>]" and a stats line) sit at the top and
+ *     double as the head/tail separator. lineCap is derived from the cap minus
+ *     a worst-case overhead so the replacement never exceeds maxInlineBytes by
+ *     construction (the best-effort guard below stays as a safety net).
  *
  * Oversized iff utf8ByteLength(text) > maxInlineBytes.
  *
@@ -83,40 +86,17 @@ function ownerSessionId(exec) {
 	return exec.agent?.session.header.id;
 }
 
-/** Prefix/suffix of `text` whose UTF-8 size does not exceed `maxBytes`; never splits code points. */
-function takeBytes(text, maxBytes, fromEnd) {
+/** Prefix of `text` whose UTF-8 size does not exceed `maxBytes`; never splits code points. */
+function takeBytes(text, maxBytes) {
 	let out = "";
 	let bytes = 0;
-	if (!fromEnd) {
-		for (const ch of text) {
-			const b = Buffer.byteLength(ch, "utf8");
-			if (bytes + b > maxBytes) break;
-			out += ch;
-			bytes += b;
-		}
-	} else {
-		const chars = [...text];
-		for (let i = chars.length - 1; i >= 0; i--) {
-			const b = Buffer.byteLength(chars[i], "utf8");
-			if (bytes + b > maxBytes) break;
-			out = chars[i] + out;
-			bytes += b;
-		}
+	for (const ch of text) {
+		const b = Buffer.byteLength(ch, "utf8");
+		if (bytes + b > maxBytes) break;
+		out += ch;
+		bytes += b;
 	}
 	return { text: out };
-}
-
-/** Bounded head/tail preview splitting `budget` bytes across both ends. */
-function buildPreview(text, budget) {
-	const headBudget = Math.ceil(budget / 2);
-	const tailBudget = Math.floor(budget / 2);
-	const head = takeBytes(text, headBudget);
-	const tail = takeBytes(text, tailBudget, true);
-	return {
-		head: head.text,
-		tail: tail.text,
-		omittedBytes: Buffer.byteLength(text, "utf8") - Buffer.byteLength(head.text, "utf8") - Buffer.byteLength(tail.text, "utf8")
-	};
 }
 
 /** Lazily loaded js-yaml module(default export), cached; undefined when unavailable. */
@@ -233,25 +213,36 @@ export async function tryParseStructured(text, depth = 0) {
 	return void 0;
 }
 
-/** First-level structural summary line(single line, no trailing newline). */
+/** Short label for a classified kind("JSON array"/"JSON object"/"JSONL"/"CSV"/...; "txt" for plain text). */
+export function kindLabel(kind, value) {
+	if (kind === void 0) return "txt";
+	if (kind === "json" || kind === "yaml") return Array.isArray(value) ? `${kind.toUpperCase()} array` : `${kind.toUpperCase()} object`;
+	return kind.toUpperCase();
+}
+
+/**
+ * First-level structural summary tail for a classified kind - the part after
+ * "kind · bytes · lines" in the stats line (no leading kind label, no brackets,
+ * no trailing newline). Empty string for plain text.
+ */
 export function summarizeStructured(kind, value) {
 	switch (kind) {
 	case "jsonl": {
 			const records=value.records;
 			const first=records.find((r)=>r!==null&&typeof r==="object");
 			const keys=first?Object.keys(first).slice(0,8).join(", "):"";
-			return `[JSONL \u00b7 ${records.length} records${keys?` \u00b7 first-record keys: ${keys}`:""}]`;
+			return `${records.length} records${keys?` \u00b7 first-record keys: ${keys}`:""}`;
 	}
 	case "csv":
 	case "tsv":
-			return `[${kind.toUpperCase()} \u00b7 ${value.rows} rows \u00b7 ${value.columns} columns${value.header?` \u00b7 header: ${value.header.slice(0,120)}`:""}]`;
+			return `${value.rows} rows \u00b7 ${value.columns} columns${value.header?` \u00b7 header: ${value.header.slice(0,120)}`:""}`;
 	case "xml":
-			return `[${kind.toUpperCase()} \u00b7 root <${value.root}>]`;
+			return `root <${value.root}>`;
 	case "html": {
 			const parts = [];
 			if (value.title) parts.push(`title: ${value.title}`);
 			if (value.lang) parts.push(`lang: ${value.lang}`);
-			return parts.length > 0 ? `[HTML \u00b7 ${parts.join(" \u00b7 ")}]` : "[HTML]";
+			return parts.join(" \u00b7 ");
 	}
 	default:
 			break;
@@ -259,10 +250,10 @@ export function summarizeStructured(kind, value) {
 	if (Array.isArray(value)) {
 			const first=value.find((v)=>v!==null&&typeof v==="object");
 			const keys=first?Object.keys(first).slice(0,8).join(", "):"";
-			return `[${kind.toUpperCase()} array \u00b7 ${value.length} records${keys?` \u00b7 first-record keys: ${keys}`:""}]`;
+			return `${value.length} records${keys?` \u00b7 first-record keys: ${keys}`:""}`;
 	}
 	const keys=Object.keys(value).slice(0,12).join(", ");
-	return `[${kind.toUpperCase()} object \u00b7 keys: ${keys}]`;
+	return `keys: ${keys}`;
 }
 
 /** Artifact extension for a classified kind; ".txt" for plain text. */
@@ -278,9 +269,64 @@ export function artifactExtension(kind){
 	default:return ".txt";
 }}
 
+/**
+ * Compose the oversized replacement preview. Returns the replacement text or
+ * undefined when the worst-case overhead alone already exceeds `cap` (the
+ * caller then keeps the inline content).
+ *
+ * Layout (top to bottom): "[Saved at <locator>]" notice, a stats line, the
+ * first `headLines` non-empty lines, a "[truncated N lines]" marker when lines
+ * were skipped, then the last `tailLines` non-empty lines. Each sampled line is
+ * capped at `lineCap` bytes; a capped line gains a "\u2026 [truncated N bytes]"
+ * suffix. lineCap is derived so the result never exceeds `cap` by construction.
+ */
+export function composeReplacement({ cap, headLines, tailLines, content, structured, locator }) {
+	const totalBytes = Buffer.byteLength(content, "utf8");
+	const lines = content.split("\n").length;
+	const label = kindLabel(structured?.kind, structured?.value);
+	const rest = structured ? summarizeStructured(structured.kind, structured.value) : "";
+	const notice1 = `[Saved at ${locator}]`;
+	const lineWord = lines === 1 ? "line" : "lines";
+	const notice2 = `[${label} \u00b7 ${totalBytes} bytes \u00b7 ${lines} ${lineWord}${rest ? ` \u00b7 ${rest}` : ""}]`;
+
+	const previewLineCount = headLines + tailLines;
+	// Worst-case per-line cap suffix and middle marker (digit counts bounded by
+	// the byte/line counts), plus the newlines between every element.
+	const lineSuffixMax = Buffer.byteLength(`\u2026 [truncated ${"0".repeat(String(totalBytes).length)} bytes]`, "utf8");
+	const markerMax = Buffer.byteLength(`[truncated ${"0".repeat(String(lines).length)} lines]`, "utf8");
+	const overhead =
+		Buffer.byteLength(notice1, "utf8") + Buffer.byteLength(notice2, "utf8") +
+		(previewLineCount + 2) + previewLineCount * lineSuffixMax + markerMax;
+	if (overhead > cap) return void 0;
+	const lineCap = Math.floor((cap - overhead) / previewLineCount);
+
+	const sampleLines = content.split("\n").filter((l) => l.trim().length > 0);
+	const total = sampleLines.length;
+	const head = lineCap > 0 ? sampleLines.slice(0, headLines) : [];
+	const tail = lineCap > 0 ? sampleLines.slice(Math.max(headLines, total - tailLines)) : [];
+	const skipped = Math.max(0, total - head.length - tail.length);
+
+	const render = (line) => {
+		const taken = takeBytes(line, lineCap);
+		const cut = Buffer.byteLength(line, "utf8") - Buffer.byteLength(taken.text, "utf8");
+		return cut > 0 ? `${taken.text}\u2026 [truncated ${cut} bytes]` : line;
+	};
+
+	const parts = [notice1, notice2];
+	for (const l of head) parts.push(render(l));
+	if (skipped > 0) parts.push(`[truncated ${skipped} lines]`);
+	for (const l of tail) parts.push(render(l));
+	return parts.join("\n");
+}
+
 export function apply(ctx, config) {
 	const cap = Number.isInteger(config?.maxInlineBytes) ? config.maxInlineBytes : 4096;
 	if (!Number.isInteger(cap) || cap < 0) throw new Error(`dsh-spill-policy: maxInlineBytes must be a non-negative integer (got ${cap})`);
+	const headLines = Number.isInteger(config?.headLines) ? config.headLines : 2;
+	const tailLines = Number.isInteger(config?.tailLines) ? config.tailLines : 1;
+	if (!Number.isInteger(headLines) || headLines < 0 || !Number.isInteger(tailLines) || tailLines < 0 || headLines + tailLines < 1) {
+		throw new Error(`dsh-spill-policy: headLines and tailLines must be non-negative integers with headLines + tailLines >= 1 (got headLines=${headLines}, tailLines=${tailLines})`);
+	}
 	const excludeTools = Array.isArray(config?.excludeTools) && config.excludeTools.length > 0 ? config.excludeTools : ["read", "skill"];
 
 	async function spillReplacement(sessionId, toolName, callId, content) {
@@ -307,19 +353,13 @@ export function apply(ctx, config) {
 			ctx.logger.warn(`dsh-spill-policy: saveText failed for ${toolName}: ${String(error)}; keeping the inline content`);
 			return undefined;
 		}
-		const totalBytes = Buffer.byteLength(content, "utf8");
-		const lines = content.split("\n").length;
-		const notice = `(Full formatted result stored at: ${ref.locator} - ${totalBytes} bytes, ${lines} lines)`;
-		const summary = structured ? summarizeStructured(structured.kind, structured.value) : "";
-		// Reserve the worst-case omission marker too: omittedBytes never exceeds totalBytes,
-		// so its digit count is bounded by String(totalBytes).length.
-		const markerMaxBytes = Buffer.byteLength(`\n[... ${"0".repeat(String(totalBytes).length)} bytes omitted ...]\n`, "utf8");
-		const reserve = Buffer.byteLength(notice, "utf8") + Buffer.byteLength(summary, "utf8") + 4 + markerMaxBytes;
-		const budget = Math.max(0, cap - reserve);
-		const { head, tail, omittedBytes } = buildPreview(content, budget);
-		const marker = omittedBytes > 0 ? `\n[... ${omittedBytes} bytes omitted ...]\n` : "";
-		const previewPart = `${head}${marker}${tail}`;
-		const replacedText = `${summary ? `${summary}\n` : ""}${previewPart.length > 0 ? `${previewPart}\n\n` : ""}${notice}`;
+		const replacedText = composeReplacement({
+			cap, headLines, tailLines, content, structured, locator: ref.locator
+		});
+		if (replacedText === void 0) {
+			ctx.logger.warn(`dsh-spill-policy: spill notice for ${toolName} exceeds maxInlineBytes; keeping the inline content`);
+			return undefined;
+		}
 		if (Buffer.byteLength(replacedText, "utf8") > cap) {
 			ctx.logger.warn(`dsh-spill-policy: spill notice for ${toolName} exceeds maxInlineBytes; keeping the inline content`);
 			return undefined;
