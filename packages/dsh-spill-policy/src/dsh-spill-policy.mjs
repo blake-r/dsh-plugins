@@ -22,10 +22,13 @@
  *         · title: ... · lang: ...]" / "[YAML ...]"),
  *         so volume can be judged without reading anything.
  *     MCP tools wrap their result in a content-block envelope
- *     ([{"type":"text","text":"..."}]); such envelopes are unwrapped before
- *     classification so browser/jira/slack dumps classify by their payload, not
- *     as "JSON array of one text block". An envelope whose payload is plain text
- *     falls back to txt. HTML summaries carry only title/lang(present parts
+ *     ([{"type":"text","text":"..."}]); for MCP tools (name prefix "mcp__") the
+ *     envelope is unwrapped ONCE right after flattening, so the size check, the
+ *     saved artifact, and the preview all work on the payload, not the envelope.
+ *     Mixed envelopes (non-text blocks) and non-envelope text stay verbatim.
+ *     Classification no longer unwraps envelopes: a transport envelope that
+ *     reaches it (nested MCP payload, non-MCP tool) classifies as a JSON array
+ *     of one text block. HTML summaries carry only title/lang(present parts
  *     only, no null placeholders; both absent -> bare [HTML]).
  *     Detection order: single JSON value -> JSONL -> HTML -> XML -> CSV/TSV ->
  *     YAML. Markdown and other prose are deliberately left as plain text.
@@ -155,24 +158,37 @@ function unwrapContentBlocks(value) {
 }
 
 /**
+ * Unpack one MCP transport-envelope level: when the whole text is a JSON
+ * content-block envelope ([{"type":"text","text":"..."}] or a single block
+ * object), return the concatenated payload; otherwise return the text
+ * unchanged. Single level only, mixed envelopes and empty payloads stay
+ * verbatim.
+ */
+function unwrapEnvelope(text) {
+	const trimmed = text.trim();
+	if (!trimmed) return text;
+	if (!((trimmed[0] === "{" && trimmed[trimmed.length - 1] === "}") ||
+		(trimmed[0] === "[" && trimmed[trimmed.length - 1] === "]"))) return text;
+	let value;
+	try { value = JSON.parse(trimmed); } catch { return text; }
+	const inner = unwrapContentBlocks(value);
+	if (inner === void 0 || inner === trimmed) return text;
+	return inner;
+}
+
+/**
  * Classify `text` as structured:{kind:"json"|"jsonl"|"html"|"xml"|"csv"|"tsv"|"yaml",value} or undefined
  * when it is plain text(or looks structured but fails to parse -> txt).
+ * Transport envelopes are NOT unwrapped here anymore: the MCP envelope is
+ * stripped once before the size check, so whatever reaches classification is
+ * the payload itself.
  */
-export async function tryParseStructured(text, depth = 0) {
+export async function tryParseStructured(text) {
 	const trimmed = text.trim();
 	if (!trimmed) return void 0;
 	if ((trimmed[0]==="{"&&trimmed[trimmed.length-1]==="}")||(trimmed[0]==="["&&trimmed[trimmed.length-1]==="]")) {
 		try {
-			const value = JSON.parse(trimmed);
-			if (depth < 3) {
-				const inner = unwrapContentBlocks(value);
-				if (inner !== void 0 && inner !== trimmed) {
-					const nested = await tryParseStructured(inner, depth + 1);
-					if (nested !== void 0) return nested;
-					return void 0; // pure transport envelope whose payload is plain text -> txt
-				}
-			}
-			return { kind:"json", value };
+			return { kind:"json", value: JSON.parse(trimmed) };
 		} catch { /* fall through */ }
 	}
 	const lines = trimmed.split("\n");
@@ -382,8 +398,9 @@ export function apply(ctx, config) {
 		) return decision;
 		const text = flattenPlainText(decision.content ?? result.content);
 		if (text === void 0) return decision;
-		if (Buffer.byteLength(text, "utf8") <= cap) return decision;
-		const replacedText = await spillReplacement(ownerSessionId(exec), exec.name, exec.callId, text);
+		const payload = exec.name.startsWith("mcp__") ? unwrapEnvelope(text) : text;
+		if (Buffer.byteLength(payload, "utf8") <= cap) return decision;
+		const replacedText = await spillReplacement(ownerSessionId(exec), exec.name, exec.callId, payload);
 		if (replacedText === void 0) return decision;
 		return {
 			kind: "accept",
@@ -399,8 +416,9 @@ ctx.on("tools/ptc-dispatch-log", async (dispatch , next) => {
 	const content = await next();
 	const text = flattenPlainText(content);
 	if (text === void 0) return content;
-	if (Buffer.byteLength(text, "utf8") <= cap) return content;
-	const replacedText = await spillReplacement(ownerSessionId(dispatch.exec), dispatch.name, dispatch.subCallId, text);
+	const payload = dispatch.name.startsWith("mcp__") ? unwrapEnvelope(text) : text;
+	if (Buffer.byteLength(payload, "utf8") <= cap) return content;
+	const replacedText = await spillReplacement(ownerSessionId(dispatch.exec), dispatch.name, dispatch.subCallId, payload);
 	if (replacedText === void 0) return content;
 	return [{
 			type: "text",
