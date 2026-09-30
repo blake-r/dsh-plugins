@@ -1,21 +1,48 @@
 // dsh-skill-from-tools — one skill per tool (no module grouping). Every
 // non-`skill` tool becomes its own skill. The skill `description` carries the
-// SHORT form: first sentence + the parameter schema as a COMPACT JSON literal
-// (no descriptions). The `content` block carries the FULL annotated schema under
-// an explicit `Arguments:` heading — each field with its description as a
-// comment. The full `parameters` schema stays in the tool registry; only the
-// compact JSON line is rendered in the description.
+// SHORT form: first sentence + the parameter schema as a COMPACT literal in the
+// `/`-marked notation below. The skill `content` carries the tool's MINIFIED
+// JSON SCHEMA, dumped verbatim from the tool registry.
 //
 // COMPACT SCHEMA NOTATION (per user spec):
-//   - required field:  `"command":string`
-//   - optional field:  `"command":undef|string`   (`undef` = may be absent)
-//   - nested object:   `{"questions":[{"id":string,"header":undef|string}]}`
-//   - array:           `[<item type>]`
-//   - enum:            `"edit"|"pause"|"resume"|"complete"|"blocked"`
-//   - const:           `"new"`
-//   - oneOf union:     `integer|null` (nullable) or `{...}|{...}` (discriminated)
-//   - `null` is a VALID value (distinct from `undef` absence); `json`/empty
-//     schemas collapse to `any`.
+//   - field with a type:   `"command":/string/` — the `/.../` marker is always
+//     present, on every field, including one whose type is a whole container,
+//     so no bare type name is ever left unmarked.
+//   - optional field:      `"description":/undef|string/` (`undef` = may be
+//     absent; rendered inside the marker, in front of the type)
+//   - const field:         `"kind":/"new"/` — a const literal keeps its double
+//     quotes and takes no `undef|` prefix (a fixed value, not an optional
+//     slot), even when the field is not listed as required.
+//   - enum:                `"action":/"edit"|"pause|resume"/` — literal values
+//     are double-quoted, so a value can never collide with the `/` marker.
+//   - nested object:       `"questions":/{"id":/string/,"header":/undef|string/}/`
+//     — containers stay structural inside the marker, and their fields carry
+//     their own markers.
+//   - array:               `"options":/undef|[{"label":/string/}]/` — the item
+//     expression is not itself marked: brackets already mark the position.
+//   - oneOf union:         `"mode":/"new"|string/` (literal beside a type),
+//     `"branch":/undef|{"kind":/"a"/}|{"kind":/"b"/}/` (discriminated),
+//     `"cursor":/string|null/` (nullable).
+//   - `null` is a VALID value (distinct from `undef` absence) and is never
+//     folded into `undef`; requiredness is carried by the `undef|` prefix
+//     alone. `json`/empty schemas collapse to `any`.
+//   - a type ARRAY (`type: ["string","null"]`) is legal JSON Schema but can
+//     only reach this plugin through a raw `register()`: an MCP server's
+//     `inputSchema` is registered unchanged (`@deepseek-ai/dsh-mcp-client`
+//     passes it through), while the harness subset rejects `type` arrays for
+//     authored tools (`@deepseek-ai/dsh-tools`: "type must be a single type
+//     string"). Such a node renders as the union of its names, with an `array`
+//     branch expanded through `items`: `["string","array"]` + `items:string`
+//     becomes `string|[string]`.
+//
+// CONTENT FORM: the content block carries the parameters as MINIFIED JSON
+// SCHEMA (`JSON.stringify`), not a hand-written annotated rendering. JSON is
+// the format every model already reads, and a serializer cannot lose or
+// misreport a node the way a custom renderer can — the `type: [...]` collapse
+// above is exactly that class of bug. The explicit `Arguments (JSON Schema):`
+// label names the dialect, so the line is not mistaken for prose. The catalog
+// line stays compact because it is the only part always in context; the
+// content block is read on demand, when the model opens the skill.
 //
 // CRITICAL: skill ids MUST be valid per the grammar `^[a-z0-9]+(?:-[a-z0-9]+)*$`.
 // Registering with `name: tool.name` (e.g. `todo_write`, `exit_plan_mode`,
@@ -77,75 +104,54 @@ function initials(nameStr) {
   return words.map((w) => w[0].toLowerCase()).join("");
 }
 
-// Compact type string for one compiled JSON-Schema node.
-function typeStr(node) {
+// Type expression for one schema node: atoms joined by `|`, containers kept
+// structural, literals double-quoted. Carries no `/.../` marker and no `undef|`
+// prefix — those belong to the field rendering in `fieldBody`.
+function typeExpr(node) {
   if (node === undefined || node === null) return "any";
   if (node.const !== undefined) return `"${String(node.const)}"`;
   if (node.enum !== undefined) return node.enum.map((v) => `"${String(v)}"`).join("|");
-  if (Array.isArray(node.oneOf)) return node.oneOf.map(typeStr).join("|");
-  if (node.type === "object" && node.properties) return objStr(node);
-  if (node.type === "array" && node.items) return `[${typeStr(node.items)}]`;
+  if (Array.isArray(node.oneOf)) return node.oneOf.map(typeExpr).join("|");
+  if (node.type === "object" && node.properties) return compactFields(node);
+  if (node.type === "array" && node.items) return `[${typeExpr(node.items)}]`;
+  if (Array.isArray(node.type)) {
+    return node.type
+      .map((t) => (t === "array" && node.items !== undefined ? `[${typeExpr(node.items)}]` : String(t)))
+      .join("|");
+  }
   if (typeof node.type === "string") return node.type;
-  if (node.items !== undefined) return `[${typeStr(node.items)}]`;
+  if (node.items !== undefined) return `[${typeExpr(node.items)}]`;
   return "any";
 }
 
-// Compact object literal for a compiled `{type:"object",properties,required}`.
-function objStr(node) {
+// One field's marked body: optional fields get `undef|` in front of the type,
+// const fields never do (a const is a fixed value).
+function fieldBody(node, isRequired) {
+  const t = typeExpr(node);
+  if (node !== null && typeof node === "object" && node.const !== undefined) return t;
+  return isRequired ? t : `undef|${t}`;
+}
+
+// Compact object literal for a compiled `{type:"object",properties,required}`:
+// every field is `"key":/type/`, the marker is never omitted.
+function compactFields(node) {
   const props = node.properties ?? {};
   const required = new Set(Array.isArray(node.required) ? node.required : []);
-  const parts = Object.keys(props).map((key) => {
-    const p = props[key];
-    const t = typeStr(p);
-    // const (literal) fields render as the bare literal — no `undef|` prefix,
-    // even when not marked required (e.g. `kind:"new"` inside a oneOf branch).
-    if (p && p.const !== undefined) return `"${key}":${t}`;
-    return `"${key}":${required.has(key) ? t : `undef|${t}`}`;
-  });
+  const parts = Object.keys(props).map((key) => `"${key}":/${fieldBody(props[key], required.has(key))}/`);
   return `{${parts.join(",")}}`;
 }
 
-// Compact JSON schema line for a tool's parameters; '' when none.
-function schemaJson(parameters) {
+// Compact schema literal for a tool's parameters; '' when there are none.
+function compactSchema(parameters) {
   if (parameters === undefined || parameters === null || typeof parameters !== "object") return "";
-  return objStr(parameters);
+  return compactFields(parameters);
 }
 
-// Full annotated schema for the skill `content`: multi-line, each field with
-// its description as a comment. Nested objects expand recursively. The compact
-// JSON literal stays in the `description`; the content block carries the
-// complete schema. '' when there are no parameters.
-function fullSchema(parameters) {
+// Minified JSON Schema for a tool's parameters, verbatim from the registry;
+// '' when there are none.
+function schemaDump(parameters) {
   if (parameters === undefined || parameters === null || typeof parameters !== "object") return "";
-  const props = parameters.properties ?? {};
-  const required = new Set(Array.isArray(parameters.required) ? parameters.required : []);
-  const lines = [];
-  for (const key of Object.keys(props)) {
-    lines.push(...fieldLines(key, props[key], required.has(key), 0));
-  }
-  return lines.join("\n");
-}
-
-// One field's lines: `key (type, required|optional): description` plus nested
-// children (objects and arrays-of-objects) indented one level deeper.
-function fieldLines(key, node, isRequired, depth) {
-  const pad = "  ".repeat(depth);
-  const req = isRequired ? "required" : "optional";
-  const desc = node && typeof node.description === "string" ? node.description.replaceAll(/\s+/g, " ").trim() : "";
-  const lines = [`${pad}${key} (${typeStr(node)}, ${req})${desc ? `: ${desc}` : ""}`];
-  const child =
-    node && node.type === "object" && node.properties
-      ? node
-      : node && node.type === "array" && node.items && node.items.type === "object" && node.items.properties
-        ? node.items
-        : null;
-  if (child) {
-    const subReq = new Set(Array.isArray(child.required) ? child.required : []);
-    for (const subKey of Object.keys(child.properties)) {
-      lines.push(...fieldLines(subKey, child.properties[subKey], subReq.has(subKey), depth + 1));
-    }
-  }
-  return lines;
+  return JSON.stringify(parameters);
 }
 
 // First sentence of a description; '' when empty.
@@ -159,29 +165,28 @@ function firstSentence(text) {
 
 // Full content block for one tool: `## \`<tool>\` tool` + an explicit "invoke as
 // a tool_call" note + the FULL description + the `tool:<name>` prose guidance
-// section from the assembly (when present) + the FULL annotated schema under an
-// explicit `Arguments:` heading. The catalog `description` keeps only the first
-// sentence; the content block carries the complete description and the full
-// prose guidance.
+// section from the assembly (when present) + the tool's MINIFIED JSON SCHEMA
+// under an explicit `Arguments (JSON Schema):` label. The catalog `description`
+// keeps only the first sentence and the compact literal; the content block
+// carries the complete description, the full prose guidance, and the schema.
 //
-// ARGUMENTS HEADING: the annotated field list would otherwise start right after
-// prose text that may itself mention fields, leaving no marker for where the
-// parameter block begins. The `Arguments:` label is therefore rendered
-// explicitly, on its own line, and omitted only when the tool takes no
+// ARGUMENTS LABEL: without it the schema line would follow prose that may
+// itself mention fields, leaving no marker for where the parameter schema
+// begins, and a bare JSON line would read as one more prose sentence. The label
+// also names the dialect, and it is omitted only when the tool takes no
 // parameters (the catalog `description` still says `Arguments: {}` there).
-// The label matches the wording used in the `description`.
 //
 // DISAMBIGUATION: the bare word "tool" is ambiguous — a model that reads the
 // skill may not know how to invoke it. The explicit note below pins the
 // mechanism: the tool is invoked as a direct `tool_call` with its own name.
-function toolBlock(tool, fullSchemaText, proseText) {
+function toolBlock(tool, schemaText, proseText) {
   const desc = typeof tool.description === "string" ? tool.description.replaceAll(/\s+/g, " ").trim() : "";
   return [
     `## \`${tool.name}\` tool`,
     `Invoke directly as a tool_call named \`${tool.name}\`.`,
     desc,
     proseText,
-    fullSchemaText ? `Arguments:\n${fullSchemaText}` : ""
+    schemaText ? `Arguments (JSON Schema): ${schemaText}` : ""
   ].filter(Boolean).join("\n").trim();
 }
 
@@ -230,8 +235,8 @@ function apply(ctx) {
       const desc = firstSentence(tool.description);
       const lower = desc.length > 0 ? desc[0].toLowerCase() + desc.slice(1) : desc;
       const catalogDesc = `Details for tool_call \`${tool.name}\`: ${lower}`.trim();
-      const description = [catalogDesc, schemaJson(tool.parameters)].filter(Boolean).map((s, i) => i === 1 ? `Arguments: ${s}` : s).join(" ");
-      const content = toolBlock(tool, fullSchema(tool.parameters), proseByTool.get(tool.name));
+      const description = [catalogDesc, compactSchema(tool.parameters)].filter(Boolean).map((s, i) => i === 1 ? `Arguments: ${s}` : s).join(" ");
+      const content = toolBlock(tool, schemaDump(tool.parameters), proseByTool.get(tool.name));
       if (content.length === 0) { index++; continue; }
       const skill = {
         name: skillName,
