@@ -46,6 +46,59 @@
 // when disabled, compaction is skipped entirely on such turn ends so past
 // sessions are never compressed on a request failure.
 //
+// ── mid-turn firing (agents/pre-step) ─────────────────────────────────────────
+// A long agent turn never fires `turn/end`, so `dsh-compaction-basic` (a lossy
+// LLM summarization) could fire first at `agent/pre-step` and destroy the
+// model's working reasoning. This plugin now ALSO listens at `agent/pre-step`
+// (the same event basic uses) and, when the surface crosses a configurable
+// pressure threshold, structurally folds the OLDEST foldable content of the
+// current turn into a one-liner checkpoint — always BEFORE basic runs, because
+// the host-plane listener registers ahead of the preset-plane basic listener
+// (`{ prepend: true }` as belt-and-suspenders) and the fold commits
+// synchronously inside the handler, so basic's own pressure measurement on the
+// same step observes the post-fold surface.
+//
+// The fold at pre-step is deliberately SYNCHRONOUS (no `queueMicrotask`
+// deferral like the `turn/end` path): at pre-step no `session.append` is
+// mid-publish, so direct appends are legal, and deferring to a microtask would
+// let basic's handler measure the PRE-fold surface and double-compact. The
+// `turn/end` path keeps its microtask deferral because `session/event` fires
+// INSIDE `session.append(...)` where reentrant appends are banned.
+//
+// Trigger (both conditions, Q26):
+//   microThreshold = floor(min(W*thresholdRatio, W − maxTokens − headroomTokens)) − chunkTokens
+//   W/maxTokens come from the harness (llm.resolveModelInfo + the durable
+//   request header), with the SAME thresholdRatio/headroomTokens knob names and
+//   defaults as dsh-compaction-basic, so both compactors configure alike and
+//   micro always fires exactly one `chunkTokens` budget earlier.
+//   skip-guard: `foldableChunks >= 1` (derived from lockedChunks; the foldable
+//   content must be older than the locked window). The locked window (the last
+//   `lockedChunks` chunk-objects, `1 < locked <= 2` chunks by default) is never
+//   folded, so the model's live tail stays intact mid-turn.
+//
+// Chunk window: foldable content of the current turn (assistant/message and
+// tool/result nodes after the nearest checkpoint) is priced with the vendored
+// heuristic and sliced into `chunkTokens` chunks from the oldest node. The last
+// `lockedChunks` chunk-objects form the locked window; everything older is
+// foldable. The fold boundary is aligned to complete call → result pairs (a
+// dangling call at the boundary is backed off one node and waits for its result).
+//
+// Checkpoint lifecycle (3.8): every replacement is a `micro-checkpoint` — its
+// message carries `source.micro` metadata (phase, turn, seq span, tokens,
+// folded counts). At the next normal `turn/end` the whole turn's checkpoint
+// block plus its remaining live content is consolidated into ONE per-turn
+// summary node (a compact map: "turn N: K calls/results folded, seq A..B,
+// ~T tokens") plus the turn's final assistant text (kept verbatim for
+// conversational continuity). This caps checkpoint overhead at O(turns) instead
+// of O(fires): a 15-fold turn ends as one ~tens-of-tokens node, not ~30K of
+// one-liners (e2c13124 lesson: 47-58 folds → 101K tokens → basic fires).
+//
+// Frame policy (3.9): old copies of injected frames (skill-catalog,
+// agent-instructions, goal, runtime-context) are DELETED from the surface,
+// keeping only the LATEST version per frame type; real user messages and
+// non-dedupe live messages (agent-message relays, tool-jobs, session-reference,
+// subagent-settled) always stay. The durable log is unchanged — recall works.
+//
 // The compiler is vendored (trimmed) from the upstream compaction compiler
 // because preset-local plugin files are loaded dependency-free. Bump the `?v=`
 // in the referencing row of agent.cordis.yml after editing this file.
@@ -86,7 +139,7 @@
 // `pendingWork()` list's last span is the current turn's session. For `blocked`
 // (no new session started) the last session is the blocked turn's session and
 // is kept. Normal turns still fold all sessions; attachment folding is
-// unchanged.
+// unchanged. The per-turn consolidation (3.8) runs only on the NORMAL path.
 //
 // This `keepLastSession` path is gated behind the `compactOnAbnormal`
 // config flag (default `false`). When the flag is `false`, an abnormal or
@@ -108,7 +161,11 @@
 // are preserved.
 
 const name = "dsh-compaction-micro";
-const inject = ["sessions", "agents"];
+// `llm`/`tokenMeter` mirror dsh-compaction-basic's inject list: mid-turn
+// pressure needs the harness context window (resolveModelInfo) and the meter's
+// measure() on the session surface. Both are host-plane rows in the base
+// bundle, so the host-plane micro row resolves them the same way basic does.
+const inject = ["sessions", "agents", "llm", "tokenMeter"];
 
 // ── vendored compiler subset ────────────────────────────────────────────────
 
@@ -476,6 +533,43 @@ function foldUserAttachments(message, seq) {
   return blocks;
 }
 
+// ── mid-turn configuration knobs ─────────────────────────────────────────────
+
+const PLUGIN_KIND = "plugin:dsh-compaction-micro";
+
+/** Frame kinds whose old copies are deleted from the surface (3.9). */
+const DEDUPE_FRAME_KINDS = new Set(["skill-catalog", "agent-instructions", "goal", "runtime-context"]);
+
+/** Phases that advance the fold boundary (everything else is decorative). */
+const BOUNDARY_PHASES = new Set(["mid-turn", "session", "turn"]);
+
+/** Positive integer config field (throws on invalid values at install time). */
+function requirePositiveInt(value, fallback, label) {
+  if (value === undefined) return fallback;
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`MicroCompactionConfig: ${label} must be a positive integer, got ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
+/** Non-negative integer config field. */
+function requireNonNegativeInt(value, fallback, label) {
+  if (value === undefined) return fallback;
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`MicroCompactionConfig: ${label} must be a non-negative integer, got ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
+/** Finite numeric ratio config field. */
+function requireRatio(value, fallback, label) {
+  if (value === undefined) return fallback;
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    throw new Error(`MicroCompactionConfig: ${label} must be a positive finite number, got ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
 // ── plugin logic ────────────────────────────────────────────────────────────
 
 /** Deep-freeze helper for the replacement message (mirrors freezeMessage). */
@@ -515,7 +609,9 @@ function apply(ctx, config = {}) {
     console.error(`dsh-compaction-micro ${message}`);
   };
 
-  // Resolve the configurable key-argument fields once per plugin install.
+  // Resolve the configurable fields once per plugin install. The mid-turn knobs
+  // share their names/defaults with dsh-compaction-basic (thresholdRatio,
+  // headroomTokens); chunkTokens/lockedChunks are micro-specific.
   const resolvedConfig = {
     includeReasoning: config.includeReasoning === true,
     toolKeyArgFields: resolveToolKeyArgFields(config),
@@ -524,7 +620,52 @@ function apply(ctx, config = {}) {
     // turn and keeps only the last (problematic) session live. When false
     // (default), compaction is skipped entirely on such turn ends so past
     // sessions are never compressed on a request failure.
-    compactOnAbnormal: config.compactOnAbnormal === true
+    compactOnAbnormal: config.compactOnAbnormal === true,
+    chunkTokens: requirePositiveInt(config.chunkTokens, 16384, "chunkTokens"),
+    lockedChunks: requirePositiveInt(config.lockedChunks, 2, "lockedChunks"),
+    thresholdRatio: requireRatio(config.thresholdRatio, 0.8, "thresholdRatio"),
+    headroomTokens: requireNonNegativeInt(config.headroomTokens, 65536, "headroomTokens")
+  };
+
+  const chunkTokens = resolvedConfig.chunkTokens;
+  const lockedChunks = resolvedConfig.lockedChunks;
+
+  /** The `source.micro` metadata of a plugin replacement, or null. */
+  const checkpointMetaOf = (event) => {
+    if (event === undefined || event === null || event.type !== "user/message") return null;
+    const source = event.data && event.data.source;
+    if (source === null || source === undefined || source.kind !== PLUGIN_KIND) return null;
+    return source.micro ?? null;
+  };
+
+  /** True for the nodes this plugin's own folds produced (any phase). */
+  const isPluginNode = (event) => {
+    if (event === undefined || event === null || event.type !== "user/message") return false;
+    const source = event.data && event.data.source;
+    return source !== null && source !== undefined && source.kind === PLUGIN_KIND;
+  };
+
+  /** True for plugin nodes that advance the fold boundary (not frame-deleted notes / attachment folds). */
+  const isBoundaryNode = (event) => {
+    if (!isPluginNode(event)) return false;
+    const meta = checkpointMetaOf(event);
+    return meta === null || BOUNDARY_PHASES.has(meta.phase);
+  };
+
+  /** True for foldable content nodes of a turn (assistant runs and tool results). */
+  const isFoldableNode = (event) => {
+    return event !== undefined && event !== null && (event.type === "assistant/message" || event.type === "tool/result");
+  };
+
+  /**
+   * Project + price one surface node; non-projecting nodes price 0 (mirrors the
+   * meter's fold). Returns `{ seq, event, message, price }` or null.
+   */
+  const projectNode = (session, seq) => {
+    const event = session.eventAt ? session.eventAt(seq) : undefined;
+    if (event === undefined || event === null) return null;
+    const message = session.deriveEventMessage(event);
+    return { seq, event, message, price: estimateMessage(message) };
   };
 
   /**
@@ -552,6 +693,50 @@ function apply(ctx, config = {}) {
   };
 
   /**
+   * The index of the boundary node: the nearest (from the end) plugin node that
+   * advances the fold boundary. Everything at or before it is already folded.
+   * @param nodes - ordered surface seqs.
+   * @param session - the session.
+   * @returns the node index, or -1 when there is no boundary.
+   */
+  const boundaryIndex = (nodes, session) => {
+    for (let i = nodes.length - 1; i >= 0; i--) {
+      const event = session.eventAt ? session.eventAt(nodes[i]) : undefined;
+      if (isBoundaryNode(event)) return i;
+    }
+    return -1;
+  };
+
+  /** Node-position cost of the last tool result inside a node set. */
+  const resultIndexByCallId = (stream) => {
+    // stream entries: { idx, seq, event, message, price }; message may be null.
+    const map = new Map();
+    for (let i = 0; i < stream.length; i++) {
+      const message = stream[i].message;
+      if (message === null || message === undefined || message.role !== "user" || message.content === undefined) continue;
+      const first = message.content[0];
+      if (first !== undefined && first.type === "tool-result" && typeof first.toolCallId === "string") {
+        map.set(first.toolCallId, i);
+      }
+    }
+    return map;
+  };
+
+  /**
+   * True when the assistant message carries a tool-call whose result is not
+   * inside `stream[0..endIdx]` (its result sits later or is still pending).
+   */
+  const hasDanglingCall = (message, endIdx, resultIndexByCall) => {
+    if (message === null || message === undefined || message.role !== "assistant" || message.content === undefined) return false;
+    for (const block of message.content) {
+      if (block === null || block === undefined || block.type !== "tool-call" || typeof block.id !== "string") continue;
+      const resultIdx = resultIndexByCall.get(block.id);
+      if (resultIdx === undefined || resultIdx > endIdx) return true;
+    }
+    return false;
+  };
+
+  /**
    * The pending compaction work for one session, found in a single forward pass
    * over the live tail (everything after our nearest replacement):
    *
@@ -576,25 +761,16 @@ function apply(ctx, config = {}) {
     const nodes = Array.from(session.surface.nodes);
     if (nodes.length === 0) return { sessions: [], attachmentUsers: [] };
 
-    // Pass 1: find our nearest replacement boundary (index into `nodes`).
-    let boundaryIdx = 0;
-    for (let i = nodes.length - 1; i >= 0; i--) {
-      const seq = nodes[i];
-      const event = session.eventAt ? session.eventAt(seq) : undefined;
-      if (event === undefined || event === null || event.type !== "user/message") continue;
-      const source = event.data && event.data.source;
-      if (source !== null && source !== undefined && source.kind === "plugin:dsh-compaction-micro") {
-        boundaryIdx = i + 1;
-        break;
-      }
-    }
+    // Pass 1: find our nearest boundary (index into `nodes`).
+    const boundaryIdx = boundaryIndex(nodes, session);
 
     // Pass 2: one forward walk from the boundary — split sessions and collect
-    // real user messages with attachments.
+    // real user messages with attachments. Mid-turn/session checkpoints are
+    // user/message nodes and split sessions exactly like real user messages.
     const sessions = [];
     const attachmentCandidates = [];
     let current = [];
-    for (let i = boundaryIdx; i < nodes.length; i++) {
+    for (let i = boundaryIdx + 1; i < nodes.length; i++) {
       const seq = nodes[i];
       const event = session.eventAt ? session.eventAt(seq) : undefined;
       if (event === undefined || event === null) continue;
@@ -635,12 +811,12 @@ function apply(ctx, config = {}) {
   };
 
   /**
-   * True when every assistant message in the given session carries only
+   * True when every assistant message in the given span carries only
    * `reasoning` blocks (no text, no tool calls, no media). Folding such a
-   * session would drop the model's chain of thought and leave nothing useful,
+   * span would drop the model's chain of thought and leave nothing useful,
    * so it is skipped.
    */
-  const sessionOnlyReasoning = (session, span) => {
+  const spanOnlyReasoning = (session, span) => {
     let hasAssistant = false;
     for (const seq of span) {
       const event = session.eventAt ? session.eventAt(seq) : undefined;
@@ -655,6 +831,364 @@ function apply(ctx, config = {}) {
     return hasAssistant;
   };
 
+  /**
+   * Commit ONE replacement over a contiguous surface range with the compaction
+   * lifecycle (start..summary..end, `turn: null`), mirroring the existing
+   * turn/end machinery. The replacement message is a plugin checkpoint
+   * (`source.micro` carries `meta` for the per-turn consolidation, 3.8).
+   * @param session - the session.
+   * @param shadowed - ordered projected nodes `{ seq, event, message, price }`.
+   * @param blocks - replacement content blocks.
+   * @param meta - `source.micro` metadata (phase/turn/span/tokens/tools).
+   * @param label - log label for the per-op breakdown.
+   * @returns the replacement seq, or null when nothing was committed.
+   */
+  const commitReplacement = (session, shadowed, blocks, meta, label) => {
+    if (shadowed.length === 0) return null;
+    const shadowedSeqs = shadowed.map((n) => n.seq);
+    const start = shadowedSeqs[0];
+    const end = shadowedSeqs[shadowedSeqs.length - 1];
+    const shadowedTokenCount = shadowed.reduce((acc, n) => acc + (n.price || 0), 0);
+    if (shadowedTokenCount === 0 && blocks.length === 0) return null;
+
+    const source = meta === undefined || meta === null ? { kind: PLUGIN_KIND } : { kind: PLUGIN_KIND, micro: deepFreeze({ ...meta }) };
+    const replacementMessage = deepFreeze({
+      id: newMessageId(),
+      role: "user",
+      content: deepFreeze(blocks),
+      source
+    });
+
+    const compactionId = newMessageId();
+    const lifecycle = { compactionId, turn: null };
+    const startEvent = session.append("compaction/start", lifecycle);
+    const summaryEvent = session.append("compaction/summary", {
+      compactionId,
+      shadowedRange: { start, end },
+      shadowedSeqs: [...shadowedSeqs],
+      shadowedTokenCount
+    });
+
+    const replacement = session.append("user/message", replacementMessage, {
+      surfaceOp: { op: "replace", startSeq: start, endSeq: end },
+      sourceEventSeqs: [startEvent.seq, summaryEvent.seq, ...shadowedSeqs]
+    });
+    session.append("compaction/end", lifecycle);
+
+    const netSaved = shadowedTokenCount - estimateMessage(replacementMessage);
+    log("info", `${label}: re-composed ${shadowedSeqs.length} surface nodes (seqs ${start}-${end}) into seq ${replacement.seq}; saved ${netSaved} net tokens (gross ${shadowedTokenCount})`);
+    return replacement.seq;
+  };
+
+  /**
+   * The mid-turn chunk window (3.3): the contiguous foldable run right after
+   * our nearest boundary, sliced into `chunkTokens` chunks from the oldest
+   * node. The last `lockedChunks` chunk-objects are the locked window (never
+   * folded); everything older is foldable.
+   * @param session - the session.
+   * @returns `{ startIdx, endIdx, shadowed, foldableChunks }`, or null when the
+   *   skip-guard fails (no complete foldable chunk older than the lock).
+   */
+  const chunkWindow = (session) => {
+    const nodes = Array.from(session.surface.nodes);
+    if (nodes.length === 0) return null;
+    const boundaryIdx = boundaryIndex(nodes, session);
+
+    // The contiguous foldable run of the current turn: nodes after the
+    // boundary, skipping the non-foldable prefix (system prompt, injected
+    // frames, the user's question — they stay live ABOVE the fold range), then
+    // the run of `assistant/message | tool/result` nodes. A foreign node
+    // INSIDE the run (mid-turn frame relay, user message) ends it — the range
+    // must shadow nothing but foldable nodes. With no boundary yet (fresh
+    // session, first fire) the run is simply the turn's whole foldable span.
+    const stream = [];
+    let streamTokens = 0;
+    let started = false;
+    for (let i = boundaryIdx + 1; i < nodes.length; i++) {
+      const event = session.eventAt ? session.eventAt(nodes[i]) : undefined;
+      if (isFoldableNode(event)) {
+        started = true;
+        const node = projectNode(session, nodes[i]);
+        if (node === null) continue;
+        stream.push(node);
+        streamTokens += node.price;
+        continue;
+      }
+      if (started) break;
+      // leading non-foldable prefix (system prompt, frames, user question):
+      // stays live above the range, skipped.
+    }
+    if (stream.length === 0) return null;
+
+    // Chunk-object model: totalChunks = ceil(streamTokens / chunkTokens); the
+    // last `lockedChunks` chunk-objects are locked. The first foldable full
+    // chunk appears when streamTokens crosses lockedChunks * chunkTokens
+    // (default 32768) — the exact two-full-chunks boundary stays locked
+    // (skip-guard, foldableChunks = 0).
+    const totalChunks = Math.ceil(streamTokens / chunkTokens);
+    const foldableChunks = totalChunks - lockedChunks;
+    if (foldableChunks <= 0) return null;
+    const foldableTokens = foldableChunks * chunkTokens;
+
+    // Nominal range end: include the node that crosses the foldable budget.
+    let endIdx = -1;
+    let acc = 0;
+    for (let j = 0; j < stream.length; j++) {
+      acc += stream[j].price;
+      if (acc >= foldableTokens) {
+        endIdx = j;
+        break;
+      }
+    }
+    if (endIdx === -1) endIdx = stream.length - 1;
+
+    // Pairing back-off (3.5): never cut a tool call from its result. Drop
+    // trailing assistant nodes whose call's result is outside the range.
+    const resultIndexByCall = resultIndexByCallId(stream);
+    while (endIdx >= 0 && hasDanglingCall(stream[endIdx].message, endIdx, resultIndexByCall)) {
+      endIdx--;
+    }
+    if (endIdx < 0) return null;
+
+    const startIdx = stream[0].idx;
+    const shadowed = stream.slice(0, endIdx + 1).map((node) => ({
+      seq: node.seq,
+      event: node.event,
+      message: node.message,
+      price: node.price
+    }));
+    return { startIdx, endIdx, shadowed, foldableChunks, streamTokens };
+  };
+
+  /**
+   * Mid-turn pressure fold at `agent/pre-step` (before basic). Fires when BOTH
+   * conditions hold (Q26): the meter's total is at or above microThreshold
+   * (the GOVERNING trigger, one `chunkTokens` below basic's threshold when both
+   * use the same thresholdRatio/headroomTokens), and there is at least one
+   * complete foldable chunk older than the locked window (skip-guard). The fold
+   * is one batched replacement over ALL foldable chunks (3.7).
+   */
+  const runMidTurn = async (agent, turn, signal) => {
+    try {
+      const session = agent.session;
+      if (session === undefined || session.surface === undefined || typeof session.eventAt !== "function") return;
+
+      const meter = ctx.tokenMeter;
+      const llm = ctx.llm;
+      if (meter === undefined || llm === undefined) {
+        // Harness services unavailable: mid-turn firing stays off, the turn/end
+        // path keeps working (it needs no W/maxTokens).
+        log("warn", "mid-turn firing disabled: harness tokenMeter/llm services not available");
+        return;
+      }
+
+      // W (context window) and maxTokens come from the harness, mirroring
+      // basic's pressure math (resolveModelInfo + durable request header).
+      const header = typeof session.requestHeader === "function" ? session.requestHeader() : undefined;
+      const headerConfig = header && header.config;
+      if (!headerConfig || typeof headerConfig.provider !== "string" || headerConfig.provider.length === 0 || typeof headerConfig.model !== "string" || headerConfig.model.length === 0) return;
+      const info = await llm.resolveModelInfo(headerConfig.provider, headerConfig.model, signal);
+      if (signal !== undefined && signal.aborted) return;
+      const windowTokens = info && info.context ? info.context.contextWindow : undefined;
+      if (!Number.isInteger(windowTokens) || windowTokens <= 0) {
+        log("info", `no context window for ${headerConfig.provider}/${headerConfig.model}; skipping mid-turn`);
+        return;
+      }
+      const headerMax = Number.isSafeInteger(headerConfig.maxTokens) && headerConfig.maxTokens > 0 ? headerConfig.maxTokens : 0;
+      const defaultMax = Number.isSafeInteger(info.defaultMaxTokens) && info.defaultMaxTokens > 0 ? info.defaultMaxTokens : 0;
+      const maxTokens = headerMax || defaultMax;
+      const pressure = windowTokens - maxTokens - resolvedConfig.headroomTokens;
+      if (pressure <= 0) return;
+      const microThreshold = Math.floor(Math.min(windowTokens * resolvedConfig.thresholdRatio, pressure)) - chunkTokens;
+
+      const measurement = meter.measure(session);
+      const totalTokens = measurement.totalTokens;
+      if (totalTokens < microThreshold) return;
+
+      const win = chunkWindow(session);
+      if (win === null) return;
+
+      const nodes = win.shadowed.map((n) => ({ seq: n.seq, message: n.message }));
+      const { entries, stats } = compileNodes(nodes, resolvedConfig);
+      if (entries.length === 0) return;
+      const blocks = frameCompiled(entries);
+
+      const meta = {
+        phase: "mid-turn",
+        turn,
+        span: [win.shadowed[0].seq, win.shadowed[win.shadowed.length - 1].seq],
+        tokens: win.shadowed.reduce((acc, n) => acc + (n.price || 0), 0),
+        tools: stats.tools
+      };
+      commitReplacement(session, win.shadowed, blocks, meta, `micro (mid-turn, pre-step, turn ${turn})`);
+      deleteStaleFrames(session);
+      log("info", `micro threshold state: total ${totalTokens} >= ${microThreshold} (${(100 * totalTokens / windowTokens).toFixed(1)}% of ${windowTokens}), foldable chunks ${win.foldableChunks}`);
+    } catch (error) {
+      log("warn", `mid-turn fold failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  /**
+   * Per-turn consolidation (3.8): at a normal turn/end, fold the whole turn's
+   * checkpoint block plus its remaining live content into ONE per-turn summary
+   * node, capping checkpoint overhead at O(turns). Runs only when the turn's
+   * foldable span is contiguous from the last per-turn summary (no user
+   * message / frame in between); otherwise the caller falls back to per-session
+   * folds.
+   * @returns true when the consolidation committed.
+   */
+  const consolidateTurn = (session, turn) => {
+    const nodes = Array.from(session.surface.nodes);
+    if (nodes.length === 0) return false;
+
+    // The consolidation boundary is the LAST per-turn summary node; the whole
+    // live tail after it (this turn's mid-turn checkpoints + live content) is
+    // folded into the next summary. When no summary exists yet, the boundary is
+    // the nearest boundary node (fresh sessions fold everything since it).
+    let boundaryIdx = -1;
+    for (let i = nodes.length - 1; i >= 0; i--) {
+      const event = session.eventAt ? session.eventAt(nodes[i]) : undefined;
+      if (!isPluginNode(event)) continue;
+      const meta = checkpointMetaOf(event);
+      if (meta !== null && meta.phase === "turn") {
+        boundaryIdx = i;
+        break;
+      }
+      if (meta === null) {
+        // Legacy checkpoint (pre-metadata): treat as a per-session boundary.
+        boundaryIdx = i;
+        break;
+      }
+    }
+
+    // The contiguous run of fold content after the boundary: foldable nodes and
+// checkpoints of foldable phases (mid-turn / session / turn). Decorative
+// plugin notes (frame-deleted, attachment folds) are skipped as prefix — they
+// stay live and must not start the run, or a user question below them would
+// break the run forever. A foreign node INSIDE the run (mid-turn frame relay,
+// user message) ends it, and the consolidation is skipped in that rare
+// interleaved layout.
+    const run = [];
+    let started = false;
+    for (let i = boundaryIdx + 1; i < nodes.length; i++) {
+      const event = session.eventAt ? session.eventAt(nodes[i]) : undefined;
+      if (isFoldableNode(event) || isBoundaryNode(event)) {
+        started = true;
+        const node = projectNode(session, nodes[i]);
+        if (node !== null) run.push(node);
+        continue;
+      }
+      if (started) break;
+      // leading non-foldable prefix (system prompt, frames, user question,
+      // decorative plugin notes): stays live below the replaced range.
+    }
+    if (run.length === 0) return false;
+    if (!run.some((n) => isFoldableNode(n.event))) return false;
+
+    // Aggregate per turn: calls/results count, seq range, gross tokens.
+    // Live nodes attribute to the current turn; checkpoints carry their own
+    // turn in `source.micro`.
+    const byTurn = new Map();
+    const nodeOf = (n) => {
+      const meta = checkpointMetaOf(n.event);
+      const turnOf = meta !== null && Number.isSafeInteger(meta.turn) ? meta.turn : Number.isSafeInteger(turn) ? turn : 0;
+      let entry = byTurn.get(turnOf);
+      if (entry === undefined) {
+        entry = { tools: 0, tokens: 0, minSeq: n.seq, maxSeq: n.seq };
+        byTurn.set(turnOf, entry);
+      }
+      entry.tokens += meta !== null && Number.isSafeInteger(meta.tokens) ? meta.tokens : (n.price || 0);
+      entry.tools += meta !== null && Number.isSafeInteger(meta.tools) ? meta.tools : toolCallCount(n.message);
+      entry.minSeq = Math.min(entry.minSeq, n.seq);
+      entry.maxSeq = Math.max(entry.maxSeq, n.seq);
+    };
+    for (const n of run) nodeOf(n);
+
+    const lines = [...byTurn.entries()].sort((a, b) => a[0] - b[0]).map(([t, e]) => {
+      return `turn ${t}: ${e.tools} calls/results folded, seq ${e.minSeq}..${e.maxSeq}, ~${e.tokens} tokens`;
+    });
+    // Keep the LAST assistant text of the folded span verbatim so the following
+    // turn's model still sees the previous answer (conversational continuity).
+    let lastText = null;
+    for (let i = run.length - 1; i >= 0; i--) {
+      const message = run[i].message;
+      if (message !== null && message !== undefined && message.role === "assistant" && message.content !== undefined) {
+        const texts = message.content.filter((b) => b !== null && b.type === "text" && b.text.trim().length > 0);
+        if (texts.length > 0) {
+          lastText = texts.map((b) => b.text).join("\n").trim();
+          break;
+        }
+      }
+    }
+    const entries = lines.map((line, i) => ({ seq: run[0].seq, text: line, kind: "text" }));
+    if (lastText !== null && lastText.length > 0 && entries.length > 0) {
+      entries.push({ seq: run[run.length - 1].seq, text: `${lastText} (${seqRef(run[run.length - 1].seq)})`, kind: "text" });
+    }
+    const blocks = frameCompiled(entries);
+    if (blocks.length === 0 || blocks[0].text.length === 0) return false;
+
+    const meta = {
+      phase: "turn",
+      turn: Number.isSafeInteger(turn) ? turn : 0,
+      span: [run[0].seq, run[run.length - 1].seq],
+      tokens: byTurn.size > 0 ? [...byTurn.values()].reduce((acc, e) => acc + e.tokens, 0) : run.reduce((acc, n) => acc + (n.price || 0), 0),
+      tools: byTurn.size > 0 ? [...byTurn.values()].reduce((acc, e) => acc + e.tools, 0) : 0
+    };
+    commitReplacement(session, run, blocks, meta, "micro (turn/end consolidation)");
+    return true;
+  };
+
+  /** Number of tool-call blocks in one message (results count implicitly). */
+  const toolCallCount = (message) => {
+    if (message === null || message === undefined || message.content === undefined) return 0;
+    return message.content.reduce((acc, b) => acc + (b !== null && b.type === "tool-call" ? 1 : 0), 0);
+  };
+
+  /**
+   * Frame policy (3.9): delete old copies of the dedupe-able injected frames
+   * (skill-catalog, agent-instructions, goal, runtime-context), keeping only
+   * the LATEST version per frame type. Real user messages and non-dedupe live
+   * messages (agent-message relays, tool-jobs, session-reference,
+   * subagent-settled) always stay. The durable log keeps the originals
+   * (recall works).
+   */
+  const deleteStaleFrames = (session) => {
+    try {
+      const nodes = Array.from(session.surface.nodes);
+      // group by frame kind, in surface order
+      const byKind = new Map();
+      for (let i = 0; i < nodes.length; i++) {
+        const event = session.eventAt ? session.eventAt(nodes[i]) : undefined;
+        if (event === undefined || event === null || event.type !== "user/message") continue;
+        const source = event.data && event.data.source;
+        if (source === null || source === undefined || !DEDUPE_FRAME_KINDS.has(source.kind)) continue;
+        // never touch the latest copy per kind
+        let list = byKind.get(source.kind);
+        if (list === undefined) {
+          list = [];
+          byKind.set(source.kind, list);
+        }
+        list.push({ idx: i, seq: nodes[i], event });
+      }
+      for (const [kind, list] of byKind) {
+        if (list.length < 2) continue;
+        const latest = list[list.length - 1];
+        for (const stale of list.slice(0, -1)) {
+          const message = session.deriveEventMessage(stale.event);
+          const node = { seq: stale.seq, event: stale.event, message, price: estimateMessage(message) };
+          const blocks = [{ type: "text", text: `[compaction: older ${kind} frame (${seqRef(stale.seq)}) removed; latest kept (${seqRef(latest.seq)})]` }];
+          const meta = { phase: "frame-deleted", kind, span: [stale.seq, stale.seq] };
+          const replacementSeq = commitReplacement(session, [node], blocks, meta, `micro (frame policy, ${kind})`);
+          if (replacementSeq !== null) {
+            log("info", `deleted stale ${kind} frame seq ${stale.seq} (latest seq ${latest.seq}) -> seq ${replacementSeq}`);
+          }
+        }
+      }
+    } catch (error) {
+      log("warn", `frame deletion failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
   const runCompaction = (agent, opts = {}) => {
     try {
       const session = agent.session;
@@ -666,87 +1200,60 @@ function apply(ctx, config = {}) {
       const { sessions, attachmentUsers } = pendingWork(session);
       if (sessions.length === 0 && attachmentUsers.length === 0) return;
 
-      // When `keepLastSession` is set (abnormal / reasoning-only turn end), fold
-      // everything up to the previous turn and leave the last session live so
-      // the interrupted reply / chain of thought survives for a "Continue".
-      const foldSessions = opts.keepLastSession ? sessions.slice(0, -1) : sessions;
-      if (opts.keepLastSession && sessions.length > 0) {
-        const kept = sessions[sessions.length - 1];
-        log("info", `keepLastSession: keeping session (seqs ${kept[0]}-${kept[kept.length - 1]}) live; folding ${foldSessions.length} prior session(s)`);
+      // Normal turn end: try the per-turn consolidation (3.8) first. It only
+      // runs when the turn's foldable span is contiguous from the last per-turn
+      // summary; otherwise (or when keepLastSession is set) fall back to the
+      // per-session folds below.
+      let replaced = 0;
+      if (!opts.keepLastSession) {
+        if (consolidateTurn(session, opts.turn)) replaced = 1;
       }
 
-      let replaced = 0;
-      for (const span of foldSessions) {
-        if (sessionOnlyReasoning(session, span)) {
-          log("info", `session (seqs ${span[0]}-${span[span.length - 1]}) is reasoning-only; no compaction`);
-          continue;
+      if (replaced === 0) {
+        // When `keepLastSession` is set (abnormal / reasoning-only turn end), fold
+        // everything up to the previous turn and leave the last session live so
+        // the interrupted reply / chain of thought survives for a "Continue".
+        const foldSessions = opts.keepLastSession ? sessions.slice(0, -1) : sessions;
+        if (opts.keepLastSession && sessions.length > 0) {
+          const kept = sessions[sessions.length - 1];
+          log("info", `keepLastSession: keeping session (seqs ${kept[0]}-${kept[kept.length - 1]}) live; folding ${foldSessions.length} prior session(s)`);
         }
 
-        // project each surface node to a message; skip non-projecting nodes.
-        const nodes = [];
-        const shadowedSeqs = [];
-        let shadowedTokenCount = 0;
-        for (const seq of span) {
-          const event = session.eventAt ? session.eventAt(seq) : undefined;
-          if (event === undefined || event === null) continue;
-          shadowedSeqs.push(seq);
-          const message = session.deriveEventMessage(event);
-          // Price the span with the same heuristic the token-meter fold used when
-          // it appended each node, so the summary's subtraction exactly reverses
-          // the meter's accumulated total (null projections priced 0, as in the fold).
-          shadowedTokenCount += estimateMessage(message);
-          if (message !== null && message !== undefined) {
-            nodes.push({ seq, message });
+        for (const span of foldSessions) {
+          if (spanOnlyReasoning(session, span)) {
+            log("info", `session (seqs ${span[0]}-${span[span.length - 1]}) is reasoning-only; no compaction`);
+            continue;
+          }
+
+          // project each surface node to a message; skip non-projecting nodes.
+          const shadowed = [];
+          for (const seq of span) {
+            const node = projectNode(session, seq);
+            if (node !== null) shadowed.push(node);
+          }
+          if (shadowed.length === 0) continue;
+
+          const nodes = shadowed.map((n) => ({ seq: n.seq, message: n.message }));
+          const { entries, stats } = compileNodes(nodes, resolvedConfig);
+          if (entries.length === 0) continue;
+          const blocks = frameCompiled(entries);
+
+          const start = shadowed[0].seq;
+          const end = shadowed[shadowed.length - 1].seq;
+          const turnOfSpan = Number.isSafeInteger(opts.turn) ? opts.turn : (shadowed[0].event.data && shadowed[0].event.data.turn);
+          const meta = {
+            phase: opts.keepLastSession ? "session" : "session",
+            turn: Number.isSafeInteger(turnOfSpan) ? turnOfSpan : 0,
+            span: [start, end],
+            tokens: shadowed.reduce((acc, n) => acc + (n.price || 0), 0),
+            tools: stats.tools
+          };
+          const replacementSeq = commitReplacement(session, shadowed, blocks, meta, `micro (turn/end, session seqs ${start}-${end})`);
+          if (replacementSeq !== null) {
+            replaced++;
+            log("info", `re-composed ${shadowed.length} surface nodes (seqs ${start}-${end}) into seq ${replacementSeq}; tool calls: ${stats.tools}, reasoning blocks: ${stats.reasoningRemoved}, text lines: ${stats.text}, media links: ${stats.media}`);
           }
         }
-
-        if (nodes.length === 0 || shadowedSeqs.length === 0) continue;
-
-        const { entries, stats } = compileNodes(nodes, resolvedConfig);
-        if (entries.length === 0) continue;
-        const blocks = frameCompiled(entries);
-
-        const start = shadowedSeqs[0];
-        const end = shadowedSeqs[shadowedSeqs.length - 1];
-
-        // commit the model-free replacement (no token metering: no budgets).
-        const replacementMessage = deepFreeze({
-          id: newMessageId(),
-          role: "user",
-          content: deepFreeze(blocks),
-          source: { kind: "plugin:dsh-compaction-micro" }
-        });
-
-        // Arm the token-meter's shadow-price claim: the `compaction/summary`
-        // event immediately before the replace states the heuristic price of the
-        // exact replaced range, so the meter's surface fold subtracts it and the
-        // UI's Messages figure shrinks with this compaction. The replace is
-        // bracketed by a v4 compaction lifecycle (`compaction/start` ...
-        // `compaction/end`, `turn: null` because it runs after `turn/end`) so
-        // the strict read validation accepts the summary.
-        const compactionId = newMessageId();
-        const lifecycle = { compactionId, turn: null };
-        const startEvent = session.append("compaction/start", lifecycle);
-        const summaryEvent = session.append("compaction/summary", {
-          compactionId,
-          shadowedRange: { start, end },
-          shadowedSeqs: [...shadowedSeqs],
-          shadowedTokenCount
-        });
-
-        const replacement = session.append("user/message", replacementMessage, {
-          surfaceOp: { op: "replace", startSeq: start, endSeq: end },
-          sourceEventSeqs: [startEvent.seq, summaryEvent.seq, ...shadowedSeqs]
-        });
-        session.append("compaction/end", lifecycle);
-
-        // Net freed tokens: the gross shadowed span minus the price of the
-        // replacement text we re-installed (mirrors the token-meter's fold,
-        // which subtracts the replacement). The `compaction/summary` above stays
-        // gross — the meter subtracts the replacement itself.
-        const netSaved = shadowedTokenCount - estimateMessage(replacementMessage);
-        log("info", `re-composed ${shadowedSeqs.length} surface nodes (seqs ${start}-${end}) into seq ${replacement.seq}; saved ${netSaved} tokens (tool calls: ${stats.tools}, reasoning blocks: ${stats.reasoningRemoved}, text lines: ${stats.text}, media links: ${stats.media})`);
-        replaced++;
       }
 
       // Fold attachments in every real user message the agent has already passed
@@ -759,15 +1266,13 @@ function apply(ctx, config = {}) {
         const attachments = userMessageAttachments(message);
         if (attachments.length === 0) continue;
 
+        const node = { seq: attachmentUser, event, message, price: estimateMessage(message) };
         const blocks = deepFreeze(foldUserAttachments(message, attachmentUser));
-        const shadowedSeqs = [attachmentUser];
-        const shadowedTokenCount = estimateMessage(message);
-
         const replacementMessage = deepFreeze({
           id: newMessageId(),
           role: "user",
           content: blocks,
-          source: { kind: "plugin:dsh-compaction-micro" }
+          source: { kind: PLUGIN_KIND }
         });
 
         const compactionId = newMessageId();
@@ -776,22 +1281,23 @@ function apply(ctx, config = {}) {
         const summaryEvent = session.append("compaction/summary", {
           compactionId,
           shadowedRange: { start: attachmentUser, end: attachmentUser },
-          shadowedSeqs: [...shadowedSeqs],
-          shadowedTokenCount
+          shadowedSeqs: [attachmentUser],
+          shadowedTokenCount: node.price
         });
 
         const replacement = session.append("user/message", replacementMessage, {
           surfaceOp: { op: "replace", startSeq: attachmentUser, endSeq: attachmentUser },
-          sourceEventSeqs: [startEvent.seq, summaryEvent.seq, ...shadowedSeqs]
+          sourceEventSeqs: [startEvent.seq, summaryEvent.seq, attachmentUser]
         });
         session.append("compaction/end", lifecycle);
 
-        const netSaved = shadowedTokenCount - estimateMessage(replacementMessage);
+        const netSaved = node.price - estimateMessage(replacementMessage);
         log("info", `folded ${attachments.length} attachment(s) in user message seq ${attachmentUser} into seq ${replacement.seq}; saved ${netSaved} tokens`);
         replaced++;
       }
 
-      if (replaced === 0) return;
+      // Frame policy: delete stale injected frame copies if any.
+      deleteStaleFrames(session);
 
       // The replacements are persisted by the engine's own write-behind
       // (SessionWriteBehind drains the buffer on its 200ms deadline and on
@@ -805,6 +1311,23 @@ function apply(ctx, config = {}) {
       log("warn", `compaction failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   };
+
+  // ── mid-turn trigger: agent/pre-step, BEFORE basic ─────────────────────────
+  // The host-plane listener registers before the preset-plane basic listener,
+  // and `{ prepend: true }` pins the order as belt-and-suspenders (3.1). The
+  // fold commits synchronously inside this handler (no microtask — none of
+  // `session.append` is open at pre-step, and deferring would let basic's
+  // pressure measurement see the PRE-fold surface and double-compact). The
+  // waterfall waits for this listener before calling the next one, so basic
+  // always measures the post-fold surface on the same step.
+  ctx.on("agent/pre-step", async ({ agent, turn, step, signal }, next) => {
+    try {
+      await runMidTurn(agent, turn, signal);
+    } catch (error) {
+      log("warn", `mid-turn pre-step handler failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return next();
+  }, { prepend: true });
 
   // ── trigger: compact once per completed request ───────────────────────────
   // Anchor on `turn/end` (a `session/event`), which the agent loop appends in
@@ -845,12 +1368,12 @@ function apply(ctx, config = {}) {
           if (abnormal || reasoningOnly) {
             if (resolvedConfig.compactOnAbnormal) {
               log("info", `turn ${turn} ended ${abnormal ? `with ${kind}` : "reasoning-only"}: folding up to previous turn, keeping last session`);
-              runCompaction(agent, { keepLastSession: true });
+              runCompaction(agent, { keepLastSession: true, turn });
             } else {
               log("info", `turn ${turn} ended ${abnormal ? `with ${kind}` : "reasoning-only"}: compactOnAbnormal disabled, skipping compaction`);
             }
           } else {
-            runCompaction(agent);
+            runCompaction(agent, { turn });
           }
         } catch {
           /* never break the driver */
