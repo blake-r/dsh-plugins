@@ -125,11 +125,13 @@ window.__ModuleLoader__.load({
 		// running — an abandoned turn) or whose last `turn/end` reason is `error` or
 		// `max-tokens`. Green reports a last `turn/end` reason of `completed`. Both
 		// require the session to be idle, exclude the currently-selected session, and
-		// clear once the session has been viewed (`acknowledged`, in-memory: added
-		// when the user leaves a session, deleted when it runs again, reset on page
-		// reload). `aborted` / `interrupted` turns are neither red nor green (silver).
-		// Because the state is journal-derived, a page reload recomputes it honestly
-		// from the journals (no localStorage).
+		// clear once the session has been viewed (host-persisted "last seen" marker,
+		// written when the user leaves a session; unread iff the row's `updatedAt` is
+		// newer than the marker, missing marker = read). `aborted` / `interrupted`
+		// turns are neither red nor green (silver). Because the state is
+		// journal-derived, a page reload recomputes it honestly from the journals; the
+		// "last seen" position survives reloads in the host storage unit
+		// `recent_sessions_ack` (served via the `recentSessions` remote).
 		//
 		// The journal reads are cached per session keyed by the list row's
 		// `updatedAt` plus the running-state transition (a run that just ended needs a
@@ -171,11 +173,98 @@ window.__ModuleLoader__.load({
 		// map and one subscription.
 		const sessionErrors = new Map();
 		
-		// In-memory set of sessions whose final state the user has already seen: added
-		// when the user leaves a session (it was the current one, its content was on
-		// screen), deleted when the session runs again, reset on page reload. Mirrors
-		// dsh's own `completionUnread` lifetime, applied to both red and green.
-		const acknowledged = new Set();
+		// Host-persisted "last seen" markers, served through the custom
+		// `recentSessions` remote namespace (host unit `recent_sessions_ack`, table
+		// `acks`, key `<sessionId>` -> { lastSeenAt }). Hydrated once from `getAck()`
+		// at startup; the marker gate in `sessionFlag` consumes the map. `ackMode`
+		// starts "pending" (nothing flagged until the first attempt settles), turns
+		// "ok" after a successful hydrate, "down" after any mount or call failure (map
+		// stays empty, switcher falls back to the in-memory registers, no console
+		// noise). A custom namespace exists only after `$mount` registers it, so it can
+		// never appear in the static `inject` list: `apply` mounts first and then
+		// resolves `remote.recentSessions` through a second injection scope, capturing
+		// the namespace object (`ackNamespace`) for the durable upserts.
+		const lastSeenAt = new Map();
+		let ackMode = "pending";
+		let ackHydrated = false;
+		let ackDispose = undefined;
+		// The resolved `recentSessions` namespace (see the mount effect in `apply`).
+		// `undefined` until the mount settles; `markSeen` no-ops while it is missing.
+		let ackNamespace = undefined;
+		
+		// The custom Remote contribution for the host ack service (namespace
+		// `recentSessions`): `getAck()` returns every marker as
+		// `{ [sessionId]: lastSeenAt }` (session ids are globally unique, so one flat
+		// table covers all workspaces), `ack(sessionId, lastSeenAt)` upserts one
+		// marker. Input
+		// parameters carry strict codecs (identity `create` is safe: the client passes
+		// raw values through untouched — see dsh-api-gateway/lib/client.js:1833-1840;
+		// the codec is a validation gate only).
+		const RECENT_SESSIONS_CONTRIBUTION = {
+		  package: "@blake-r/dsh-client-ui-recent-sessions-switcher",
+		  descriptors: [
+		    {
+		      id: "@blake-r/dsh-client-ui-recent-sessions-switcher#recentSessions/getAck",
+		      service: "recentSessions",
+		      namespace: "recentSessions",
+		      method: "getAck",
+		      invocation: { kind: "direct" },
+		      parameters: [],
+		      result: { mode: "src-json" }
+		    },
+		    {
+		      id: "@blake-r/dsh-client-ui-recent-sessions-switcher#recentSessions/ack",
+		      service: "recentSessions",
+		      namespace: "recentSessions",
+		      method: "ack",
+		      invocation: { kind: "direct" },
+		      parameters: [
+		        { name: "sessionId", wire: "sessionId", source: "json", codec: { mode: "strict", typeSymbol: "@blake-r/dsh-client-ui-recent-sessions-switcher#SessionId", create: (value) => value } },
+		        { name: "lastSeenAt", wire: "lastSeenAt", source: "json", codec: { mode: "strict", typeSymbol: "@blake-r/dsh-client-ui-recent-sessions-switcher#LastSeenAt", create: (value) => value } }
+		      ],
+		      result: { mode: "src-json" }
+		    }
+		  ]
+		};
+		
+		const hydrateAcks = async (namespace) => {
+		  if (ackHydrated) return;
+		  if (namespace === undefined) return;
+		  try {
+		    const result = await namespace.getAck();
+		    if (!(result && result.ok === true && result.value !== null && typeof result.value === "object")) throw new Error("invalid ack payload");
+		    lastSeenAt.clear();
+		    for (const [sessionId, seenAt] of Object.entries(result.value)) {
+		      if (typeof sessionId === "string" && sessionId.length > 0 && typeof seenAt === "number" && Number.isFinite(seenAt)) lastSeenAt.set(sessionId, seenAt);
+		    }
+		    ackMode = "ok";
+		  } catch {
+		    ackMode = "down";
+		  } finally {
+		    ackHydrated = true;
+		  }
+		};
+		
+		// Issue a durable "last seen" upsert for one session: update the local map
+		// optimistically (the badge re-derives via notifyTail) and fire the remote
+		// ack; RPC failures are swallowed — the next successful ack still persists.
+		const markSeen = (sessionId, seenAt) => {
+		  lastSeenAt.set(sessionId, seenAt);
+		  notifyTail();
+		  if (ackMode !== "ok" || ackNamespace === undefined) return;
+		  ackNamespace.ack(sessionId, seenAt).catch(() => {});
+		};
+		
+		// Durable unread gate used by both red and green markers (and, through them,
+		// the badge counters): a session is unread iff its row has durable activity
+		// (`updatedAt`, maintained by the session manager) newer than the persisted
+		// marker; a missing marker — or a not-yet-hydrated map — means read, so the
+		// first run after install flags nothing.
+		const isUnread = (session) => {
+		  if (session === undefined || !ackHydrated || ackMode !== "ok") return false;
+		  const seenAt = lastSeenAt.get(session.id);
+		  return seenAt !== undefined && (session.updatedAt ?? 0) > seenAt;
+		};
 		
 		// The last session id any registration rendered for. Module-level because the
 		// session-scoped header slot remounts its children on every session switch, so
@@ -335,9 +424,9 @@ window.__ModuleLoader__.load({
 		  const tail = tailCache.get(s.id)?.state;
 		  const contentRed = tail !== undefined && (tail.openTurn || tail.lastEndKind === "error" || tail.lastEndKind === "max-tokens");
 		  const fallbackRed = (tail === undefined || !tail.hasContent) && sessionErrors.has(s.id);
-		  if (contentRed && !acknowledged.has(s.id)) return { flag: "red", message: tail.lastError ?? sessionErrors.get(s.id) };
+		  if (contentRed && isUnread(s)) return { flag: "red", message: tail.lastError ?? sessionErrors.get(s.id) };
 		  if (fallbackRed) return { flag: "red", message: sessionErrors.get(s.id) };
-		  if (tail !== undefined && tail.lastEndKind === "completed" && !acknowledged.has(s.id)) return { flag: "green" };
+		  if (tail !== undefined && tail.lastEndKind === "completed" && isUnread(s)) return { flag: "green" };
 		  return undefined;
 		};
 		
@@ -523,6 +612,50 @@ window.__ModuleLoader__.load({
 		      if (typeof sessionId === "string" && typeof message === "string") sessionErrors.set(sessionId, message);
 		    });
 		  });
+		  // Mount the custom `recentSessions` remote contribution and hydrate the
+		  // persisted "last seen" map once at startup. A custom namespace does not
+		  // exist before `$mount` registers it, so it cannot be named in the static
+		  // `inject` list: mount first, then resolve `remote.recentSessions` inside a
+		  // second injection scope and capture the namespace object. Until the first
+		  // attempt settles nothing is flagged from the map (ackMode "pending"); on any
+		  // mount or call failure the map stays empty (ackMode "down", hydrated=true)
+		  // and the switcher keeps using its in-memory registers — errors are
+		  // swallowed, no console noise. The disposer withdraws both the injection
+		  // scope and the mounted contribution on slot teardown.
+		  ctx.effect(() => {
+		    if (remote === undefined || typeof remote.$mount !== "function") {
+		      ackMode = "down";
+		      ackHydrated = true;
+		      return;
+		    }
+		    let cancelled = false;
+		    let scope;
+		    (async () => {
+		      try {
+		        ackDispose = await remote.$mount(RECENT_SESSIONS_CONTRIBUTION);
+		      } catch {
+		        ackMode = "down";
+		        ackHydrated = true;
+		        return;
+		      }
+		      if (cancelled) return;
+		      scope = ctx.inject(["remote.recentSessions"], (scopedCtx) => {
+		        const namespace = scopedCtx.remote.recentSessions;
+		        ackNamespace = namespace;
+		        hydrateAcks(namespace);
+		      });
+		    })();
+		    return () => {
+		      cancelled = true;
+		      ackNamespace = undefined;
+		      if (scope !== undefined && typeof scope.dispose === "function") scope.dispose();
+		      if (ackDispose !== undefined) {
+		        const dispose = ackDispose;
+		        ackDispose = undefined;
+		        dispose().catch(() => {});
+		      }
+		    };
+		  });
 		  // One component serves two registrations: the header utilities row (active
 		  // Session) and the hero dock row (new Session). `heroDock` is injected by the
 		  // second registration so the trigger label can differ while the blank Session
@@ -550,36 +683,38 @@ window.__ModuleLoader__.load({
 		        return () => { tailListeners.delete(bump); };
 		      }, []);
 		
-		      // Acknowledging: leaving a session means its final state was on screen,
-		      // so its red/green clears. The current session is excluded by id anyway;
-		      // this covers the session the user just left. Blank sessions have
-		      // nothing to acknowledge. `lastSeenSessionId` is module-level because
-		      // the session-scoped header slot remounts its children on every session
+		      // Marking seen: leaving a session means its final state was on screen,
+		      // so its red/green clears. The current session is excluded by id
+		      // anyway; this covers the session the user just left. Blank sessions
+		      // have nothing to mark. `lastSeenSessionId` is module-level because the
+		      // session-scoped header slot remounts its children on every session
 		      // switch, which would reset a per-instance ref before it could fire.
 		      react.useEffect(() => {
 		        const prev = lastSeenSessionId;
 		        lastSeenSessionId = sessionId;
 		        if (prev === undefined || prev === sessionId) return;
 		        const prevSession = list.byId[prev];
-		        if (prevSession !== undefined && !prevSession.blank) acknowledged.add(prev);
+		        if (prevSession !== undefined && !prevSession.blank) markSeen(prev, Date.now());
 		      }, [sessionId, list]);
 		
-		      // Register hygiene: a session that runs again is no longer failed or
-		      // viewed (its previous outcome is moot), and a session that vanished
-		      // from the list cannot stay flagged. Runs on every status/list change.
+		      // Register hygiene: a session that vanished from the list cannot stay
+		      // flagged — its persisted marker is pruned too (the host keeps the
+		      // durable copy, but a reappeared session restarts read). A session that
+		      // runs again is NOT pruned: the durable unread predicate
+		      // (`updatedAt > lastSeenAt`) makes its fresh output unread on its own,
+		      // exactly like offline activity does after a reload.
 		      react.useEffect(() => {
 		        for (const [id, st] of status) {
 		          if (st?.running === true) {
 		            sessionErrors.delete(id);
-		            acknowledged.delete(id);
 		          }
 		        }
 		        if (list.phase === "ready") {
 		          for (const id of sessionErrors.keys()) {
 		            if (!(id in list.byId)) sessionErrors.delete(id);
 		          }
-		          for (const id of acknowledged.keys()) {
-		            if (!(id in list.byId)) acknowledged.delete(id);
+		          for (const id of lastSeenAt.keys()) {
+		            if (!(id in list.byId)) lastSeenAt.delete(id);
 		          }
 		        }
 		      }, [status, list]);

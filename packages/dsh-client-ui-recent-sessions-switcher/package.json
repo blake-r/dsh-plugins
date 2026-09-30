@@ -1,6 +1,6 @@
 {
   "name": "@blake-r/dsh-client-ui-recent-sessions-switcher",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "DSH Web UI plugin: a recent-sessions switcher in the conversation header with per-session status dots (running / idle / unread).",
   "type": "module",
   "main": "lib/index.js",
@@ -35,6 +35,11 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-storage-domain": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-typert-protocol": "0.2.0-rc.2",
+    "zod": "^4.4.3"
   },
   "engines": {
     "node": ">=18"
