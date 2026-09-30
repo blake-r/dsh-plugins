@@ -5,27 +5,52 @@
 // JSON SCHEMA, dumped verbatim from the tool registry.
 //
 // COMPACT SCHEMA NOTATION (per user spec):
-//   - field with a type:   `"command":/string/` — the `/.../` marker is always
-//     present, on every field, including one whose type is a whole container,
-//     so no bare type name is ever left unmarked.
-//   - optional field:      `"description":/undef|string/` (`undef` = may be
-//     absent; rendered inside the marker, in front of the type)
-//   - const field:         `"kind":/"new"/` — a const literal keeps its double
-//     quotes and takes no `undef|` prefix (a fixed value, not an optional
-//     slot), even when the field is not listed as required.
-//   - enum:                `"action":/"edit"|"pause|resume"/` — literal values
-//     are double-quoted, so a value can never collide with the `/` marker.
-//   - nested object:       `"questions":/{"id":/string/,"header":/undef|string/}/`
-//     — containers stay structural inside the marker, and their fields carry
-//     their own markers.
-//   - array:               `"options":/undef|[{"label":/string/}]/` — the item
-//     expression is not itself marked: brackets already mark the position.
-//   - oneOf union:         `"mode":/"new"|string/` (literal beside a type),
-//     `"branch":/undef|{"kind":/"a"/}|{"kind":/"b"/}/` (discriminated),
-//     `"cursor":/string|null/` (nullable).
+//   - the `/.../` marker delimits ONE TYPE ATOM: a type name (`/string/`),
+//     `undef`, a double-quoted literal (`/"new"/`), or a reference
+//     (`/$ref:Thing/`). No operator ever appears inside a marker, so a literal
+//     whose own value contains `|` or `&` can never be confused with one.
+//   - `|` joins alternatives BETWEEN markers: `"cursor":/undef/|/string/|/null/`.
+//   - `&` joins requirements that hold TOGETHER and binds tighter than `|`:
+//     `"kid":/object/&/$ref:Node/`. Parentheses regroup the other way:
+//     `(/A/|/B/)&(/C/|/D/)`.
+//   - optional field: `"description":/undef/|/string/` — `undef` (may be absent)
+//     is an ordinary alternative. A const field never takes it: a const is a
+//     fixed value, not an optional slot.
+//   - enum/const: one marked, double-quoted literal per value —
+//     `"action":/"edit"/|/"pause"/|/"resume"/`. The literal is a JSON STRING
+//     LITERAL (`JSON.stringify`), so a value containing a double quote or a
+//     backslash is escaped rather than breaking the notation (`say "hi"` ->
+//     `/"say \"hi\""/`); a value containing `/` is held by its own quotes,
+//     since the marker has no escape sequence.
+//   - containers are self-delimiting and stand as whole alternatives:
+//     `"questions":[{"id":/string/,"header":/undef/|/string/}]` (array of
+//     objects), `"daily":/undef/|{"time":/string/,"time_zone":/string/}`
+//     (optional object). Object fields carry their own expressions; an array's
+//     element does too — an element cannot be absent, so `undef` never appears
+//     in that position.
 //   - `null` is a VALID value (distinct from `undef` absence) and is never
-//     folded into `undef`; requiredness is carried by the `undef|` prefix
-//     alone. `json`/empty schemas collapse to `any`.
+//     folded into `undef`.
+//   - `json` marks a node declaring no type this renderer can read: an empty
+//     schema, a node carrying only annotations, an unknown keyword. It matches
+//     the harness's own DSL keyword `type: "json"` (which compiles to a node
+//     with no `type`); its TS renderer calls the same node `JsonValue`.
+//   - `$ref` renders as the LAST token of its JSON Pointer, exactly as written
+//     (`#/definitions/Thing` -> `/$ref:Thing/`, `#/definitions/a~1b` ->
+//     `/$ref:a~1b/`). The pointer is never followed, so only a name is shown and
+//     a cyclic schema cannot recurse. The empty pointer — `"#"`, the document
+//     root, the standard recursion idiom — renders as `/$ref:root/`; a trailing
+//     slash names the empty-string key and renders as `/$ref:/`; a target in
+//     ANOTHER document (`"https://x/y.json"`, no fragment) and a non-string
+//     `$ref` render as `/json/`.
+//   - a node carrying `$ref` BESIDE a structural keyword is a CONJUNCTION (`$ref`
+//     and its siblings both apply from 2019-09 on), rendered with `&`, the
+//     structural part first. A union there would accept values the schema
+//     rejects: `{$ref: X(integer), type: "string"}` accepts nothing, while
+//     `/$ref:X/|/string/` reads as "either an integer or a string".
+//   - `anyOf` renders exactly like `oneOf` — both are a union of their branches
+//     (`anyOf` differs only in allowing overlapping branches, which the `|`
+//     notation never claims to exclude). A node carrying BOTH renders as
+//     `(/oneOf branches/)&(/anyOf branches/)`.
 //   - a type ARRAY (`type: ["string","null"]`) is legal JSON Schema but can
 //     only reach this plugin through a raw `register()`: an MCP server's
 //     `inputSchema` is registered unchanged (`@deepseek-ai/dsh-mcp-client`
@@ -33,7 +58,9 @@
 //     authored tools (`@deepseek-ai/dsh-tools`: "type must be a single type
 //     string"). Such a node renders as the union of its names, with an `array`
 //     branch expanded through `items`: `["string","array"]` + `items:string`
-//     becomes `string|[string]`.
+//     becomes `/string/|[/string/]`.
+//   - tuple `items` (an array of schemas) renders as the union of its position
+//     types inside the brackets — the positions themselves are not expressed.
 //
 // CONTENT FORM: the content block carries the parameters as MINIFIED JSON
 // SCHEMA (`JSON.stringify`), not a hand-written annotated rendering. JSON is
@@ -104,40 +131,108 @@ function initials(nameStr) {
   return words.map((w) => w[0].toLowerCase()).join("");
 }
 
-// Type expression for one schema node: atoms joined by `|`, containers kept
-// structural, literals double-quoted. Carries no `/.../` marker and no `undef|`
-// prefix — those belong to the field rendering in `fieldBody`.
-function typeExpr(node) {
-  if (node === undefined || node === null) return "any";
-  if (node.const !== undefined) return `"${String(node.const)}"`;
-  if (node.enum !== undefined) return node.enum.map((v) => `"${String(v)}"`).join("|");
-  if (Array.isArray(node.oneOf)) return node.oneOf.map(typeExpr).join("|");
-  if (node.type === "object" && node.properties) return compactFields(node);
-  if (node.type === "array" && node.items) return `[${typeExpr(node.items)}]`;
-  if (Array.isArray(node.type)) {
-    return node.type
-      .map((t) => (t === "array" && node.items !== undefined ? `[${typeExpr(node.items)}]` : String(t)))
-      .join("|");
-  }
-  if (typeof node.type === "string") return node.type;
-  if (node.items !== undefined) return `[${typeExpr(node.items)}]`;
-  return "any";
+// One marked atom. The marker delimits a single type atom — a type name, a
+// double-quoted literal, `undef`, or `$ref:<name>` — so an operator never
+// appears inside it and a literal's own characters can never collide with one.
+function atom(text) {
+  return `/${text}/`;
 }
 
-// One field's marked body: optional fields get `undef|` in front of the type,
-// const fields never do (a const is a fixed value).
-function fieldBody(node, isRequired) {
-  const t = typeExpr(node);
-  if (node !== null && typeof node === "object" && node.const !== undefined) return t;
-  return isRequired ? t : `undef|${t}`;
+// `$ref` as a marked atom. The pointer is never followed (a cyclic schema must
+// not recurse), so only its last token is rendered, exactly as written in the
+// pointer. The empty pointer names the document root; a target outside this
+// document and a non-string `$ref` fall back to `json`. An empty last token (a
+// trailing slash) names the empty-string key, so it renders as `$ref:` with an
+// empty name.
+function refPart(ref) {
+  if (typeof ref !== "string") return atom("json");
+  const hash = ref.indexOf("#");
+  if (hash === -1) return atom("json");
+  const pointer = ref.slice(hash + 1);
+  if (pointer === "") return atom("$ref:root");
+  const last = pointer.startsWith("/") ? pointer.split("/").at(-1) : pointer;
+  return atom(`$ref:${last}`);
+}
+
+// Union of a branch list, or '' when the list is absent or empty.
+function unionOf(list) {
+  if (!Array.isArray(list) || list.length === 0) return "";
+  return list.map(typeExpr).join("|");
+}
+
+// Parenthesize only where a tighter `&` would otherwise regroup a `|`.
+function group(text) {
+  return text.includes("|") ? `(${text})` : text;
+}
+
+// A literal value as a JSON string literal, escaped by the JSON serializer: a
+// value containing a double quote or a backslash cannot break the notation
+// (`say "hi"` -> `/"say \"hi\""/`). A value containing `/` stays intact because
+// the quotes delimit it — the marker itself has no escape sequence.
+function literal(value) {
+  return JSON.stringify(String(value));
+}
+
+// Structural part of a node: const/enum, unions, containers, a type name.
+// Returns '' when the node declares nothing this renderer can read.
+function structuralExpr(node) {
+  if (node.const !== undefined) return atom(literal(node.const));
+  if (Array.isArray(node.enum) && node.enum.length > 0) {
+    return node.enum.map((value) => atom(literal(value))).join("|");
+  }
+  const oneOf = unionOf(node.oneOf);
+  const anyOf = unionOf(node.anyOf);
+  if (oneOf && anyOf) return `${group(oneOf)}&${group(anyOf)}`;
+  if (oneOf || anyOf) return oneOf || anyOf;
+  if (node.type === "object" && node.properties) return compactFields(node);
+  if (node.type === "array" && node.items !== undefined) return `[${itemExpr(node.items)}]`;
+  if (Array.isArray(node.type)) {
+    return node.type
+      .map((t) => (t === "array" && node.items !== undefined ? `[${itemExpr(node.items)}]` : atom(String(t))))
+      .join("|");
+  }
+  if (typeof node.type === "string") return atom(node.type);
+  if (node.items !== undefined) return `[${itemExpr(node.items)}]`;
+  return "";
+}
+
+// One array's element expression. An element cannot be absent, so `undef` never
+// appears here; tuple `items` (an array of schemas) renders as the union of its
+// position types — the positions themselves are not expressed.
+function itemExpr(items) {
+  if (Array.isArray(items)) return items.map(typeExpr).join("|");
+  return typeExpr(items);
+}
+
+// Type expression for one schema node: marked atoms joined by `|`, containers
+// self-delimiting, and a `$ref` beside a structural keyword conjoined with `&`
+// (structural part first). An unreadable node renders as `/json/`.
+function typeExpr(node) {
+  if (node === null || typeof node !== "object") return atom("json");
+  const aspects = [];
+  const structural = structuralExpr(node);
+  if (structural) aspects.push(structural);
+  if (node.$ref !== undefined) aspects.push(refPart(node.$ref));
+  if (aspects.length === 0) return atom("json");
+  if (aspects.length === 1) return aspects[0];
+  return aspects.map(group).join("&");
+}
+
+// One field's expression: `undef` is an ordinary alternative in front of the
+// type, except on a const field (a fixed value, not an optional slot).
+function fieldExpr(node, isRequired) {
+  const body = typeExpr(node);
+  if (node !== null && typeof node === "object" && node.const !== undefined) return body;
+  return isRequired ? body : `${atom("undef")}|${body}`;
 }
 
 // Compact object literal for a compiled `{type:"object",properties,required}`:
-// every field is `"key":/type/`, the marker is never omitted.
+// every field is `"key":<expression>`, and its own expression carries the
+// markers.
 function compactFields(node) {
   const props = node.properties ?? {};
   const required = new Set(Array.isArray(node.required) ? node.required : []);
-  const parts = Object.keys(props).map((key) => `"${key}":/${fieldBody(props[key], required.has(key))}/`);
+  const parts = Object.keys(props).map((key) => `"${key}":${fieldExpr(props[key], required.has(key))}`);
   return `{${parts.join(",")}}`;
 }
 

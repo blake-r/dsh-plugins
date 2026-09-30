@@ -22,24 +22,35 @@ A bundle package in the dsh-plugins monorepo. See the header comment in
 `src/dsh-skill-from-tools.mjs` for full behavior.
 
 Each skill's catalog `description` renders its tool's parameter schema as a
-**compact literal** in which every field's type is enclosed in `/`:
+**compact literal**. The `/.../` marker delimits one type atom — a type name,
+`undef`, a double-quoted literal, or a reference — and the operators `|` and `&`
+stand only *between* markers:
 
 - required field: `"command":/string/`
-- optional field: `"description":/undef|string/` (`undef` = may be absent)
-- const field: `"kind":/"new"/` — no `undef|` prefix, even when not required
-- enum: `"action":/"edit"|"pause|resume"/` — literal values stay double-quoted
-  and can never collide with the `/` marker
-- nested objects/arrays expand recursively: `"options":/undef|[{"label":/string/}]/`,
-  `"questions":/{"id":/string/,"header":/undef|string/}/`
-- `oneOf` unions: `/"new"|string/` (literal beside a type), `"cursor":/string|null/`
-  (nullable) or `{"kind":/"a"/}|{"kind":/"b"/}` (discriminated)
+- optional field: `"description":/undef/|/string/` (`undef` = may be absent, an
+  ordinary alternative)
+- const field: `"kind":/"new"/` — no `undef` alternative, even when not required
+- enum: `"action":/"edit"/|/"pause"/|/"resume"/` — one marked literal per value, so
+  a value containing `|` or `&` can never be confused with an operator. The literal
+  is a JSON string literal, so an embedded double quote is escaped
+  (`/"say \"hi\""/`) instead of breaking the notation
+- containers are self-delimiting and stand as whole alternatives:
+  `"options":[{"label":/string/}]`, `"daily":/undef/|{"time":/string/,"time_zone":/string/}`
+- `oneOf`/`anyOf` unions: `"cursor":/undef/|/string/|/null/` (nullable),
+  `{"kind":/"a"/}|{"kind":/"b"/}` (discriminated)
+- `$ref`: `/$ref:Thing/` — the last token of the pointer, exactly as written; the
+  pointer is never followed, so a cyclic schema cannot recurse
+- a `$ref` beside a structural keyword is a conjunction: `/object/&/$ref:Node/`
+  (`&` binds tighter than `|`; parentheses regroup as `(/A/|/B/)&(/C/|/D/)`)
 
-Every field carries the marker — including one whose type is a whole container —
-so no bare type name is ever left unmarked. `null` is a valid value, distinct
-from `undef` absence, and is never folded into `undef`. A `type` array
-(`type: ["string","null"]`), which reaches the plugin only through a raw MCP
-`inputSchema`, renders as the union of its names, with an `array` branch expanded
-through `items`. `json`/empty schemas collapse to `any`.
+`null` is a valid value, distinct from `undef` absence, and is never folded into
+`undef`. `json` marks a node that declares no type this renderer can read (an empty
+schema, annotations only, an unknown keyword) — the harness's own keyword for the
+same node is `type: "json"`. The empty pointer (`"#"`, the document root) renders as
+`/$ref:root/`, a trailing slash as `/$ref:/`, and a target in another document as
+`/json/`. A `type` array (`type: ["string","null"]`), which reaches the plugin only
+through a raw MCP `inputSchema`, renders as the union of its names, with an `array`
+branch expanded through `items`: `/string/|[/string/]`.
 
 Each skill's `content` block carries the tool's parameters as **minified JSON
 Schema**, dumped verbatim from the registry, under an explicit
