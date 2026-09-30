@@ -8,12 +8,18 @@
 // user messages and injected frames between sessions stay live:
 //   - tool calls      -> `* name "description" (seq N -> result M)`  (name plus
 //                        the model-authored `description` from the arguments,
-//                        when present; no raw argument blobs). A call whose
-//                        result carries the structured `isError` flag gets a
-//                        `, fail` marker so the model still sees the call was
+//                        when present; no raw argument blobs). `-> result M` is
+//                        the pointer to the result row this fold shadows. A call
+//                        whose result carried the structured `isError` flag gets
+//                        a `, fail` marker so the model still sees the call was
 //                        attempted and did not succeed.
-//   - tool results    -> collapsed into the call's `-> result M` pointer;
-//                        an unmatched result keeps its own `* tool-result (seq N)`
+//   - tool results    -> every folded result row keeps a pointer line of its
+//                        own, `* tool-result (seq N)`; the body is never
+//                        inlined (removing it is what the fold is for — recall
+//                        recovers it), and the call row above carries
+//                        `-> result M` when the pair lies in the same fold. A
+//                        result whose call row is outside the range (its call
+//                        was folded in an earlier pass) is still pointed at.
 //   - reasoning       -> dropped
 //   - assistant text  -> kept verbatim, back-linked with `(seq N)`
 //   - user attachments -> media/documents/other blocks in every REAL user message
@@ -102,6 +108,34 @@
 // non-dedupe live messages (agent-message relays, tool-jobs, session-reference,
 // subagent-settled) always stay. The durable log is unchanged — recall works.
 //
+// Tool-pairing (3.10): a fold may only be committed where the engine's own
+// balance contract holds — the cut before its first shadowed node and the cut
+// after its last one must both be cuts the engine accepts (no tool call left
+// unanswered across them). The predicates are `toolPairingBalancedBefore` /
+// `toolPairingBalancedAfter` of `@deepseek-ai/dsh-compaction`, resolved at
+// runtime through the composition loader (no dependency is added). The
+// token-driven mid-turn end is snapped onto the nearest such cut, and every
+// fold path (mid-turn, turn/end consolidation, per-session, frame policy,
+// attachment) is floor-checked in `commitReplacement`/its own branch. Without
+// the oracle nothing is folded: an unchecked boundary is the corruption this
+// guard exists to prevent (a `tool/result` whose call the same fold removed
+// leaves the surface uncuttable — see 3.5, which only guarded a trailing call
+// row). Skipping a fold is recoverable; an orphan result is not.
+//
+// Result detection (3.11): the digest and the dangling-call guard read a tool
+// result from its v4 shape — `deriveEventMessage` gives `tool/result` events a
+// `role: "tool"` message with the answering `toolCallId` and the failure flag
+// `isError` at the message level (the pre-v4 `role: "user"` /
+// `content[0].type === "tool-result"` shape never occurs under v4: 2433 of 2433
+// real result rows are `role: "tool"`, `content[0].type: "text"`). One helper,
+// `toolResultOf`, is the single detector: it feeds the call -> result map (so
+// call rows cite `-> result M` and result rows get their own
+// `* tool-result (seq N)` line) and the 3.5 back-off. Before this fix the map
+// was empty, so the digest cited calls with no result pointer and 3.5 was blind
+// to results — the blindness that let a token-driven cut land inside a result
+// run (the corruption 3.10 now floors). The detector is digest-side only: the
+// 3.10 floor keeps its own authority at commit.
+//
 // The compiler is vendored (trimmed) from the upstream compaction compiler
 // because preset-local plugin files are loaded dependency-free. Bump the `?v=`
 // in the referencing row of agent.cordis.yml after editing this file.
@@ -111,8 +145,10 @@
 // Σ `estimateMessage` over the whole replaced span — the gross cost of the
 // removed nodes, NOT subtracting the price of the new elide/replacement text.
 // Each summary is bracketed by a v4 compaction lifecycle (`compaction/start`
-// ... `compaction/end`, `turn: null` because the plugin runs after `turn/end`)
-// so the strict read validation accepts it.
+// ... `compaction/end`, with `data.turn` = the OPEN turn of the session at
+// commit time — `null` only between turns, a turn number for the mid-turn
+// pre-step fold and the frame policy that follows it) so the strict read
+// validation accepts it.
 // That summary event MUST stay gross: the token-meter's surface fold subtracts
 // the replacement itself (`deltaTokens = estimateMessage(replacement) −
 // claim.tokens`), so a net summary would double-subtract. The plugin's own
@@ -152,10 +188,13 @@
 //
 // ── breakdown log + whitespace normalization ────────────────────────────────
 // The `re-composed N surface nodes ...` log line carries a per-kind breakdown
-// with plain labels (no "folded/removed" synonyms): `(tool calls: K, reasoning
-// blocks: R, text lines: L, media links: M)`. The counts come from
-// `compileNodes`' returned `stats` (`tools`, `reasoningRemoved`, `text`,
-// `media`). Separately, `joinCompiledEntries` runs the output through
+// with plain labels (no "folded/removed" synonyms): `(tool calls: K, tool
+// results: R, reasoning blocks: X, text lines: L, media links: M)`. The counts
+// come from `compileNodes`' returned `stats` (`tools`, `results`,
+// `reasoningRemoved`, `text`, `media`) — `tools` counts call rows and `results`
+// result rows (3.11), so `K` stays the call count it always was and `R` is the
+// new, previously invisible half of the fold. Separately, `joinCompiledEntries`
+// runs the output through
 // `normalizeWhitespace`, which collapses runs of blank lines to one, trims
 // trailing spaces/tabs per line, and drops leading/trailing blank lines —
 // intra-line space runs are deliberately untouched so code/indentation in kept
@@ -324,36 +363,53 @@ function estimateMessage(message) {
 }
 
 /**
+ * The v4 tool-result identity of one node's derived message (3.11): the call it
+ * answers plus its failure flag, or null when the node is not a tool result.
+ * `deriveEventMessage` projects a `tool/result` event to its `data.message`,
+ * which under the v4 format is `role: "tool"` carrying the answering
+ * `toolCallId` and the `isError` flag at the message level, with the result
+ * text in `content`. The pre-v4 shape this plugin used to test
+ * (`role === "user"` with `content[0].type === "tool-result"`) is never
+ * produced by the v4 format, which is why the call -> result map stayed empty.
+ * This helper is the single detector for both the digest pointers and the 3.5
+ * dangling-call back-off.
+ * @param message - the derived message (may be null).
+ * @returns `{ callId, isError }` or null.
+ */
+function toolResultOf(message) {
+  if (message === null || message === undefined || message.role !== "tool") return null;
+  if (typeof message.toolCallId !== "string" || message.toolCallId.length === 0) return null;
+  return { callId: message.toolCallId, isError: message.isError === true };
+}
+
+/**
  * Compile one ordered surface region into re-composed entry strings.
  * @param nodes - ordered `{ seq, message }` projections (message may be null).
  * @param config - resolved compiler configuration.
  * @returns `{ entries, stats }` where each entry is `{ seq, text, kind }` and
- *   `stats` counts the folded surface by kind: `tools` (tool-call / tool-result
- *   rows), `text` (assistant text rows), `media` (image/document/other links),
- *   and `reasoningRemoved` (reasoning blocks dropped because `includeReasoning`
- *   is off).
+ *   `stats` counts the folded surface by kind: `tools` (tool-call rows),
+ *   `results` (tool-result rows), `text` (assistant text rows), `media`
+ *   (image/document/other links), and `reasoningRemoved` (reasoning blocks
+ *   dropped because `includeReasoning` is off).
  */
 function compileNodes(nodes, config) {
   const includeReasoning = config.includeReasoning === true;
   const keyArgFields = config.toolKeyArgFields ?? DEFAULT_TOOL_KEY_ARG_FIELDS;
-  const stats = { tools: 0, text: 0, media: 0, reasoningRemoved: 0 };
+  const stats = { tools: 0, results: 0, text: 0, media: 0, reasoningRemoved: 0 };
 
-  // map each tool call id -> seq of its result node (result pointer), and track
-  // which calls failed (result block carries the structured `isError` flag, set
-  // by dsh-llm's createToolResultMessage and for interrupted calls by
-  // dsh-session). Failed calls get a `, fail` marker on their compacted row so
-  // the model still sees that the call was attempted and did not succeed — the
-  // result text itself is already collapsed into the `-> result M` pointer.
+  // map each tool call id -> seq of its result node (3.11 v4 detector), and
+  // track which calls failed (the v4 result message carries the structured
+  // `isError` flag, set by dsh-llm's createToolResultMessage and for
+  // interrupted calls by dsh-session). Failed calls get a `, fail` marker on
+  // their compacted row so the model still sees that the call was attempted and
+  // did not succeed — the result text itself is only pointed at.
   const resultSeqByCallId = new Map();
   const failedCallIds = new Set();
   for (const node of nodes) {
-    const message = node.message;
-    if (message === null || message === undefined || message.role !== "user" || message.content === undefined) continue;
-    const first = message.content[0];
-    if (first !== undefined && first.type === "tool-result" && typeof first.toolCallId === "string") {
-      resultSeqByCallId.set(first.toolCallId, node.seq);
-      if (first.isError === true) failedCallIds.add(first.toolCallId);
-    }
+    const result = toolResultOf(node.message);
+    if (result === null) continue;
+    resultSeqByCallId.set(result.callId, node.seq);
+    if (result.isError) failedCallIds.add(result.callId);
   }
 
   const entries = [];
@@ -372,6 +428,16 @@ function compileNodes(nodes, config) {
   for (const node of nodes) {
     const message = node.message;
     if (message === null || message === undefined || message.content === undefined) continue;
+    if (toolResultOf(message) !== null) {
+      // Every folded result row keeps a pointer of its own: the call row above
+      // carries `-> result M` when the pair lies in the same fold, and this line
+      // guarantees the row is recoverable when its call is outside the range (a
+      // call already folded in an earlier pass). The body is NOT inlined — that
+      // is exactly what the fold removes; recall is the way back to it.
+      entries.push({ seq: node.seq, text: `${roleHeader("assistant")}* tool-result (${seqRef(node.seq)})`, kind: "tool" });
+      stats.results++;
+      continue;
+    }
     if (message.role === "assistant") {
       let header = "";
       for (const block of message.content) {
@@ -423,21 +489,6 @@ function compileNodes(nodes, config) {
         stats.media++;
       }
       continue;
-    }
-    if (message.role === "user") {
-      const first = message.content[0];
-      if (first !== undefined && first.type === "tool-result") {
-        // A matched result is consumed into the call's `-> result M` pointer;
-        // an unmatched result keeps its own link so it never vanishes silently.
-        const consumed = resultSeqByCallId.get(first.toolCallId) === node.seq;
-        if (!consumed) {
-          entries.push({ seq: node.seq, text: `${roleHeader("assistant")}* tool-result (${seqRef(node.seq)})`, kind: "tool" });
-          stats.tools++;
-        }
-        continue;
-      }
-      // Only tool/result user nodes reach here (real user messages and injected
-      // frames are never folded), so nothing else needs handling.
     }
   }
 
@@ -539,6 +590,13 @@ function foldUserAttachments(message, seq) {
 // ── mid-turn configuration knobs ─────────────────────────────────────────────
 
 const PLUGIN_KIND = "plugin:dsh-compaction-micro";
+
+/**
+ * Package the engine's tool-pairing predicates come from (3.10). Resolved at
+ * runtime through the composition loader, never a static import: the plugin
+ * package does not depend on it and must not gain a dependency for a check.
+ */
+const SPEC_COMPACTION = "@deepseek-ai/dsh-compaction";
 
 /** Frame kinds whose old copies are deleted from the surface (3.9). */
 const DEDUPE_FRAME_KINDS = new Set(["skill-catalog", "agent-instructions", "goal", "runtime-context"]);
@@ -718,17 +776,13 @@ function apply(ctx, config = {}) {
     return -1;
   };
 
-  /** Node-position cost of the last tool result inside a node set. */
+  /** Node-position cost of the last tool result inside a node set (3.11: v4 detector). */
   const resultIndexByCallId = (stream) => {
     // stream entries: { idx, seq, event, message, price }; message may be null.
     const map = new Map();
     for (let i = 0; i < stream.length; i++) {
-      const message = stream[i].message;
-      if (message === null || message === undefined || message.role !== "user" || message.content === undefined) continue;
-      const first = message.content[0];
-      if (first !== undefined && first.type === "tool-result" && typeof first.toolCallId === "string") {
-        map.set(first.toolCallId, i);
-      }
+      const result = toolResultOf(stream[i].message);
+      if (result !== null) map.set(result.callId, i);
     }
     return map;
   };
@@ -843,10 +897,188 @@ function apply(ctx, config = {}) {
   };
 
   /**
+   * The turn a compaction lifecycle committed right now belongs to: the open
+   * turn derived from real session state — the last `turn/start` without a
+   * matching `turn/end` — or null when no turn is open. The v4 log invariant
+   * requires `compaction/start` and its paired `compaction/end` to name exactly
+   * the open turn, so a fold made INSIDE a turn (the mid-turn pre-step path and
+   * the frame policy that runs right after it) must not write the standalone
+   * `turn: null`, which is correct only between turns.
+   * @param session - the session.
+   * @returns the open turn number, or null when no turn is open.
+   */
+  const openTurnOf = (session) => {
+    let events;
+    try {
+      events = typeof session.snapshotEvents === "function" ? session.snapshotEvents() : session.log;
+    } catch {
+      return null;
+    }
+    if (events === undefined || events === null || typeof events[Symbol.iterator] !== "function") return null;
+    let open = null;
+    for (const event of events) {
+      if (event === undefined || event === null) continue;
+      if (event.type === "turn/start") open = event.data === undefined || event.data === null ? null : event.data.turn;
+      else if (event.type === "turn/end") open = null;
+    }
+    return Number.isSafeInteger(open) ? open : null;
+  };
+
+  // ── tool-pairing oracle (3.10) ──────────────────────────────────────────────
+  // The engine that cuts surfaces (`@deepseek-ai/dsh-compaction-basic`) only
+  // cuts where no tool call is unanswered and refuses a surface where a
+  // `tool/result` has no live `tool-call` ("corrupt surface"): it asks
+  // `toolPairingBalancedBefore` / `toolPairingBalancedAfter` from
+  // `@deepseek-ai/dsh-compaction`. A fold must use THAT notion, not a private
+  // one. The helpers live in a package this plugin does not depend on, so they
+  // are resolved at runtime through the composition loader (ctx.loader.import
+  // resolves against ctx.baseUrl, the profile directory) — no static import,
+  // no new dependency. Until the module is in hand the plugin does not fold at
+  // all: an unchecked boundary is exactly the corruption this guard exists to
+  // prevent, and the next trigger retries.
+  let pairingHelpers = null;
+  let pairingLoad = null;
+  let pairingWarned = false;
+  const pairing = () => {
+    if (pairingHelpers !== null) return pairingHelpers;
+    if (pairingLoad === null) {
+      try {
+        const loader = ctx.loader;
+        if (loader === undefined || loader === null || typeof loader.import !== "function") {
+          pairingLoad = Promise.resolve(undefined);
+        } else {
+          pairingLoad = Promise.resolve(loader.import(SPEC_COMPACTION)).then(
+            (mod) => {
+              if (mod !== null && mod !== undefined && typeof mod.toolPairingBalancedAfter === "function" && typeof mod.toolPairingBalancedBefore === "function") {
+                pairingHelpers = mod;
+                log("info", `tool-pairing oracle: ${SPEC_COMPACTION} helpers loaded (folds are boundary-checked)`);
+              }
+              return pairingHelpers;
+            },
+            (error) => {
+              pairingLoad = null;
+              log("warn", `tool-pairing oracle: ${SPEC_COMPACTION} unavailable (${error instanceof Error ? error.message : String(error)}); folds stay disabled`);
+              return null;
+            }
+          );
+        }
+      } catch (error) {
+        pairingLoad = null;
+        log("warn", `tool-pairing oracle: ${SPEC_COMPACTION} unavailable (${error instanceof Error ? error.message : String(error)}); folds stay disabled`);
+      }
+    }
+    return pairingHelpers;
+  };
+
+  /**
+   * Ask the engine whether a cut is tool-pairing balanced. `undefined` means
+   * the oracle cannot answer (not loaded, seq off the surface, or the surface
+   * is already pairing-corrupt) — callers treat that as "do not fold", never
+   * as "balanced".
+   * @param fn - the engine predicate (`toolPairingBalancedBefore`/`After`).
+   * @param session - the session.
+   * @param seq - surface seq whose leading/trailing cut is checked.
+   * @returns true/false from the engine, or undefined when it cannot answer.
+   */
+  const cutBalanced = (fn, session, seq) => {
+    try {
+      const answer = fn(session, seq);
+      return answer === true ? true : answer === false ? false : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const oracleMissing = () => {
+    if (!pairingWarned) {
+      pairingWarned = true;
+      log("warn", "tool-pairing oracle unavailable: skipping compaction folds (a fold boundary cannot be checked)");
+    }
+    return false;
+  };
+
+  /**
+   * Both cuts of a span must be pairing balanced (3.10): the cut before its
+   * first node and the cut after its last one. Only then is every tool
+   * call/result pair wholly inside or wholly outside the span, so the fold can
+   * leave neither an orphan result nor a permanently unanswered call — the two
+   * shapes that stop the engine from cutting the surface ever again.
+   * @param session - the session.
+   * @param start - first shadowed surface seq.
+   * @param end - last shadowed surface seq.
+   * @param label - log label of the fold being guarded.
+   * @returns true when the span may be committed.
+   */
+  const pairingSafeSpan = (session, start, end, label) => {
+    const helpers = pairing();
+    if (helpers === null) return oracleMissing();
+    const before = cutBalanced(helpers.toolPairingBalancedBefore, session, start);
+    if (before !== true) {
+      log("warn", `${label}: refusing fold seqs ${start}-${end}: the cut before seq ${start} is not pairing balanced (${before === undefined ? "unverifiable" : "a tool call or result crosses it"})`);
+      return false;
+    }
+    const after = cutBalanced(helpers.toolPairingBalancedAfter, session, end);
+    if (after !== true) {
+      log("warn", `${label}: refusing fold seqs ${start}-${end}: the cut after seq ${end} is not pairing balanced (${after === undefined ? "unverifiable" : "a tool call or result crosses it"})`);
+      return false;
+    }
+    return true;
+  };
+
+  /**
+   * Move a token-driven fold end onto the engine's nearest pairing-balanced
+   * cut (3.10). Forward first (keep the fold as large as intended: the extra
+   * nodes are the tail of a step whose head is already inside the range, and
+   * they stay bounded by one extra locked chunk), backward second (fold less),
+   * nothing when neither is acceptable — never a boundary that splits a pair.
+   * @param session - the session.
+   * @param stream - the foldable run in surface order (`{ seq, price }`).
+   * @param endIdx - the token-driven end index into `stream`.
+   * @returns `{ endIdx, moved, extraTokens }`, or null when no safe end exists.
+   */
+  const snapEndToBalancedCut = (session, stream, endIdx) => {
+    const helpers = pairing();
+    if (helpers === null) {
+      oracleMissing();
+      return null;
+    }
+    const after = (index) => cutBalanced(helpers.toolPairingBalancedAfter, session, stream[index].seq);
+    const startCut = cutBalanced(helpers.toolPairingBalancedBefore, session, stream[0].seq);
+    if (startCut !== true) {
+      log("warn", `mid-turn: refusing to fold from seq ${stream[0].seq}: the cut before it is not pairing balanced (${startCut === undefined ? "unverifiable" : "a tool call or result crosses it"})`);
+      return null;
+    }
+    if (after(endIdx) === true) return { endIdx, moved: false, extraTokens: 0 };
+
+    let extraTokens = 0;
+    for (let index = endIdx + 1; index < stream.length; index++) {
+      extraTokens += stream[index].price || 0;
+      if (after(index) === true) {
+        const cap = chunkTokens * (lockedChunks + 1);
+        if (extraTokens > cap) {
+          log("warn", `mid-turn: pairing-safe fold end lies ${extraTokens} tokens ahead (cap ${cap}); fold skipped this pass`);
+          return null;
+        }
+        return { endIdx: index, moved: true, extraTokens, from: stream[endIdx].seq, to: stream[index].seq };
+      }
+    }
+    for (let index = endIdx - 1; index >= 0; index--) {
+      if (after(index) !== true) continue;
+      const keptTokens = stream.slice(0, index + 1).reduce((acc, node) => acc + (node.price || 0), 0);
+      if (keptTokens < chunkTokens) return null;
+      return { endIdx: index, moved: true, extraTokens: 0, from: stream[endIdx].seq, to: stream[index].seq, shrunk: true };
+    }
+    log("warn", `mid-turn: no pairing-balanced fold end at or before seq ${stream[endIdx].seq}; fold skipped this pass`);
+    return null;
+  };
+
+  /**
    * Commit ONE replacement over a contiguous surface range with the compaction
-   * lifecycle (start..summary..end, `turn: null`), mirroring the existing
-   * turn/end machinery. The replacement message is a plugin checkpoint
-   * (`source.micro` carries `meta` for the per-turn consolidation, 3.8).
+   * lifecycle (start..summary..end), mirroring the existing turn/end machinery.
+   * The lifecycle owner turn is the OPEN turn of the session at commit time
+   * (`null` only for a fold committed between turns). The replacement message
+   * is a plugin checkpoint (`source.micro` carries `meta` for the per-turn
+   * consolidation, 3.8).
    * @param session - the session.
    * @param shadowed - ordered projected nodes `{ seq, event, message, price }`.
    * @param blocks - replacement content blocks.
@@ -862,6 +1094,13 @@ function apply(ctx, config = {}) {
     const shadowedTokenCount = shadowed.reduce((acc, n) => acc + (n.price || 0), 0);
     if (shadowedTokenCount === 0 && blocks.length === 0) return null;
 
+    // Tool-pairing floor (3.10): every fold path funnels through here, so this
+    // is where the engine's balance contract is enforced — the cut before the
+    // first shadowed node and the cut after the last one must both be
+    // pairing balanced. A span that fails is not committed at all: leaving the
+    // content live is always recoverable, an orphan result is not.
+    if (!pairingSafeSpan(session, start, end, label)) return null;
+
     const source = meta === undefined || meta === null ? { kind: PLUGIN_KIND } : { kind: PLUGIN_KIND, micro: deepFreeze({ ...meta }) };
     const replacementMessage = deepFreeze({
       id: newMessageId(),
@@ -871,7 +1110,7 @@ function apply(ctx, config = {}) {
     });
 
     const compactionId = newMessageId();
-    const lifecycle = { compactionId, turn: null };
+    const lifecycle = { compactionId, turn: openTurnOf(session) };
     const startEvent = session.append("compaction/start", lifecycle);
     const summaryEvent = session.append("compaction/summary", {
       compactionId,
@@ -954,12 +1193,29 @@ function apply(ctx, config = {}) {
     if (endIdx === -1) endIdx = stream.length - 1;
 
     // Pairing back-off (3.5): never cut a tool call from its result. Drop
-    // trailing assistant nodes whose call's result is outside the range.
+    // trailing assistant nodes whose call's result lies outside the range.
+    // 3.11: the map is now built from the v4 result shape ("tool" role +
+    // `toolCallId`), so this guard actually sees results; before the fix the
+    // map was empty and the loop only ever backed off a trailing call row.
     const resultIndexByCall = resultIndexByCallId(stream);
     while (endIdx >= 0 && hasDanglingCall(stream[endIdx].message, endIdx, resultIndexByCall)) {
       endIdx--;
     }
     if (endIdx < 0) return null;
+
+    // Tool-pairing snap (3.10): that back-off only guards a call whose row is
+    // the LAST node of the range. A token-driven end can land inside a step's
+    // result run while the call row sits far earlier — the fold then removes
+    // the calls with part of their results and leaves the rest live, which is
+    // the "corrupt surface" that stops the engine from ever compacting again.
+    // Move the end onto the engine's own nearest balanced cut instead.
+    const snap = snapEndToBalancedCut(session, stream, endIdx);
+    if (snap === null) return null;
+    if (snap.moved) {
+      log("info", `mid-turn: pairing snap moved the fold end from seq ${snap.from} to seq ${snap.to} (+${snap.extraTokens} tokens${snap.shrunk ? ", shrunk" : ""}) so no tool call/result pair is split; nominal seq ${stream[endIdx].seq}`);
+      endIdx = snap.endIdx;
+      if (endIdx < 0) return null;
+    }
 
     const startIdx = stream[0].idx;
     const shadowed = stream.slice(0, endIdx + 1).map((node) => ({
@@ -1258,7 +1514,7 @@ function apply(ctx, config = {}) {
           const replacementSeq = commitReplacement(session, shadowed, blocks, meta, `micro (turn/end, session seqs ${start}-${end})`);
           if (replacementSeq !== null) {
             replaced++;
-            log("info", `re-composed ${shadowed.length} surface nodes (seqs ${start}-${end}) into seq ${replacementSeq}; tool calls: ${stats.tools}, reasoning blocks: ${stats.reasoningRemoved}, text lines: ${stats.text}, media links: ${stats.media}`);
+            log("info", `re-composed ${shadowed.length} surface nodes (seqs ${start}-${end}) into seq ${replacementSeq}; tool calls: ${stats.tools}, tool results: ${stats.results}, reasoning blocks: ${stats.reasoningRemoved}, text lines: ${stats.text}, media links: ${stats.media}`);
           }
         }
       }
@@ -1275,6 +1531,9 @@ function apply(ctx, config = {}) {
 
         const node = { seq: attachmentUser, event, message, price: estimateMessage(message) };
         const blocks = deepFreeze(foldUserAttachments(message, attachmentUser));
+        // Tool-pairing floor (3.10): same contract as commitReplacement, which
+        // this path bypasses because it writes its own lifecycle.
+        if (!pairingSafeSpan(session, attachmentUser, attachmentUser, "micro (attachment fold)")) continue;
         const replacementMessage = deepFreeze({
           id: newMessageId(),
           role: "user",
@@ -1283,7 +1542,7 @@ function apply(ctx, config = {}) {
         });
 
         const compactionId = newMessageId();
-        const lifecycle = { compactionId, turn: null };
+        const lifecycle = { compactionId, turn: openTurnOf(session) };
         const startEvent = session.append("compaction/start", lifecycle);
         const summaryEvent = session.append("compaction/summary", {
           compactionId,
@@ -1318,6 +1577,12 @@ function apply(ctx, config = {}) {
       log("warn", `compaction failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   };
+
+  // Start resolving the pairing oracle NOW (3.10). `apply` runs when the plugin
+  // mounts — long before the first fold — so the first trigger already holds the
+  // helpers instead of skipping one fold while the import settles; a fold
+  // attempted before they arrive is refused (fail-closed), never unchecked.
+  pairing();
 
   // ── mid-turn trigger: agent/pre-step, BEFORE basic ─────────────────────────
   // The host-plane listener registers before the preset-plane basic listener,
