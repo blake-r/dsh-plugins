@@ -44,11 +44,13 @@ Three behaviors:
 3. **Per-turn consolidation (3.8)** — every replacement is a micro-checkpoint
    carrying `source.micro` metadata. At the next normal `turn/end` the turn's
    checkpoint block plus its remaining live content is folded into ONE per-turn
-   summary node (a compact map: `turn N: K calls/results folded, seq A..B,
-   ~T tokens` plus the turn's final assistant text verbatim). Checkpoint
-   overhead is capped at O(turns) — a 15-fold turn ends as one node, not ~30K
-   tokens of one-liners (e2c13124 lesson: 47-58 folds → 101K tokens → basic
-   fires).
+   node whose content follows the SAME fold semantics as every other fold
+   (reasoning dropped, tool calls/results folded to pointers, everything else
+   kept verbatim — mid-turn checkpoints carry over verbatim in surface order).
+   Checkpoint NODE overhead is capped at O(turns) while the concentrated
+   content is preserved (user decision); the context grows gradually per turn
+   and basic compaction remains the long-range backstop (e2c13124 lesson:
+   47-58 folds → 101K tokens).
 
 4. **Frame policy (3.9)** — old copies of injected frames (skill-catalog,
    agent-instructions, goal, runtime-context) are deleted from the surface,

@@ -87,11 +87,14 @@
 // message carries `source.micro` metadata (phase, turn, seq span, tokens,
 // folded counts). At the next normal `turn/end` the whole turn's checkpoint
 // block plus its remaining live content is consolidated into ONE per-turn
-// summary node (a compact map: "turn N: K calls/results folded, seq A..B,
-// ~T tokens") plus the turn's final assistant text (kept verbatim for
-// conversational continuity). This caps checkpoint overhead at O(turns) instead
-// of O(fires): a 15-fold turn ends as one ~tens-of-tokens node, not ~30K of
-// one-liners (e2c13124 lesson: 47-58 folds → 101K tokens → basic fires).
+// node, and that node's content follows the SAME fold semantics as every other
+// fold (Q29): reasoning dropped, tool call/result folded to pointers,
+// everything else kept verbatim — mid-turn checkpoints inside the span are
+// already-compiled content and carry over verbatim in surface order. This caps
+// checkpoint NODE overhead at O(turns) while keeping the concentrated content
+// (user decision): a 15-fold turn ends as one node, not ~30K of one-liners
+// (e2c13124 lesson: 47-58 folds → 101K tokens). The context grows gradually
+// per turn; basic compaction remains the long-range backstop.
 //
 // Frame policy (3.9): old copies of injected frames (skill-catalog,
 // agent-instructions, goal, runtime-context) are DELETED from the surface,
@@ -638,6 +641,14 @@ function apply(ctx, config = {}) {
     return source.micro ?? null;
   };
 
+  /** The visible text of a plugin node's message, or null when empty. */
+  const checkpointTextOf = (message) => {
+    if (message === null || message === undefined || message.content === undefined) return null;
+    const texts = message.content.filter((b) => b !== null && b.type === "text" && typeof b.text === "string");
+    const joined = texts.map((b) => b.text).join("\n").trim();
+    return joined.length > 0 ? joined : null;
+  };
+
   /** True for the nodes this plugin's own folds produced (any phase). */
   const isPluginNode = (event) => {
     if (event === undefined || event === null || event.type !== "user/message") return false;
@@ -1030,21 +1041,25 @@ function apply(ctx, config = {}) {
 
   /**
    * Per-turn consolidation (3.8): at a normal turn/end, fold the whole turn's
-   * checkpoint block plus its remaining live content into ONE per-turn summary
-   * node, capping checkpoint overhead at O(turns). Runs only when the turn's
-   * foldable span is contiguous from the last per-turn summary (no user
-   * message / frame in between); otherwise the caller falls back to per-session
-   * folds.
+   * checkpoint block plus its remaining live content into ONE per-turn node,
+   * capping checkpoint NODE overhead at O(turns). The node's content follows
+   * the SAME fold semantics as every other fold (Q29): reasoning dropped, tool
+   * call/result folded to pointers, everything else kept verbatim — the format
+   * the compacting machinery produced before this session's changes (a plain
+   * assistant text step stays as-is; no map card, no special final-answer
+   * handling). Runs only when the turn's foldable span is contiguous from the
+   * last per-turn node (no user message / frame in between); otherwise the
+   * caller falls back to per-session folds.
    * @returns true when the consolidation committed.
    */
   const consolidateTurn = (session, turn) => {
     const nodes = Array.from(session.surface.nodes);
     if (nodes.length === 0) return false;
 
-    // The consolidation boundary is the LAST per-turn summary node; the whole
-    // live tail after it (this turn's mid-turn checkpoints + live content) is
-    // folded into the next summary. When no summary exists yet, the boundary is
-    // the nearest boundary node (fresh sessions fold everything since it).
+    // The consolidation boundary is the LAST per-turn consolidation node; the
+    // whole live tail after it (this turn's mid-turn checkpoints + live
+    // content) is folded into the next node. When none exists yet, the boundary
+    // is the nearest boundary node (fresh sessions fold everything since it).
     let boundaryIdx = -1;
     for (let i = nodes.length - 1; i >= 0; i--) {
       const event = session.eventAt ? session.eventAt(nodes[i]) : undefined;
@@ -1085,63 +1100,55 @@ function apply(ctx, config = {}) {
     if (run.length === 0) return false;
     if (!run.some((n) => isFoldableNode(n.event))) return false;
 
-    // Aggregate per turn: calls/results count, seq range, gross tokens.
-    // Live nodes attribute to the current turn; checkpoints carry their own
-    // turn in `source.micro`.
-    const byTurn = new Map();
-    const nodeOf = (n) => {
-      const meta = checkpointMetaOf(n.event);
-      const turnOf = meta !== null && Number.isSafeInteger(meta.turn) ? meta.turn : Number.isSafeInteger(turn) ? turn : 0;
-      let entry = byTurn.get(turnOf);
-      if (entry === undefined) {
-        entry = { tools: 0, tokens: 0, minSeq: n.seq, maxSeq: n.seq };
-        byTurn.set(turnOf, entry);
-      }
-      entry.tokens += meta !== null && Number.isSafeInteger(meta.tokens) ? meta.tokens : (n.price || 0);
-      entry.tools += meta !== null && Number.isSafeInteger(meta.tools) ? meta.tools : toolCallCount(n.message);
-      entry.minSeq = Math.min(entry.minSeq, n.seq);
-      entry.maxSeq = Math.max(entry.maxSeq, n.seq);
+    // Content = the span's foldable nodes compiled with the standard semantics
+    // (assistant text verbatim under `[assistant]` headers, calls/results ->
+    // pointers, reasoning dropped), interleaved in surface order with the
+    // already-compiled mid-turn checkpoints carried over verbatim. Sub-runs are
+    // compiled separately: a checkpoint never splits a call -> result pair (a
+    // fold commits only after both are on the surface), so pairing stays intact.
+    const entries = [];
+    const foldRun = [];
+    let tools = 0;
+    const flushFold = () => {
+      if (foldRun.length === 0) return;
+      const { entries: compiled, stats } = compileNodes(foldRun, resolvedConfig);
+      tools += stats.tools;
+      for (const entry of compiled) entries.push(entry);
+      foldRun.length = 0;
     };
-    for (const n of run) nodeOf(n);
-
-    const lines = [...byTurn.entries()].sort((a, b) => a[0] - b[0]).map(([t, e]) => {
-      return `turn ${t}: ${e.tools} calls/results folded, seq ${e.minSeq}..${e.maxSeq}, ~${e.tokens} tokens`;
-    });
-    // Keep the LAST assistant text of the folded span verbatim so the following
-    // turn's model still sees the previous answer (conversational continuity).
-    let lastText = null;
-    for (let i = run.length - 1; i >= 0; i--) {
-      const message = run[i].message;
-      if (message !== null && message !== undefined && message.role === "assistant" && message.content !== undefined) {
-        const texts = message.content.filter((b) => b !== null && b.type === "text" && b.text.trim().length > 0);
-        if (texts.length > 0) {
-          lastText = texts.map((b) => b.text).join("\n").trim();
-          break;
-        }
+    for (const node of run) {
+      if (isPluginNode(node.event)) {
+        flushFold();
+        const text = checkpointTextOf(node.message);
+        if (text !== null) entries.push({ seq: node.seq, text, kind: "text" });
+      } else {
+        foldRun.push(node);
       }
     }
-    const entries = lines.map((line, i) => ({ seq: run[0].seq, text: line, kind: "text" }));
-    if (lastText !== null && lastText.length > 0 && entries.length > 0) {
-      entries.push({ seq: run[run.length - 1].seq, text: `${lastText} (${seqRef(run[run.length - 1].seq)})`, kind: "text" });
-    }
+    flushFold();
+    if (entries.length === 0) return false;
     const blocks = frameCompiled(entries);
     if (blocks.length === 0 || blocks[0].text.length === 0) return false;
 
+    let tokens = 0;
+    for (const node of run) {
+      const meta = checkpointMetaOf(node.event);
+      if (meta !== null) {
+        if (Number.isSafeInteger(meta.tokens)) tokens += meta.tokens;
+        if (Number.isSafeInteger(meta.tools)) tools += meta.tools;
+      } else {
+        tokens += node.price || 0;
+      }
+    }
     const meta = {
       phase: "turn",
       turn: Number.isSafeInteger(turn) ? turn : 0,
       span: [run[0].seq, run[run.length - 1].seq],
-      tokens: byTurn.size > 0 ? [...byTurn.values()].reduce((acc, e) => acc + e.tokens, 0) : run.reduce((acc, n) => acc + (n.price || 0), 0),
-      tools: byTurn.size > 0 ? [...byTurn.values()].reduce((acc, e) => acc + e.tools, 0) : 0
+      tokens,
+      tools
     };
     commitReplacement(session, run, blocks, meta, "micro (turn/end consolidation)");
     return true;
-  };
-
-  /** Number of tool-call blocks in one message (results count implicitly). */
-  const toolCallCount = (message) => {
-    if (message === null || message === undefined || message.content === undefined) return 0;
-    return message.content.reduce((acc, b) => acc + (b !== null && b.type === "tool-call" ? 1 : 0), 0);
   };
 
   /**
