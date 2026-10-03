@@ -45,7 +45,7 @@
  *     non-empty line(s), each capped at `lineCap` bytes. A per-line ellipsis
  *     plus "[truncated N bytes]" tag marks a capped line; a "[truncated N
  *     lines]" marker separates head from tail when lines were skipped. A single
- *     header line ("[Saved at <locator>] [<stats>]") sits at the top and doubles
+ *     header line ("[Temporary saved at <locator>] [<stats>]") sits at the top and doubles
  *     as the head/tail separator. lineCap is derived from the cap minus
  *     a worst-case overhead so the replacement never exceeds maxInlineBytes by
  *     construction (the best-effort guard below stays as a safety net).
@@ -290,7 +290,7 @@ export function artifactExtension(kind){
  * undefined when the worst-case overhead alone already exceeds `cap` (the
  * caller then keeps the inline content).
  *
- * Layout (top to bottom): a single header line "[Saved at <locator>] [<kind> ·
+ * Layout (top to bottom): a single header line "[Temporary saved at <locator>] [<kind> ·
  * N bytes · M lines · <summary>]", the first `headLines` non-empty lines, a
  * "[truncated N lines]" marker when lines were skipped, then the last
  * `tailLines` non-empty lines. Each sampled line is
@@ -304,7 +304,7 @@ export function composeReplacement({ cap, headLines, tailLines, content, structu
 	// Whitespace in the structural summary is collapsed so the header always
 	// stays on one line (JSON keys / CSV headers may contain real newlines).
 	const rest = structured ? summarizeStructured(structured.kind, structured.value).replace(/\s+/g, " ") : "";
-	const notice1 = `[Saved at ${locator}]`;
+	const notice1 = `[Temporary saved at ${locator}]`;
 	const lineWord = lines === 1 ? "line" : "lines";
 	const notice2 = `[${label} \u00b7 ${totalBytes} bytes \u00b7 ${lines} ${lineWord}${rest ? ` \u00b7 ${rest}` : ""}]`;
 	const header = `${notice1} ${notice2}`;
