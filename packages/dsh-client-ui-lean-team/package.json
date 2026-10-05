@@ -1,7 +1,7 @@
 {
   "name": "@blake-r/dsh-client-ui-lean-team",
   "version": "0.1.0",
-  "description": "DSH Web UI plugin: the Lean Team kanban board's entry — an icon in the conversation header's utilities row that opens the board as a 100%-covering modal (a same-origin iframe at /lean-team/).",
+  "description": "DSH Web UI plugin: the Lean Team kanban board's entry — a labeled pill in the conversation header's utilities row (the glyph plus the visible label \"Lean Team\") that opens the board as a 100%-covering modal (a same-origin iframe at /lean-team/).",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
