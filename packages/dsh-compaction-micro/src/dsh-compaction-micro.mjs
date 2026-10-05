@@ -1514,7 +1514,6 @@ function apply(ctx, config = {}) {
           const replacementSeq = commitReplacement(session, shadowed, blocks, meta, `micro (turn/end, session seqs ${start}-${end})`);
           if (replacementSeq !== null) {
             replaced++;
-            log("info", `re-composed ${shadowed.length} surface nodes (seqs ${start}-${end}) into seq ${replacementSeq}; tool calls: ${stats.tools}, tool results: ${stats.results}, reasoning blocks: ${stats.reasoningRemoved}, text lines: ${stats.text}, media links: ${stats.media}`);
           }
         }
       }
