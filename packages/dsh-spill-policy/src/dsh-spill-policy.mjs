@@ -304,7 +304,7 @@ export function composeReplacement({ cap, headLines, tailLines, content, structu
 	// Whitespace in the structural summary is collapsed so the header always
 	// stays on one line (JSON keys / CSV headers may contain real newlines).
 	const rest = structured ? summarizeStructured(structured.kind, structured.value).replace(/\s+/g, " ") : "";
-	const notice1 = `[Temporary saved at ${locator}] Read the file with the read tool, never with bash (a bash read re-triggers the spill formation).`;
+	const notice1 = `[Result is too long and should be read from ${locator}] Read it with the read tool, never with bash (a bash read re-triggers the spill formation). [Below is the truncated version]`;
 	const lineWord = lines === 1 ? "line" : "lines";
 	const notice2 = `[${label} \u00b7 ${totalBytes} bytes \u00b7 ${lines} ${lineWord}${rest ? ` \u00b7 ${rest}` : ""}]`;
 	const header = `${notice1} ${notice2}`;

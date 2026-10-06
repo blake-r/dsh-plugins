@@ -22,8 +22,9 @@ Divergence from base `@deepseek-ai/dsh-spill-policy`:
 - The preview is a MINIMAL sample, not a budget-filling head/tail slice. A
   capped line gains a "… [truncated N bytes]" suffix; skipped middle lines are
   summarized by a "[truncated N lines]" marker. A single header line —
-  "[Temporary saved at <locator>] Read the file with the read tool, never with
-  bash (a bash read re-triggers the spill formation). [<stats>]" — sits at the
+  "[Result is too long and should be read from <locator>] Read it with the read
+  tool, never with bash (a bash read re-triggers the spill formation). [Below is
+  the truncated version] [<stats>]" — sits at the
   top and doubles as the head/tail separator. The read instruction is part of
   the header, so the model always knows how to read the spill-file back.
 - `lineCap` is derived from `maxInlineBytes` minus a worst-case overhead, so
@@ -34,7 +35,7 @@ Divergence from base `@deepseek-ai/dsh-spill-policy`:
 For an oversized result the replacement reads (top to bottom):
 
 ```
-[Temporary saved at spill/xxx.jsonl] Read the file with the read tool, never with bash (a bash read re-triggers the spill formation). [JSONL · 112788 bytes · 5000 lines · 5000 records · first-record keys: a, b]
+[Result is too long and should be read from spill/xxx.jsonl] Read it with the read tool, never with bash (a bash read re-triggers the spill formation). [Below is the truncated version] [JSONL · 112788 bytes · 5000 lines · 5000 records · first-record keys: a, b]
 {"a": 1, "b": 2}
 {"a": 2, "b": 3}
 [truncated 4997 lines]
@@ -44,11 +45,11 @@ For an oversized result the replacement reads (top to bottom):
 A single line longer than `lineCap` is capped with an ellipsis and a byte count:
 
 ```
-[Temporary saved at spill/data.json] Read the file with the read tool, never with bash (a bash read re-triggers the spill formation). [JSON object · 4029 bytes · 1 line · keys: a, b, c]
+[Result is too long and should be read from spill/data.json] Read it with the read tool, never with bash (a bash read re-triggers the spill formation). [Below is the truncated version] [JSON object · 4029 bytes · 1 line · keys: a, b, c]
 {"a":1,"b":2,"c":[0,1,2,...,348,… [truncated 2725 bytes]
 ```
 
-Plain-text results carry no summary in the stats line: `[Temporary saved at <locator>] Read the file with the read tool, never with bash (a bash read re-triggers the spill formation). [txt · N bytes · M lines]`. Whitespace in the structural summary is collapsed
+Plain-text results carry no summary in the stats line: `[Result is too long and should be read from <locator>] Read it with the read tool, never with bash (a bash read re-triggers the spill formation). [Below is the truncated version] [txt · N bytes · M lines]`. Whitespace in the structural summary is collapsed
 to single spaces, so the header always stays on one line even when JSON keys or
 CSV headers contain newlines.
 
