@@ -13,7 +13,9 @@ artifact back via `read` when it actually needs the data.
 
 Divergence from base `@deepseek-ai/dsh-spill-policy`:
 
-- Much tighter byte cap (`maxInlineBytes`, default 4096 vs the base 50000).
+- Byte cap (`maxInlineBytes` — the deployment's row config sets 131072,
+  matching the read tool's `readMaxBytes`; the code default is 4096 vs the
+  base 50000).
 - Structured results (JSON/JSONL/CSV/TSV/XML/HTML/YAML) get a first-level
   structural summary folded into the stats line; the artifact is saved
   verbatim, never reformatted.
@@ -56,15 +58,16 @@ CSV headers contain newlines.
 ## Mount
 
 The bundle patch disables the base `spill-policy` row and inserts
-`dsh-spill-policy`. The row carries no config: the defaults live in the
-plugin code (`maxInlineBytes: 4096`, `headLines: 2`, `tailLines: 1`,
+`dsh-spill-policy`. The row's config overrides `maxInlineBytes` to 131072
+bytes (32K tokens) — matching the read tool's `readMaxBytes` — while the
+remaining defaults live in the plugin code (`headLines: 2`, `tailLines: 1`,
 `excludeTools: ["read", "skill"]`) and apply whenever no config is specified.
 A profile patch applied after this bundle layer can still override the values:
 
 ```yaml
 - id: dsh-spill-policy
   config:
-    maxInlineBytes: 8192
+    maxInlineBytes: 131072
     headLines: 3
     tailLines: 2
 ```
