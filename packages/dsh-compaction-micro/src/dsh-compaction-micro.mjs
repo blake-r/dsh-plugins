@@ -725,13 +725,15 @@ function apply(ctx, config = {}) {
   // headroomTokens); chunkTokens/lockedChunks are micro-specific.
   const resolvedConfig = {
     includeReasoning: config.includeReasoning === true,
-    // Per-step intermediate fold at `agent/pre-step` (default ON): when the last
-    // completed step carried reasoning + tool calls, fold the whole step pair
-    // [assistant, results] into one user message that removes ONLY the reasoning
-    // blocks (call with full arguments + result text stay fully visible). Synced
-    // with `includeReasoning`: when the user asked to KEEP reasoning, the
-    // intermediate fold never fires (see the runIntermediateFold guard).
-    intermediateFold: config.intermediateFold !== false,
+    // Per-step intermediate fold at `agent/pre-step` (default OFF): when the
+    // last completed step carried reasoning + tool calls, fold the whole step
+    // pair [assistant, results] into one user message that removes ONLY the
+    // reasoning blocks (call with full arguments + result text stay fully
+    // visible). Opt-in via `intermediateFold: true` in the plugin row's
+    // `config`. Synced with `includeReasoning`: when the user asked to KEEP
+    // reasoning, the intermediate fold never fires (see the runIntermediateFold
+    // guard).
+    intermediateFold: config.intermediateFold === true,
     toolKeyArgFields: resolveToolKeyArgFields(config),
     // When true, an abnormal turn end (`error`, `max-tokens`, `aborted`,
     // `blocked`) or a reasoning-only turn folds everything up to the previous
