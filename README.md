@@ -29,6 +29,7 @@ dsh-plugins/
 | [dsh-provider-websearch-lightpanda](packages/dsh-provider-websearch-lightpanda/README.md) | WebRuntime provider pair backed by the lightpanda MCP server. |
 | [dsh-skill-from-tools](packages/dsh-skill-from-tools/README.md) | One skill per tool (no module grouping), short form. |
 | [dsh-tool-filter-root-find](packages/dsh-tool-filter-root-find/README.md) | Gates tool calls that sweep the whole disk or home directory. |
+| [dsh-tool-python](packages/dsh-tool-python/README.md) | `py_run` / `py_pip` tools over a per-workspace venv, with on-the-fly repair of a relocated venv. |
 | [dsh-tool-trajectory-recall](packages/dsh-tool-trajectory-recall/README.md) | Model-facing same-session recall/search tools over the durable session log. |
 
 ## How it works
