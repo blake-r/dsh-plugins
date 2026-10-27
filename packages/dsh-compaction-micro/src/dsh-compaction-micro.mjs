@@ -496,6 +496,56 @@ function compileNodes(nodes, config) {
 }
 
 /**
+ * Build the INTERMEDIATE fold content (the instant reasoning removal): remove
+ * ONLY the `reasoning` blocks, keep everything else fully visible — assistant
+ * text verbatim, each tool call with its FULL arguments, and the tool result
+ * text verbatim — as one plain-text user message. Nothing is collapsed to a
+ * label/pointer here (the full fold recompiles the original frames later; see
+ * consolidateTurn). Media blocks become recall links, mirroring
+ * foldUserAttachments.
+ * @param nodes - ordered step nodes `{ seq, message }` ([assistant, ...results]).
+ * @returns a single text content block, or null when nothing remains.
+ */
+function compileIntermediate(nodes) {
+  const parts = [];
+  for (const node of nodes) {
+    const message = node.message;
+    if (message === null || message === undefined || message.content === undefined) continue;
+    for (const block of message.content) {
+      if (block === null || block === undefined) continue;
+      if (block.type === "reasoning") continue;
+      if (block.type === "text") {
+        const text = sanitize(block.text ?? "");
+        if (text.trim().length === 0) continue;
+        parts.push(text);
+        continue;
+      }
+      if (block.type === "tool-call") {
+        const name = block.name ?? "unknown";
+        const raw = block.arguments;
+        const args = typeof raw === "string" ? raw : raw === undefined ? "" : JSON.stringify(raw);
+        parts.push(`[tool-call] ${name}${args.length > 0 ? ` ${args}` : ""}`);
+        continue;
+      }
+      if (block.type === "image" || block.type === "document") {
+        parts.push(`[${block.type}] (${seqRef(node.seq)})`);
+        continue;
+      }
+      if (block.type === "tool-result") {
+        const text = sanitize(block.text ?? block.content ?? "");
+        if (text.trim().length === 0) continue;
+        parts.push(text);
+        continue;
+      }
+      parts.push(`[${String(block.type)}] (${seqRef(node.seq)})`);
+    }
+  }
+  const text = normalizeWhitespace(parts.join("\n"));
+  if (text.length === 0) return null;
+  return [{ type: "text", text }];
+}
+
+/**
  * Collapse runs of blank lines and trailing whitespace in the joined text.
  * Multiple consecutive blank lines become one, each line's trailing spaces/tabs
  * are trimmed, and leading/trailing blank lines are dropped. Intra-line space
@@ -602,7 +652,7 @@ const SPEC_COMPACTION = "@deepseek-ai/dsh-compaction";
 const DEDUPE_FRAME_KINDS = new Set(["skill-catalog", "agent-instructions", "goal", "runtime-context"]);
 
 /** Phases that advance the fold boundary (everything else is decorative). */
-const BOUNDARY_PHASES = new Set(["mid-turn", "session", "turn"]);
+const BOUNDARY_PHASES = new Set(["mid-turn", "session", "turn", "reasoning"]);
 
 /** Positive integer config field (throws on invalid values at install time). */
 function requirePositiveInt(value, fallback, label) {
@@ -675,6 +725,13 @@ function apply(ctx, config = {}) {
   // headroomTokens); chunkTokens/lockedChunks are micro-specific.
   const resolvedConfig = {
     includeReasoning: config.includeReasoning === true,
+    // Per-step intermediate fold at `agent/pre-step` (default ON): when the last
+    // completed step carried reasoning + tool calls, fold the whole step pair
+    // [assistant, results] into one user message that removes ONLY the reasoning
+    // blocks (call with full arguments + result text stay fully visible). Synced
+    // with `includeReasoning`: when the user asked to KEEP reasoning, the
+    // intermediate fold never fires (see the runIntermediateFold guard).
+    intermediateFold: config.intermediateFold !== false,
     toolKeyArgFields: resolveToolKeyArgFields(config),
     // When true, an abnormal turn end (`error`, `max-tokens`, `aborted`,
     // `blocked`) or a reasoning-only turn folds everything up to the previous
@@ -1084,9 +1141,12 @@ function apply(ctx, config = {}) {
    * @param blocks - replacement content blocks.
    * @param meta - `source.micro` metadata (phase/turn/span/tokens/tools).
    * @param label - log label for the per-op breakdown.
+   * @param foldMode - trajectory fold kind: `"intermediateFold"` for the per-step
+   *   reasoning-removal fold, `"full"` (default) for every other fold. Mirrored
+   *   on the `compaction/summary` event so the trajectory object can tell them apart.
    * @returns the replacement seq, or null when nothing was committed.
    */
-  const commitReplacement = (session, shadowed, blocks, meta, label) => {
+  const commitReplacement = (session, shadowed, blocks, meta, label, foldMode = "full") => {
     if (shadowed.length === 0) return null;
     const shadowedSeqs = shadowed.map((n) => n.seq);
     const start = shadowedSeqs[0];
@@ -1114,6 +1174,7 @@ function apply(ctx, config = {}) {
     const startEvent = session.append("compaction/start", lifecycle);
     const summaryEvent = session.append("compaction/summary", {
       compactionId,
+      foldMode,
       shadowedRange: { start, end },
       shadowedSeqs: [...shadowedSeqs],
       shadowedTokenCount
@@ -1126,7 +1187,21 @@ function apply(ctx, config = {}) {
     session.append("compaction/end", lifecycle);
 
     const netSaved = shadowedTokenCount - estimateMessage(replacementMessage);
-    log("info", `${label}: re-composed ${shadowedSeqs.length} surface nodes (seqs ${start}-${end}) into seq ${replacement.seq}; saved ${netSaved} net tokens (gross ${shadowedTokenCount})`);
+    // The reasoning actually cut from the span (the whole point of the fold when
+    // includeReasoning is off). The log is ours — show it plainly regardless of
+    // the meter's gross/net contract, so the real savings are visible at a glance.
+    let reasoningRemoved = 0;
+    for (const node of shadowed) {
+      const message = node.message;
+      if (message === null || message === undefined || message.content === undefined) continue;
+      for (const block of message.content) {
+        if (block !== null && block !== undefined && block.type === "reasoning") {
+          reasoningRemoved += Math.ceil((block.text ?? "").length / CHARS_PER_TOKEN) + BLOCK_OVERHEAD;
+        }
+      }
+    }
+    const sessionId = typeof session.id === "string" ? session.id : "";
+    log("info", `${label} [session ${sessionId}]: re-composed ${shadowedSeqs.length} surface nodes (seqs ${start}-${end}) into seq ${replacement.seq}; saved ${netSaved} net tokens (gross ${shadowedTokenCount}, reasoning removed ${reasoningRemoved})`);
     return replacement.seq;
   };
 
@@ -1225,6 +1300,127 @@ function apply(ctx, config = {}) {
       price: node.price
     }));
     return { startIdx, endIdx, shadowed, foldableChunks, streamTokens };
+  };
+
+  /**
+   * The intermediate fold (instant reasoning removal): at `agent/pre-step`,
+   * BEFORE the pressure fold, fold the just-completed step — the last
+   * `assistant/message` that carried reasoning + tool calls together with ALL of
+   * its `tool/result` nodes — into ONE user message that removes ONLY the
+   * reasoning blocks (call with full arguments + result text stay fully visible,
+   * see compileIntermediate). The span is pairing-balanced (whole call/result
+   * pairs), so the engine guard accepts it.
+   *
+   * Guards (leave the step live when any fails):
+   *  - `intermediateFold` config is on and `includeReasoning` is off (reasoning
+   *    must not be cut when the user asked to keep it);
+   *  - the last assistant message has reasoning blocks AND at least one tool call;
+   *  - EVERY tool call has its result on the surface (no dangling calls).
+   * The checkpoint advances the fold boundary (phase `"reasoning"`) and is
+   * recompiled from its ORIGINAL frames at the turn/end full fold.
+   */
+  const runIntermediateFold = async (agent, turn) => {
+    try {
+      const session = agent.session;
+      if (session === undefined || session.surface === undefined || typeof session.eventAt !== "function") return;
+      if (!resolvedConfig.intermediateFold || resolvedConfig.includeReasoning) return;
+
+      const nodes = Array.from(session.surface.nodes);
+      if (nodes.length === 0) return;
+
+      // Find the LAST assistant message on the surface (the just-completed step).
+      let assistantIdx = -1;
+      let assistantEvent;
+      for (let i = nodes.length - 1; i >= 0; i--) {
+        const event = session.eventAt ? session.eventAt(nodes[i]) : undefined;
+        if (event !== undefined && event !== null && event.type === "assistant/message") {
+          assistantIdx = i;
+          assistantEvent = event;
+          break;
+        }
+      }
+      if (assistantEvent === undefined) return;
+      const assistantMessage = session.deriveEventMessage(assistantEvent);
+      if (assistantMessage === null || assistantMessage === undefined || assistantMessage.content === undefined) return;
+
+      let hasReasoning = false;
+      const callIds = [];
+      for (const block of assistantMessage.content) {
+        if (block === null || block === undefined) continue;
+        if (block.type === "reasoning") hasReasoning = true;
+        if (block.type === "tool-call" && typeof block.id === "string") callIds.push(block.id);
+      }
+      if (!hasReasoning || callIds.length === 0) return;
+
+      // Collect the assistant + its result nodes (the contiguous tool-result
+      // tail). Bail on ANY inconsistency — a dangling call or a stray node in
+      // the tail means the surface is not a clean completed step, so leave it
+      // live (the pressure fold / turn end handles it later).
+      const shadowed = [];
+      const assistantNode = projectNode(session, nodes[assistantIdx]);
+      if (assistantNode === null) return;
+      shadowed.push(assistantNode);
+      const missing = new Set(callIds);
+      for (let i = assistantIdx + 1; i < nodes.length; i++) {
+        const event = session.eventAt ? session.eventAt(nodes[i]) : undefined;
+        if (event === undefined || event === null || event.type !== "tool/result") break;
+        const node = projectNode(session, nodes[i]);
+        if (node === null) return;
+        const result = toolResultOf(node.message);
+        if (result === null || !missing.has(result.callId)) return;
+        missing.delete(result.callId);
+        shadowed.push(node);
+      }
+      if (missing.size > 0) {
+        log("info", `intermediate: step has ${missing.size} dangling tool call(s); leaving live`);
+        return;
+      }
+
+      // Reasoning-only accumulation: a step that carried ONLY reasoning (no
+      // tool call, no visible text) is left live at its own pre-step — there is
+      // nothing to pair it with, and cutting it would hide the chain of thought
+      // the model may still "Continue" from. But when a tool step finally
+      // completes, fold the CONTIGUOUS reasoning-only assistants directly above
+      // it together with [tool-assistant, ...results] in one pairing-balanced
+      // span. Their reasoning is dropped (compileIntermediate emits nothing for
+      // them), so the fold removes them from the surface without losing any
+      // visible content.
+      for (let i = assistantIdx - 1; i >= 0; i--) {
+        const event = session.eventAt ? session.eventAt(nodes[i]) : undefined;
+        if (event === undefined || event === null || event.type !== "assistant/message") break;
+        const msg = session.deriveEventMessage(event);
+        if (msg === null || msg === undefined || msg.content === undefined) break;
+        let sawReasoning = false;
+        let reasoningOnly = true;
+        for (const block of msg.content) {
+          if (block === null || block === undefined) continue;
+          if (block.type === "reasoning") { sawReasoning = true; continue; }
+          if (block.type === "text" && (block.text ?? "").trim().length === 0) continue;
+          reasoningOnly = false;
+          break;
+        }
+        if (!sawReasoning || !reasoningOnly) break;
+        const node = projectNode(session, nodes[i]);
+        if (node === null) break;
+        shadowed.unshift(node);
+      }
+
+      const blocks = compileIntermediate(shadowed);
+      if (blocks === null || blocks.length === 0) return;
+
+      const meta = {
+        phase: "reasoning",
+        mode: "intermediateFold",
+        turn: Number.isSafeInteger(turn) ? turn : 0,
+        span: [shadowed[0].seq, shadowed[shadowed.length - 1].seq],
+        tokens: shadowed.reduce((acc, n) => acc + (n.price || 0), 0),
+        tools: callIds.length,
+        shadowedSeqs: shadowed.map((n) => n.seq)
+      };
+      commitReplacement(session, shadowed, blocks, meta, `micro (intermediate, pre-step, turn ${turn})`, "intermediateFold");
+    } catch (error) {
+      log("warn", `intermediate fold failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
   };
 
   /**
@@ -1359,9 +1555,11 @@ function apply(ctx, config = {}) {
     // Content = the span's foldable nodes compiled with the standard semantics
     // (assistant text verbatim under `[assistant]` headers, calls/results ->
     // pointers, reasoning dropped), interleaved in surface order with the
-    // already-compiled mid-turn checkpoints carried over verbatim. Sub-runs are
-    // compiled separately: a checkpoint never splits a call -> result pair (a
-    // fold commits only after both are on the surface), so pairing stays intact.
+    // already-compiled checkpoints: intermediate checkpoints are RECOMPILED from
+    // their original frames (mode "intermediateFold" + shadowedSeqs, D5), every
+    // other checkpoint is carried over verbatim. Sub-runs are compiled
+    // separately: a checkpoint never splits a call -> result pair (a fold
+    // commits only after both are on the surface), so pairing stays intact.
     const entries = [];
     const foldRun = [];
     let tools = 0;
@@ -1375,8 +1573,26 @@ function apply(ctx, config = {}) {
     for (const node of run) {
       if (isPluginNode(node.event)) {
         flushFold();
-        const text = checkpointTextOf(node.message);
-        if (text !== null) entries.push({ seq: node.seq, text, kind: "text" });
+        const meta = checkpointMetaOf(node.event);
+        if (meta !== null && meta.mode === "intermediateFold" && Array.isArray(meta.shadowedSeqs) && meta.shadowedSeqs.length > 0) {
+          // Recompile the ORIGINAL frames with full-fold semantics: call args ->
+          // short label, result -> seq pointer, reasoning dropped, adjacent tool
+          // rows joined. The durable log keeps the shadowed seqs addressable.
+          const originals = [];
+          for (const seq of meta.shadowedSeqs) {
+            const projected = projectNode(session, seq);
+            if (projected !== null) originals.push(projected);
+          }
+          if (originals.length > 0) {
+            // The checkpoint's own meta.tools is summed by the accounting loop
+            // below, so this recompile must not add stats.tools again.
+            const { entries: compiled } = compileNodes(originals.map((n) => ({ seq: n.seq, message: n.message })), resolvedConfig);
+            for (const entry of compiled) entries.push(entry);
+          }
+        } else {
+          const text = checkpointTextOf(node.message);
+          if (text !== null) entries.push({ seq: node.seq, text, kind: "text" });
+        }
       } else {
         foldRun.push(node);
       }
@@ -1461,7 +1677,27 @@ function apply(ctx, config = {}) {
       }
 
       const { sessions, attachmentUsers } = pendingWork(session);
-      if (sessions.length === 0 && attachmentUsers.length === 0) return;
+
+      // Early return only when there is truly nothing to do. With the instant
+      // (intermediate) fold, every tool step becomes ONE checkpoint node, so a
+      // session run never reaches 2 nodes (each step = checkpoint + the final
+      // 1-node assistant tail). `consolidateTurn` below still needs to run to
+      // recompile those checkpoints from their originals (D5); without this
+      // relaxation it would never fire and each step would stay a separate
+      // checkpoint forever. Only INTERMEDIATE checkpoints trigger it — an old
+      // turn/session checkpoint alone must not fold a lone text-only answer
+      // (that would be a behavior regression).
+      let hasIntermediate = false;
+      if (sessions.length === 0 && attachmentUsers.length === 0) {
+        for (const seq of session.surface.nodes) {
+          const meta = checkpointMetaOf(session.eventAt ? session.eventAt(seq) : undefined);
+          if (meta !== null && meta.mode === "intermediateFold" && Array.isArray(meta.shadowedSeqs) && meta.shadowedSeqs.length > 0) {
+            hasIntermediate = true;
+            break;
+          }
+        }
+        if (!hasIntermediate) return;
+      }
 
       // Normal turn end: try the per-turn consolidation (3.8) first. It only
       // runs when the turn's foldable span is contiguous from the last per-turn
@@ -1593,6 +1829,7 @@ function apply(ctx, config = {}) {
   // always measures the post-fold surface on the same step.
   ctx.on("agent/pre-step", async ({ agent, turn, step, signal }, next) => {
     try {
+      await runIntermediateFold(agent, turn);
       await runMidTurn(agent, turn, signal);
     } catch (error) {
       log("warn", `mid-turn pre-step handler failed: ${error instanceof Error ? error.message : String(error)}`);
