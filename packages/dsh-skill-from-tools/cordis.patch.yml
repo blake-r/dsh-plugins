@@ -5,5 +5,5 @@
 # patch is applied after this bundle, so per-profile overrides still win.
 
 - insert:
-    - id: dsh-skill-from-tools
+    - id: skill-from-tools
       name: '@blake-r/dsh-skill-from-tools'

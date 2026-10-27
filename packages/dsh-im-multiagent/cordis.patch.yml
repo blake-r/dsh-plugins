@@ -11,6 +11,6 @@
 # by reinstalling the package).
 
 - insert:
-    - id: dsh-im-multiagent
+    - id: im-multiagent
       name: '@blake-r/dsh-im-multiagent'
       disabled: true

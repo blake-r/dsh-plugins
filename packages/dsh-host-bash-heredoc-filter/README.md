@@ -29,7 +29,7 @@ everywhere.
 Web profile `cordis.patch.yml` (host plane):
 
 ```yaml
-- id: dsh-host-bash-heredoc-filter
+- id: host-bash-heredoc-filter
   name: '@blake-r/dsh-host-bash-heredoc-filter'
 ```
 

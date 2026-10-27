@@ -65,7 +65,7 @@ remaining defaults live in the plugin code (`headLines: 2`, `tailLines: 1`,
 A profile patch applied after this bundle layer can still override the values:
 
 ```yaml
-- id: dsh-spill-policy
+- id: spill-policy-replacement
   config:
     maxInlineBytes: 131072
     headLines: 3

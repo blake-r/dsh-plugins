@@ -16,7 +16,7 @@
   disabled: true
 
 - insert:
-    - id: dsh-spill-policy
+    - id: spill-policy-replacement
       name: '@blake-r/dsh-spill-policy'
       config:
         maxInlineBytes: 131072

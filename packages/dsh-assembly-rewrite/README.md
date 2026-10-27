@@ -40,7 +40,7 @@ config:
 Example — rewrite the `exit_plan_mode` tool:
 
 ```yaml
-- id: dsh-assembly-rewrite-exit-plan-mode
+- id: assembly-rewrite-exit-plan-mode
   name: '@blake-r/dsh-assembly-rewrite'
   config:
     namespace: tools
@@ -54,7 +54,7 @@ Example — rewrite the `exit_plan_mode` tool:
 Example — insert the `identity` section after the persona:
 
 ```yaml
-- id: dsh-assembly-rewrite-identity
+- id: assembly-rewrite-identity
   name: '@blake-r/dsh-assembly-rewrite'
   config:
     namespace: sections

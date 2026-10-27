@@ -96,7 +96,7 @@ patch:
 Example:
 
 ```yaml
-- id: dsh-compaction-micro
+- id: compaction-micro
   config:
     compactOnAbnormal: false
 ```

@@ -5,5 +5,5 @@
 # patch is applied after this bundle, so per-profile overrides still win.
 
 - insert:
-    - id: dsh-tool-filter-root-find
+    - id: tool-filter-root-find
       name: '@blake-r/dsh-tool-filter-root-find'

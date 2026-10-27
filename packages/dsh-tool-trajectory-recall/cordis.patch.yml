@@ -9,5 +9,5 @@
 # after this bundle layer), so no duplicate registration occurs. The compaction
 # engine row stays active.
 - insert:
-    - id: dsh-tool-trajectory-recall
+    - id: tool-trajectory-recall
       name: '@blake-r/dsh-tool-trajectory-recall'
