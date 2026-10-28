@@ -45,12 +45,10 @@
 //
 // A turn that ended abnormally — `error`, `max-tokens` ("Output token limit
 // reached"), `aborted`, or `blocked` — or a completed turn whose last assistant
-// message is reasoning-only folds everything up to the previous turn, keeping
-// only the last (problematic) session live so the interrupted reply / chain of
-// thought survives for a "Continue" prompt. This `keepLastSession` behavior is
-// gated behind the `compactOnAbnormal` config flag (default `false`):
-// when disabled, compaction is skipped entirely on such turn ends so past
-// sessions are never compressed on a request failure.
+// message is reasoning-only keeps its reasoning live: the turn/end handler
+// skips compaction entirely on such ends, so a problematic turn's chain of
+// thought always survives for a "Continue" prompt. Reasoning removal is owned
+// by the `intermediateFold` flag; there is no separate abnormal-fold path.
 //
 // ── mid-turn firing (agents/pre-step) ─────────────────────────────────────────
 // A long agent turn never fires `turn/end`, so `dsh-compaction-basic` (a lossy
@@ -168,23 +166,16 @@
 // line now does too.
 //
 // ── abnormal / reasoning-only turn behavior ─────────────────────────────────
-// The `turn/end` trigger treats abnormal ends (`error`, `max-tokens`,
-// `aborted`, `blocked`) AND reasoning-only turns the same way: instead of
-// skipping compaction entirely, it calls `runCompaction(agent,
-// {keepLastSession:true})`, which folds `sessions.slice(0, -1)` — everything up
-// to the previous turn — and keeps only the last session (the problematic turn)
-// live so the interrupted reply / chain of thought survives a "Continue".
-// `runCompaction(agent, opts)` gained the `opts.keepLastSession` flag; the
-// `pendingWork()` list's last span is the current turn's session. For `blocked`
-// (no new session started) the last session is the blocked turn's session and
-// is kept. Normal turns still fold all sessions; attachment folding is
-// unchanged. The per-turn consolidation (3.8) runs only on the NORMAL path.
-//
-// This `keepLastSession` path is gated behind the `compactOnAbnormal`
-// config flag (default `false`). When the flag is `false`, an abnormal or
-// reasoning-only turn end skips compaction entirely — past sessions are never
-// compressed on a request failure. Set `compactOnAbnormal: true` in the
-// plugin row's `config` to restore the original keep-last-session behavior.
+// Reasoning removal is owned by the `intermediateFold` flag: the intermediate
+// fold (when enabled) cleans the turn's reasoning during the run and keeps the
+// last (problematic) step live as the tail for a "Continue". On an abnormal
+// turn end (`error`, `max-tokens`, `aborted`, `blocked`) or a reasoning-only
+// turn there is therefore nothing left to fold — the old `keepLastSession` /
+// `runAbnormalFold` path was removed, so a problematic turn's reasoning ALWAYS
+// stays live (especially with `intermediateFold` off). The `turn/end` handler
+// skips compaction on such ends; normal turns still fold via `runCompaction`.
+// The `compactOnAbnormal` config flag is retained only for config-surface
+// compatibility and is now inert (no-op).
 //
 // ── breakdown log + whitespace normalization ────────────────────────────────
 // The `re-composed N surface nodes ...` log line carries a per-kind breakdown
@@ -735,11 +726,10 @@ function apply(ctx, config = {}) {
     // guard).
     intermediateFold: config.intermediateFold === true,
     toolKeyArgFields: resolveToolKeyArgFields(config),
-    // When true, an abnormal turn end (`error`, `max-tokens`, `aborted`,
-    // `blocked`) or a reasoning-only turn folds everything up to the previous
-    // turn and keeps only the last (problematic) session live. When false
-    // (default), compaction is skipped entirely on such turn ends so past
-    // sessions are never compressed on a request failure.
+    // Retained only for config-surface compatibility; now inert. Reasoning
+    // removal is owned by the `intermediateFold` flag, and a problematic
+    // (abnormal / reasoning-only) turn's reasoning ALWAYS stays live — the
+    // turn/end handler skips compaction on such ends.
     compactOnAbnormal: config.compactOnAbnormal === true,
     chunkTokens: requirePositiveInt(config.chunkTokens, 16384, "chunkTokens"),
     lockedChunks: requirePositiveInt(config.lockedChunks, 2, "lockedChunks"),
@@ -1203,7 +1193,33 @@ function apply(ctx, config = {}) {
       }
     }
     const sessionId = typeof session.id === "string" ? session.id : "";
-    log("info", `${label} [session ${sessionId}]: re-composed ${shadowedSeqs.length} surface nodes (seqs ${start}-${end}) into seq ${replacement.seq}; saved ${netSaved} net tokens (gross ${shadowedTokenCount}, reasoning removed ${reasoningRemoved})`);
+    // The reasoning-only fold (intermediate) removes ONLY reasoning — tool calls
+    // and results are carried over verbatim. Its net saving is reasoningRemoved
+    // PLUS the overhead saved by merging N messages into one (each message −4,
+    // each reasoning block −4, etc.), so `saved` is normally a little LARGER than
+    // the reasoning token count. Show the honest breakdown: reasoning removed and
+    // the merge overhead saving, so the relationship is clear. The full fold
+    // really folds the tools too, so it keeps the true gross plus the full
+    // breakdown: reasoning, tool calls and tool results folded.
+    const reasoningOnly = foldMode === "intermediateFold";
+    let toolCalls = 0;
+    let toolResults = 0;
+    if (!reasoningOnly) {
+      for (const node of shadowed) {
+        const message = node.message;
+        if (message === null || message === undefined || message.content === undefined) continue;
+        for (const block of message.content) {
+          if (block !== null && block !== undefined && block.type === "tool-call") toolCalls++;
+        }
+        if (toolResultOf(message) !== null) toolResults++;
+      }
+    }
+    if (reasoningOnly) {
+      const mergeSavings = netSaved - reasoningRemoved;
+      log("info", `${label} [session ${sessionId}]: re-composed ${shadowedSeqs.length} surface nodes (seqs ${start}-${end}) into seq ${replacement.seq}; saved ${netSaved} net tokens (reasoning ${reasoningRemoved}, merge savings ${mergeSavings})`);
+      return replacement.seq;
+    }
+    log("info", `${label} [session ${sessionId}]: re-composed ${shadowedSeqs.length} surface nodes (seqs ${start}-${end}) into seq ${replacement.seq}; saved ${netSaved} net tokens (gross ${shadowedTokenCount}, reasoning ${reasoningRemoved}, tool calls ${toolCalls}, tool results ${toolResults})`);
     return replacement.seq;
   };
 
@@ -1306,18 +1322,21 @@ function apply(ctx, config = {}) {
 
   /**
    * The intermediate fold (instant reasoning removal): at `agent/pre-step`,
-   * BEFORE the pressure fold, fold the just-completed step — the last
-   * `assistant/message` that carried reasoning + tool calls together with ALL of
-   * its `tool/result` nodes — into ONE user message that removes ONLY the
-   * reasoning blocks (call with full arguments + result text stay fully visible,
-   * see compileIntermediate). The span is pairing-balanced (whole call/result
+   * BEFORE the pressure fold, climb from the END of the surface and fold
+   * EVERYTHING up to the last reasoning-with-a-text-answer (the anchor). The
+   * anchor and everything at or after it stay fully live — its reasoning is the
+   * "latest" the model continues from, so it must stay on the surface. Every
+   * step OLDER than the anchor is folded into ONE user message that removes
+   * ONLY the reasoning blocks (visible text / tool-call arguments / result text
+   * stay, see compileIntermediate), including text-bearing steps, failed steps
+   * and reasoning-only blocks. The span is pairing-balanced (whole call/result
    * pairs), so the engine guard accepts it.
    *
-   * Guards (leave the step live when any fails):
+   * Guards (leave the surface live when any fails):
    *  - `intermediateFold` config is on and `includeReasoning` is off (reasoning
    *    must not be cut when the user asked to keep it);
-   *  - the last assistant message has reasoning blocks AND at least one tool call;
-   *  - EVERY tool call has its result on the surface (no dangling calls).
+   *  - there is at least one assistant step with a text answer + reasoning (the
+   *    anchor) and at least one foldable step older than it.
    * The checkpoint advances the fold boundary (phase `"reasoning"`) and is
    * recompiled from its ORIGINAL frames at the turn/end full fold.
    */
@@ -1330,93 +1349,92 @@ function apply(ctx, config = {}) {
       const nodes = Array.from(session.surface.nodes);
       if (nodes.length === 0) return;
 
-      // Find the LAST assistant message on the surface (the just-completed step).
-      let assistantIdx = -1;
-      let assistantEvent;
-      for (let i = nodes.length - 1; i >= 0; i--) {
-        const event = session.eventAt ? session.eventAt(nodes[i]) : undefined;
-        if (event !== undefined && event !== null && event.type === "assistant/message") {
-          assistantIdx = i;
-          assistantEvent = event;
-          break;
-        }
-      }
-      if (assistantEvent === undefined) return;
-      const assistantMessage = session.deriveEventMessage(assistantEvent);
-      if (assistantMessage === null || assistantMessage === undefined || assistantMessage.content === undefined) return;
+      // The fold boundary: the nearest (from the end) plugin node that advances
+      // the fold. Everything at or before it is already folded, so the anchor
+      // and the fold region live strictly AFTER it — we never climb above the
+      // previous micro-compaction (intermediate or full) back to the surface
+      // start.
+      const boundaryIdx = boundaryIndex(nodes, session);
 
-      let hasReasoning = false;
-      const callIds = [];
-      for (const block of assistantMessage.content) {
-        if (block === null || block === undefined) continue;
-        if (block.type === "reasoning") hasReasoning = true;
-        if (block.type === "tool-call" && typeof block.id === "string") callIds.push(block.id);
-      }
-      if (!hasReasoning || callIds.length === 0) return;
-
-      // Collect the assistant + its result nodes (the contiguous tool-result
-      // tail). Bail on ANY inconsistency — a dangling call or a stray node in
-      // the tail means the surface is not a clean completed step, so leave it
-      // live (the pressure fold / turn end handles it later).
-      const shadowed = [];
-      const assistantNode = projectNode(session, nodes[assistantIdx]);
-      if (assistantNode === null) return;
-      shadowed.push(assistantNode);
-      const missing = new Set(callIds);
-      for (let i = assistantIdx + 1; i < nodes.length; i++) {
+      // Anchor: the LAST assistant step (after the boundary) that carries a
+      // text answer together with reasoning. It and everything newer stay live;
+      // everything older is folded. Climbing from the end guarantees the anchor
+      // is the newest reasoning the model still needs to move forward from.
+      let anchorIdx = -1;
+      for (let i = nodes.length - 1; i > boundaryIdx; i--) {
         const event = session.eventAt ? session.eventAt(nodes[i]) : undefined;
-        if (event === undefined || event === null || event.type !== "tool/result") break;
-        const node = projectNode(session, nodes[i]);
-        if (node === null) return;
-        const result = toolResultOf(node.message);
-        if (result === null || !missing.has(result.callId)) return;
-        missing.delete(result.callId);
-        shadowed.push(node);
-      }
-      if (missing.size > 0) {
-        log("info", `intermediate: step has ${missing.size} dangling tool call(s); leaving live`);
-        return;
-      }
-
-      // Reasoning-only accumulation: a step that carried ONLY reasoning (no
-      // tool call, no visible text) is left live at its own pre-step — there is
-      // nothing to pair it with, and cutting it would hide the chain of thought
-      // the model may still "Continue" from. But when a tool step finally
-      // completes, fold the CONTIGUOUS reasoning-only assistants directly above
-      // it together with [tool-assistant, ...results] in one pairing-balanced
-      // span. Their reasoning is dropped (compileIntermediate emits nothing for
-      // them), so the fold removes them from the surface without losing any
-      // visible content.
-      for (let i = assistantIdx - 1; i >= 0; i--) {
-        const event = session.eventAt ? session.eventAt(nodes[i]) : undefined;
-        if (event === undefined || event === null || event.type !== "assistant/message") break;
+        if (event === undefined || event === null || event.type !== "assistant/message") continue;
         const msg = session.deriveEventMessage(event);
-        if (msg === null || msg === undefined || msg.content === undefined) break;
-        let sawReasoning = false;
-        let reasoningOnly = true;
+        if (msg === null || msg === undefined || msg.content === undefined) continue;
+        let hasText = false;
+        let hasReasoning = false;
         for (const block of msg.content) {
           if (block === null || block === undefined) continue;
-          if (block.type === "reasoning") { sawReasoning = true; continue; }
-          if (block.type === "text" && (block.text ?? "").trim().length === 0) continue;
-          reasoningOnly = false;
+          if (block.type === "reasoning") hasReasoning = true;
+          if (block.type === "text" && (block.text ?? "").trim().length > 0) hasText = true;
+        }
+        if (hasText && hasReasoning) {
+          anchorIdx = i;
           break;
         }
-        if (!sawReasoning || !reasoningOnly) break;
-        const node = projectNode(session, nodes[i]);
-        if (node === null) break;
-        shadowed.unshift(node);
       }
+      if (anchorIdx === -1) return;
+
+      // Fold region: the contiguous foldable run after the boundary, strictly
+      // BEFORE the anchor. Everything there is folded — text-bearing steps,
+      // failed steps and reasoning-only blocks alike (the climb-from-the-end
+      // rule folds all of it, keeping only the anchor + newer live).
+      const startIdx = boundaryIdx + 1;
+      if (startIdx >= anchorIdx) return;
+
+      const shadowed = [];
+      let toolCalls = 0;
+      let started = false;
+      for (let i = startIdx; i < anchorIdx; i++) {
+        const event = session.eventAt ? session.eventAt(nodes[i]) : undefined;
+        if (isFoldableNode(event)) {
+          started = true;
+          const node = projectNode(session, nodes[i]);
+          if (node === null) continue;
+          if (node.message !== null && node.message !== undefined && node.message.content !== undefined) {
+            for (const block of node.message.content) {
+              if (block !== null && block !== undefined && block.type === "tool-call") toolCalls++;
+            }
+          }
+          shadowed.push(node);
+          continue;
+        }
+        if (started) break;
+        // leading non-foldable prefix (system prompt, user question): stays live
+        // above the fold range, skipped.
+      }
+      if (shadowed.length === 0) return;
 
       const blocks = compileIntermediate(shadowed);
       if (blocks === null || blocks.length === 0) return;
 
+      // The checkpoint's turn is the turn of the FOLDED CONTENT, not the current
+      // pre-step turn. When an artificial break (server restart) leaves the
+      // previous turn unconsolidated, the fold region can cross into that turn's
+      // content; labeling it with the current turn would mis-attribute the folded
+      // steps to the wrong turn and the turn/end consolidation would route them
+      // to the wrong per-turn node. Deriving the turn from the shadowed events
+      // keeps the checkpoint honest about which turn it actually folded.
+      let shadowedTurn = Number.isSafeInteger(turn) ? turn : 0;
+      for (const n of shadowed) {
+        if (n.event && n.event.data && Number.isSafeInteger(n.event.data.turn)) {
+          shadowedTurn = n.event.data.turn;
+          break;
+        }
+      }
+
       const meta = {
         phase: "reasoning",
         mode: "intermediateFold",
-        turn: Number.isSafeInteger(turn) ? turn : 0,
+        turn: shadowedTurn,
         span: [shadowed[0].seq, shadowed[shadowed.length - 1].seq],
         tokens: shadowed.reduce((acc, n) => acc + (n.price || 0), 0),
-        tools: callIds.length,
+        tools: toolCalls,
         shadowedSeqs: shadowed.map((n) => n.seq)
       };
       commitReplacement(session, shadowed, blocks, meta, `micro (intermediate, pre-step, turn ${turn})`, "intermediateFold");
@@ -1510,16 +1528,21 @@ function apply(ctx, config = {}) {
     const nodes = Array.from(session.surface.nodes);
     if (nodes.length === 0) return false;
 
-    // The consolidation boundary is the LAST per-turn consolidation node; the
-    // whole live tail after it (this turn's mid-turn checkpoints + live
-    // content) is folded into the next node. When none exists yet, the boundary
-    // is the nearest boundary node (fresh sessions fold everything since it).
+    // The consolidation boundary is the LAST full-compaction node — phase
+    // "turn" or "session" (both are produced by a full fold that already dropped
+    // reasoning). This is exactly the record the intermediate fold stops at when
+    // climbing from the end of the trajectory (boundaryIndex accepts both), so
+    // once a segment is fully compacted the next turn's intermediate fold never
+    // reaches below it. Mid-turn and reasoning checkpoints are NOT boundaries:
+    // they still hold reasoning to be recompiled, so they fold into the current
+    // segment. When no full compaction exists yet (fresh session), the boundary
+    // is the start of the dialog (boundaryIdx stays -1).
     let boundaryIdx = -1;
     for (let i = nodes.length - 1; i >= 0; i--) {
       const event = session.eventAt ? session.eventAt(nodes[i]) : undefined;
       if (!isPluginNode(event)) continue;
       const meta = checkpointMetaOf(event);
-      if (meta !== null && meta.phase === "turn") {
+      if (meta !== null && (meta.phase === "turn" || meta.phase === "session")) {
         boundaryIdx = i;
         break;
       }
@@ -1530,99 +1553,138 @@ function apply(ctx, config = {}) {
       }
     }
 
-    // The contiguous run of fold content after the boundary: foldable nodes and
-// checkpoints of foldable phases (mid-turn / session / turn). Decorative
-// plugin notes (frame-deleted, attachment folds) are skipped as prefix — they
-// stay live and must not start the run, or a user question below them would
-// break the run forever. A foreign node INSIDE the run (mid-turn frame relay,
-// user message) ends it, and the consolidation is skipped in that rare
-// interleaved layout.
-    const run = [];
+    // Build the fold segments after the boundary: each contiguous run of
+    // foldable nodes / checkpoints, split by real user messages (turn starts and
+    // steers). Real user messages stay live; every segment between them folds
+    // into its own per-turn node. Decorative plugin notes and injected frames
+    // are skipped as prefix — they stay live and must not start a segment.
+    const segments = [];
+    let seg = [];
     let started = false;
     for (let i = boundaryIdx + 1; i < nodes.length; i++) {
       const event = session.eventAt ? session.eventAt(nodes[i]) : undefined;
       if (isFoldableNode(event) || isBoundaryNode(event)) {
         started = true;
         const node = projectNode(session, nodes[i]);
-        if (node !== null) run.push(node);
+        if (node !== null) seg.push(node);
         continue;
       }
-      if (started) break;
+      if (event !== undefined && event !== null && event.type === "user/message") {
+        const source = event.data && event.data.source;
+        if (source !== null && source !== undefined && source.kind === "user") {
+          if (seg.length > 0) segments.push(seg);
+          seg = [];
+          started = false;
+          continue;
+        }
+      }
+      if (started) {
+        if (seg.length > 0) segments.push(seg);
+        seg = [];
+        started = false;
+      }
       // leading non-foldable prefix (system prompt, frames, user question,
       // decorative plugin notes): stays live below the replaced range.
     }
-    if (run.length === 0) return false;
-    if (!run.some((n) => isFoldableNode(n.event))) return false;
+    if (seg.length > 0) segments.push(seg);
 
-    // Content = the span's foldable nodes compiled with the standard semantics
-    // (assistant text verbatim under `[assistant]` headers, calls/results ->
-    // pointers, reasoning dropped), interleaved in surface order with the
-    // already-compiled checkpoints: intermediate checkpoints are RECOMPILED from
-    // their original frames (mode "intermediateFold" + shadowedSeqs, D5), every
-    // other checkpoint is carried over verbatim. Sub-runs are compiled
-    // separately: a checkpoint never splits a call -> result pair (a fold
-    // commits only after both are on the surface), so pairing stays intact.
-    const entries = [];
-    const foldRun = [];
-    let tools = 0;
-    const flushFold = () => {
-      if (foldRun.length === 0) return;
-      const { entries: compiled, stats } = compileNodes(foldRun, resolvedConfig);
-      tools += stats.tools;
-      for (const entry of compiled) entries.push(entry);
-      foldRun.length = 0;
-    };
-    for (const node of run) {
-      if (isPluginNode(node.event)) {
-        flushFold();
-        const meta = checkpointMetaOf(node.event);
-        if (meta !== null && meta.mode === "intermediateFold" && Array.isArray(meta.shadowedSeqs) && meta.shadowedSeqs.length > 0) {
-          // Recompile the ORIGINAL frames with full-fold semantics: call args ->
-          // short label, result -> seq pointer, reasoning dropped, adjacent tool
-          // rows joined. The durable log keeps the shadowed seqs addressable.
-          const originals = [];
-          for (const seq of meta.shadowedSeqs) {
-            const projected = projectNode(session, seq);
-            if (projected !== null) originals.push(projected);
-          }
-          if (originals.length > 0) {
-            // The checkpoint's own meta.tools is summed by the accounting loop
-            // below, so this recompile must not add stats.tools again.
-            const { entries: compiled } = compileNodes(originals.map((n) => ({ seq: n.seq, message: n.message })), resolvedConfig);
-            for (const entry of compiled) entries.push(entry);
+    // Fold each segment into its own per-turn node, NEWEST FIRST: each
+    // commitReplacement replaces a contiguous range with one node, so folding
+    // the newest segment keeps the older segments' seqs valid (their ranges are
+    // untouched). Folding oldest-first would invalidate the snapshot mid-loop.
+    let committed = false;
+    for (let k = segments.length - 1; k >= 0; k--) {
+      const run = segments[k];
+      if (run.length === 0) continue;
+      const hasFoldable = run.some((n) => isFoldableNode(n.event));
+      const hasIntermediate = run.some((n) => {
+        const meta = checkpointMetaOf(n.event);
+        return meta !== null && meta.mode === "intermediateFold" && Array.isArray(meta.shadowedSeqs) && meta.shadowedSeqs.length > 0;
+      });
+      if (!hasFoldable && !hasIntermediate) continue;
+
+      // Content = the span's foldable nodes compiled with the standard semantics
+      // (assistant text verbatim under `[assistant]` headers, calls/results ->
+      // pointers, reasoning dropped), interleaved in surface order with the
+      // already-compiled checkpoints: intermediate checkpoints are RECOMPILED
+      // from their original frames (mode "intermediateFold" + shadowedSeqs, D5),
+      // every other checkpoint is carried over verbatim. Sub-runs are compiled
+      // separately: a checkpoint never splits a call -> result pair (a fold
+      // commits only after both are on the surface), so pairing stays intact.
+      const entries = [];
+      const foldRun = [];
+      let tools = 0;
+      const flushFold = () => {
+        if (foldRun.length === 0) return;
+        const { entries: compiled, stats } = compileNodes(foldRun, resolvedConfig);
+        tools += stats.tools;
+        for (const entry of compiled) entries.push(entry);
+        foldRun.length = 0;
+      };
+      for (const node of run) {
+        if (isPluginNode(node.event)) {
+          flushFold();
+          const meta = checkpointMetaOf(node.event);
+          if (meta !== null && meta.mode === "intermediateFold" && Array.isArray(meta.shadowedSeqs) && meta.shadowedSeqs.length > 0) {
+            // Recompile the ORIGINAL frames with full-fold semantics: call args
+            // -> short label, result -> seq pointer, reasoning dropped, adjacent
+            // tool rows joined. The durable log keeps the shadowed seqs
+            // addressable.
+            const originals = [];
+            for (const seq of meta.shadowedSeqs) {
+              const projected = projectNode(session, seq);
+              if (projected !== null) originals.push(projected);
+            }
+            if (originals.length > 0) {
+              // The checkpoint's own meta.tools is summed by the accounting loop
+              // below, so this recompile must not add stats.tools again.
+              const { entries: compiled } = compileNodes(originals.map((n) => ({ seq: n.seq, message: n.message })), resolvedConfig);
+              for (const entry of compiled) entries.push(entry);
+            }
+          } else {
+            const text = checkpointTextOf(node.message);
+            if (text !== null) entries.push({ seq: node.seq, text, kind: "text" });
           }
         } else {
-          const text = checkpointTextOf(node.message);
-          if (text !== null) entries.push({ seq: node.seq, text, kind: "text" });
+          foldRun.push(node);
         }
-      } else {
-        foldRun.push(node);
       }
-    }
-    flushFold();
-    if (entries.length === 0) return false;
-    const blocks = frameCompiled(entries);
-    if (blocks.length === 0 || blocks[0].text.length === 0) return false;
+      flushFold();
+      if (entries.length === 0) continue;
+      const blocks = frameCompiled(entries);
+      if (blocks.length === 0 || blocks[0].text.length === 0) continue;
 
-    let tokens = 0;
-    for (const node of run) {
-      const meta = checkpointMetaOf(node.event);
-      if (meta !== null) {
-        if (Number.isSafeInteger(meta.tokens)) tokens += meta.tokens;
-        if (Number.isSafeInteger(meta.tools)) tools += meta.tools;
-      } else {
-        tokens += node.price || 0;
+      let tokens = 0;
+      for (const node of run) {
+        const meta = checkpointMetaOf(node.event);
+        if (meta !== null) {
+          if (Number.isSafeInteger(meta.tokens)) tokens += meta.tokens;
+          if (Number.isSafeInteger(meta.tools)) tools += meta.tools;
+        } else {
+          tokens += node.price || 0;
+        }
       }
+      // The segment's turn: prefer the turn carried by its content (assistant
+      // messages or intermediate checkpoint metas), falling back to the passed
+      // turn. Correct even when consolidating accumulated content from earlier
+      // turns in one pass.
+      let segTurn = Number.isSafeInteger(turn) ? turn : 0;
+      for (const node of run) {
+        const meta = checkpointMetaOf(node.event);
+        if (meta !== null && Number.isSafeInteger(meta.turn)) { segTurn = meta.turn; break; }
+        if (node.event && node.event.data && Number.isSafeInteger(node.event.data.turn)) { segTurn = node.event.data.turn; break; }
+      }
+      const meta = {
+        phase: "turn",
+        turn: segTurn,
+        span: [run[0].seq, run[run.length - 1].seq],
+        tokens,
+        tools
+      };
+      commitReplacement(session, run, blocks, meta, "micro (turn/end consolidation)");
+      committed = true;
     }
-    const meta = {
-      phase: "turn",
-      turn: Number.isSafeInteger(turn) ? turn : 0,
-      span: [run[0].seq, run[run.length - 1].seq],
-      tokens,
-      tools
-    };
-    commitReplacement(session, run, blocks, meta, "micro (turn/end consolidation)");
-    return true;
+    return committed;
   };
 
   /**
@@ -1703,24 +1765,12 @@ function apply(ctx, config = {}) {
 
       // Normal turn end: try the per-turn consolidation (3.8) first. It only
       // runs when the turn's foldable span is contiguous from the last per-turn
-      // summary; otherwise (or when keepLastSession is set) fall back to the
-      // per-session folds below.
+      // summary; otherwise fall back to the per-session folds below.
       let replaced = 0;
-      if (!opts.keepLastSession) {
-        if (consolidateTurn(session, opts.turn)) replaced = 1;
-      }
+      if (consolidateTurn(session, opts.turn)) replaced = 1;
 
       if (replaced === 0) {
-        // When `keepLastSession` is set (abnormal / reasoning-only turn end), fold
-        // everything up to the previous turn and leave the last session live so
-        // the interrupted reply / chain of thought survives for a "Continue".
-        const foldSessions = opts.keepLastSession ? sessions.slice(0, -1) : sessions;
-        if (opts.keepLastSession && sessions.length > 0) {
-          const kept = sessions[sessions.length - 1];
-          log("info", `keepLastSession: keeping session (seqs ${kept[0]}-${kept[kept.length - 1]}) live; folding ${foldSessions.length} prior session(s)`);
-        }
-
-        for (const span of foldSessions) {
+        for (const span of sessions) {
           if (spanOnlyReasoning(session, span)) {
             log("info", `session (seqs ${span[0]}-${span[span.length - 1]}) is reasoning-only; no compaction`);
             continue;
@@ -1743,7 +1793,7 @@ function apply(ctx, config = {}) {
           const end = shadowed[shadowed.length - 1].seq;
           const turnOfSpan = Number.isSafeInteger(opts.turn) ? opts.turn : (shadowed[0].event.data && shadowed[0].event.data.turn);
           const meta = {
-            phase: opts.keepLastSession ? "session" : "session",
+            phase: "session",
             turn: Number.isSafeInteger(turnOfSpan) ? turnOfSpan : 0,
             span: [start, end],
             tokens: shadowed.reduce((acc, n) => acc + (n.price || 0), 0),
@@ -1848,9 +1898,12 @@ function apply(ctx, config = {}) {
   // When the turn ended abnormally — `error` (request failed), `max-tokens`
   // ("Output token limit reached": reply cut off), `aborted` (cancelled
   // mid-turn), `blocked` (rejected before any step ran) — or when the last
-  // assistant message of a completed turn is reasoning only, fold everything up
-  // to the previous turn and keep only the last (problematic) session live so
-  // the interrupted reply / chain of thought survives for a "Continue" prompt.
+  // assistant message of a completed turn is reasoning only, compaction is
+  // SKIPPED entirely: reasoning removal is owned by the `intermediateFold`
+  // flag, and a problematic turn's reasoning ALWAYS stays live (especially
+  // with `intermediateFold` off) so the interrupted reply / chain of thought
+  // survives for a "Continue" prompt. The old `keepLastSession` /
+  // `runAbnormalFold` paths were removed; `compactOnAbnormal` is now inert.
   ctx.on("session/event", (session, event) => {
     try {
       if (event.type !== "turn/end") return;
@@ -1869,19 +1922,9 @@ function apply(ctx, config = {}) {
       // first; the surface is already complete by then.
       queueMicrotask(() => {
         try {
-          // A request that did not end successfully — `error` (request failed),
-          // `max-tokens` (reply cut off), `aborted` (cancelled mid-turn),
-          // `blocked` (rejected before any step ran) — or a reasoning-only turn
-          // (last message is just a chain of thought) folds everything up to the
-          // previous turn and keeps only the last (problematic) session live so
-          // the interrupted reply / chain of thought survives for a "Continue".
           if (abnormal || reasoningOnly) {
-            if (resolvedConfig.compactOnAbnormal) {
-              log("info", `turn ${turn} ended ${abnormal ? `with ${kind}` : "reasoning-only"}: folding up to previous turn, keeping last session`);
-              runCompaction(agent, { keepLastSession: true, turn });
-            } else {
-              log("info", `turn ${turn} ended ${abnormal ? `with ${kind}` : "reasoning-only"}: compactOnAbnormal disabled, skipping compaction`);
-            }
+            // Reasoning stays live on a problematic turn end — nothing to fold.
+            log("info", `turn ${turn} ended ${abnormal ? `with ${kind}` : "reasoning-only"}: keeping reasoning live, skipping compaction`);
           } else {
             runCompaction(agent, { turn });
           }

@@ -65,14 +65,22 @@ algorithm this plugin adapts for per-request trajectory re-composition.
 The plugin reads its options from the plugin row's `config` in the profile
 patch:
 
-- `compactOnAbnormal` (boolean, default `false`): when a turn ends
-  abnormally (`error`, `max-tokens`, `aborted`, `blocked`) or reasoning-only,
-  the plugin normally folds everything up to the previous turn and keeps only
-  the last (problematic) session live so the interrupted reply / chain of
-  thought survives a "Continue". Set this flag to `true` to enable that
-  keep-last-session behavior. When `false` (the default), compaction is skipped
-  entirely on such turn ends, so past sessions are never compressed on a
-  request failure.
+- `compactOnAbnormal` (boolean, default `false`): **inert** — retained only for
+  config-surface compatibility. Reasoning removal is owned by `intermediateFold`:
+  on an abnormal turn end (`error`, `max-tokens`, `aborted`, `blocked`) or a
+  reasoning-only turn, the plugin skips compaction entirely and the turn's
+  reasoning ALWAYS stays live (especially with `intermediateFold` off), so the
+  interrupted reply / chain of thought survives for a "Continue" prompt.
+- `intermediateFold` (boolean, default `false`): at `agent/pre-step`, climb from
+  the END of the surface and fold EVERYTHING up to the last reasoning-with-a-
+  text-answer (the anchor) into one user message that removes ONLY the reasoning
+  blocks (visible text / tool-call arguments / result text stay fully visible).
+  The anchor and everything at or after it stay fully live — its reasoning is
+  the "latest" the model continues from, so it always stays on the surface.
+  Every step OLDER than the anchor is folded, including text-bearing steps,
+  failed steps and reasoning-only blocks. The fold fires only when there is at
+  least one assistant step with a text answer + reasoning (the anchor) and at
+  least one foldable step older than it.
 - `includeReasoning` (boolean, default `false`): when `true`, assistant
   `reasoning` blocks are kept verbatim in the folded output instead of being
   dropped. Mid-turn checkpoints always drop reasoning (Q24) regardless of
@@ -98,7 +106,7 @@ Example:
 ```yaml
 - id: compaction-micro
   config:
-    compactOnAbnormal: false
+    intermediateFold: true
 ```
 
 ## Development
