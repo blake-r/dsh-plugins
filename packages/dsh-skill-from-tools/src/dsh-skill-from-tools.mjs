@@ -24,9 +24,21 @@
 // `ask_user_question`) — which contain underscores — throws `invalid skill
 // name`, and the exception thrown inside the `system-prompt/assemble` waterfall
 // listener aborts the WHOLE waterfall → NO skills registered at all (empty
-// catalog, "skills disappeared"). Fix: EVERY skill gets a `t<hex><initials>` id;
-// the real tool name lives only in the `description`. Never use a raw tool name
-// as a skill id — always route through the `t<hex><initials>` scheme.
+// catalog, "skills disappeared"). Fix: every skill id is a SLUG of the tool name
+// (`todo_write` → `todo-write`, `mcp__browser__click` → `mcp-browser-click`).
+//
+// STABILITY: the id is derived from the TOOL NAME ONLY — never from its index in
+// the assembly's tools array. The array order changes between assembles (MCP
+// tools appear later than built-ins), so an index-based id (`t<hex><initials>`)
+// produced a DIFFERENT id for the same tool on a later assemble; the per-agent
+// "already registered" guard then missed and the whole catalog was registered a
+// second time under new ids — visible as duplicate entries (`t30nn`/`t31nn` for
+// one tool). A name-derived id is stable across assembles and orders.
+//
+// COLLISIONS: two different tool names can slug to the same id (`mcp__a__b` vs
+// `mcp-a-b`). A pre-pass over all tools detects that and appends a short hash of
+// the full tool name to EVERY colliding id, so the result does not depend on
+// which one comes first.
 //
 // SCOPE: this plugin ONLY moves tool details out of the LLM context into
 // skills. It does NOT strip the `tool:<name>` prose sections out of the system
@@ -69,14 +81,43 @@ const inject = ["skills", "systemPrompt", "tools"];
 // invocable and skill-backed.
 const EXCLUDED = new Set(["skill"]);
 
-// Lowercased first letters of each word of a name (camelCase + separators).
-function initials(nameStr) {
-  const words = nameStr
-    .replaceAll(/([a-z0-9])([A-Z])/g, "$1 $2")
-    .replaceAll(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
-    .split(/[^a-zA-Z0-9]+/)
-    .filter(Boolean);
-  return words.map((w) => w[0].toLowerCase()).join("");
+// Skill-id slug: lowercase alphanumerics joined by single hyphens, which is
+// exactly the skill-name grammar.
+function slugify(text) {
+  const slug = text
+    .toLowerCase()
+    .replaceAll(/[^a-z0-9]+/g, "-")
+    .replaceAll(/^-+|-+$/g, "");
+  return slug.length > 0 ? slug : "tool";
+}
+
+// Stable 6-hex-digit FNV-1a digest of a tool name; used only to disambiguate
+// slugs that collide.
+function shortHash(text) {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0").slice(0, 6);
+}
+
+// Map tool name → skill id for one assembly. Ids depend on the tool NAMES only,
+// so they stay identical across assembles regardless of array order.
+function skillIds(tools) {
+  const slugs = new Map();
+  const counts = new Map();
+  for (const tool of tools) {
+    const slug = slugify(tool.name);
+    slugs.set(tool.name, slug);
+    counts.set(slug, (counts.get(slug) ?? 0) + 1);
+  }
+  const ids = new Map();
+  for (const tool of tools) {
+    const slug = slugs.get(tool.name);
+    ids.set(tool.name, counts.get(slug) > 1 ? `${slug}-${shortHash(tool.name)}` : slug);
+  }
+  return ids;
 }
 
 // First sentence of a description; '' when empty.
@@ -184,10 +225,9 @@ function apply(ctx) {
         registeredByAgent.set(agent, registered);
       }
     }
-    const hexWidth = Math.max(1, (all.length - 1).toString(16).length);
-    let index = 0;
+    const ids = skillIds(all);
     for (const tool of all) {
-      const skillName = `t${index.toString(16).padStart(hexWidth, "0")}${initials(tool.name)}`;
+      const skillName = ids.get(tool.name);
       const alreadyRegistered = registered !== undefined && registered.has(skillName);
       // Capture the FULL description and VERBATIM schema BEFORE the tools zone
       // is shortened, so the skill content keeps the complete detail layer.
@@ -207,12 +247,12 @@ function apply(ctx) {
       if (tool.parameters !== undefined && tool.parameters !== null && typeof tool.parameters === "object") {
         tool.parameters = stripSchema(tool.parameters);
       }
-      if (alreadyRegistered) { index++; continue; }
+      if (alreadyRegistered) continue;
       // Catalog: a bare comment naming the tool, no schema — the schema lives
       // in the tools zone and the full detail layer lives in the content.
       const description = `Tool details for \`${tool.name}\`.`;
       const content = toolBlock(tool.name, fullDesc, verbatimSchema, proseByTool.get(tool.name));
-      if (content.length === 0) { index++; continue; }
+      if (content.length === 0) continue;
       const skill = {
         name: skillName,
         description,
@@ -236,7 +276,6 @@ function apply(ctx) {
         // the plugin's own context so the tool still becomes a skill.
         ctx.skills.register(skill);
       }
-      index++;
     }
     // Authoritative: every tool stays in the LLM request's tools array — the
     // skills are a detail layer, not a replacement. No filtering here.
