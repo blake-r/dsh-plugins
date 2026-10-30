@@ -188,16 +188,26 @@ function apply(ctx) {
     let index = 0;
     for (const tool of all) {
       const skillName = `t${index.toString(16).padStart(hexWidth, "0")}${initials(tool.name)}`;
-      if (registered !== undefined && registered.has(skillName)) { index++; continue; }
+      const alreadyRegistered = registered !== undefined && registered.has(skillName);
       // Capture the FULL description and VERBATIM schema BEFORE the tools zone
       // is shortened, so the skill content keeps the complete detail layer.
       const fullDesc = typeof tool.description === "string" ? tool.description.replaceAll(/\s+/g, " ").trim() : "";
       const verbatimSchema = schemaDump(tool.parameters);
       // Tools zone: short description + minimal schema (annotations stripped).
+      //
+      // MUST run on EVERY assemble, not only on the first one. The assembly is
+      // rebuilt from the tool providers before each waterfall run and every
+      // schema is `structuredClone`d there, so the shortening applied to a
+      // previous assembly never survives into the next step. Guarding this
+      // block with `alreadyRegistered` left every step after the first with
+      // FULL descriptions and fully annotated schemas — the plugin looked dead.
+      // Only the SKILL registration is idempotent; the tools-zone shortening is
+      // per-assembly and unconditional.
       tool.description = firstSentence(tool.description);
       if (tool.parameters !== undefined && tool.parameters !== null && typeof tool.parameters === "object") {
         tool.parameters = stripSchema(tool.parameters);
       }
+      if (alreadyRegistered) { index++; continue; }
       // Catalog: a bare comment naming the tool, no schema — the schema lives
       // in the tools zone and the full detail layer lives in the content.
       const description = `Tool details for \`${tool.name}\`.`;
