@@ -1,0 +1,17 @@
+# @blake-r/dsh-loop-guard bundle patch.
+# Declaring `dsh.bundle` in package.json makes `dsh plugin add` treat this
+# package as a profile layer: it is added to `dsh.profile.bundles`
+# automatically and this patch is applied as a layer. The user's profile
+# patch is applied after this bundle, so per-profile overrides still win.
+#
+# One package, two plugin rows. Both rows share the internal coordination
+# module (src/dsh-loop-guard-shared.mjs) but stay independent plugins with
+# their own ids and configs. The profile patch keeps the two configs separate
+# (they are NOT merged): the reasoning-loop-guard row and the
+# repeat-pattern-reminder row each carry their own thresholds and options.
+
+- insert:
+    - id: dsh-host-reasoning-loop-guard
+      name: '@blake-r/dsh-loop-guard/reasoning-loop-guard'
+    - id: dsh-host-repeat-pattern-reminder
+      name: '@blake-r/dsh-loop-guard/repeat-pattern-reminder'

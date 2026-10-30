@@ -1,0 +1,24 @@
+{
+  "name": "@blake-r/dsh-command-status-interrupt",
+  "version": "0.1.0",
+  "description": "DSH host plugin: a /status command that aborts the running generation and asks the model for a progress report without opening a new turn or a user bubble.",
+  "type": "module",
+  "main": "src/dsh-command-status-interrupt.mjs",
+  "exports": {
+    ".": "./src/dsh-command-status-interrupt.mjs"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "node --check src/dsh-command-status-interrupt.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
