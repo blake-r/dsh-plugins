@@ -1,6 +1,6 @@
 {
   "name": "@blake-r/dsh-spill-policy",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Replacement spill policy: bound oversized model-facing tool results to a head/tail preview plus a spill notice.",
   "type": "module",
   "main": "src/dsh-spill-policy.mjs",
