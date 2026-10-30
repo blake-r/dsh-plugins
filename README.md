@@ -32,7 +32,7 @@ dsh-plugins/
 | [dsh-loop-guard](packages/dsh-loop-guard/README.md) | One package, two plugin rows: a reasoning-loop guard and a repeat-pattern reminder, sharing an internal coordination module. |
 | [dsh-spill-policy](packages/dsh-spill-policy/README.md) | Replacement spill policy: bound oversized model-facing tool results to a head/tail preview plus a spill notice. |
 | [dsh-provider-websearch-lightpanda](packages/dsh-provider-websearch-lightpanda/README.md) | WebRuntime provider pair backed by the lightpanda MCP server. |
-| [dsh-skill-from-tools](packages/dsh-skill-from-tools/README.md) | One skill per tool (no module grouping), short form. |
+| [dsh-skill-from-tools](packages/dsh-skill-from-tools/README.md) | Tools stay directly invocable; one skill per tool holds full details. |
 | [dsh-tool-filter-root-find](packages/dsh-tool-filter-root-find/README.md) | Gates tool calls that sweep the whole disk or home directory. |
 | [dsh-tool-mcp-mutation-gate](packages/dsh-tool-mcp-mutation-gate/README.md) | MCP command filter that asks the user for confirmation before executing a server's mutating tools. |
 | [dsh-tool-node](packages/dsh-tool-node/README.md) | `node_run` / `node_npm` tools confined through the DSH sandbox seam. |

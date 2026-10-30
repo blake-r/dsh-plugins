@@ -1,75 +1,23 @@
-// dsh-skill-from-tools — one skill per tool (no module grouping). Every
-// non-`skill` tool becomes its own skill. The skill `description` carries the
-// SHORT form: first sentence + the parameter schema as a COMPACT literal in the
-// `/`-marked notation below. The skill `content` carries the tool's MINIFIED
-// JSON SCHEMA, dumped verbatim from the tool registry.
+// dsh-skill-from-tools — every non-`skill` tool stays directly invocable in the
+// LLM request's `tools` array, and ALSO becomes a skill that holds the tool's
+// full details as an on-demand detail layer.
 //
-// COMPACT SCHEMA NOTATION (per user spec):
-//   - the `/.../` marker delimits ONE TYPE ATOM: a type name (`/string/`),
-//     `undef`, a double-quoted literal (`/"new"/`), or a reference
-//     (`/$ref:Thing/`). No operator ever appears inside a marker, so a literal
-//     whose own value contains `|` or `&` can never be confused with one.
-//   - `|` joins alternatives BETWEEN markers: `"cursor":/undef/|/string/|/null/`.
-//   - `&` joins requirements that hold TOGETHER and binds tighter than `|`:
-//     `"kid":/object/&/$ref:Node/`. Parentheses regroup the other way:
-//     `(/A/|/B/)&(/C/|/D/)`.
-//   - optional field: `"description":/undef/|/string/` — `undef` (may be absent)
-//     is an ordinary alternative. A const field never takes it: a const is a
-//     fixed value, not an optional slot.
-//   - enum/const: one marked, double-quoted literal per value —
-//     `"action":/"edit"/|/"pause"/|/"resume"/`. The literal is a JSON STRING
-//     LITERAL (`JSON.stringify`), so a value containing a double quote or a
-//     backslash is escaped rather than breaking the notation (`say "hi"` ->
-//     `/"say \"hi\""/`); a value containing `/` is held by its own quotes,
-//     since the marker has no escape sequence.
-//   - containers are self-delimiting and stand as whole alternatives:
-//     `"questions":[{"id":/string/,"header":/undef/|/string/}]` (array of
-//     objects), `"daily":/undef/|{"time":/string/,"time_zone":/string/}`
-//     (optional object). Object fields carry their own expressions; an array's
-//     element does too — an element cannot be absent, so `undef` never appears
-//     in that position.
-//   - `null` is a VALID value (distinct from `undef` absence) and is never
-//     folded into `undef`.
-//   - `json` marks a node declaring no type this renderer can read: an empty
-//     schema, a node carrying only annotations, an unknown keyword. It matches
-//     the harness's own DSL keyword `type: "json"` (which compiles to a node
-//     with no `type`); its TS renderer calls the same node `JsonValue`.
-//   - `$ref` renders as the LAST token of its JSON Pointer, exactly as written
-//     (`#/definitions/Thing` -> `/$ref:Thing/`, `#/definitions/a~1b` ->
-//     `/$ref:a~1b/`). The pointer is never followed, so only a name is shown and
-//     a cyclic schema cannot recurse. The empty pointer — `"#"`, the document
-//     root, the standard recursion idiom — renders as `/$ref:root/`; a trailing
-//     slash names the empty-string key and renders as `/$ref:/`; a target in
-//     ANOTHER document (`"https://x/y.json"`, no fragment) and a non-string
-//     `$ref` render as `/json/`.
-//   - a node carrying `$ref` BESIDE a structural keyword is a CONJUNCTION (`$ref`
-//     and its siblings both apply from 2019-09 on), rendered with `&`, the
-//     structural part first. A union there would accept values the schema
-//     rejects: `{$ref: X(integer), type: "string"}` accepts nothing, while
-//     `/$ref:X/|/string/` reads as "either an integer or a string".
-//   - `anyOf` renders exactly like `oneOf` — both are a union of their branches
-//     (`anyOf` differs only in allowing overlapping branches, which the `|`
-//     notation never claims to exclude). A node carrying BOTH renders as
-//     `(/oneOf branches/)&(/anyOf branches/)`.
-//   - a type ARRAY (`type: ["string","null"]`) is legal JSON Schema but can
-//     only reach this plugin through a raw `register()`: an MCP server's
-//     `inputSchema` is registered unchanged (`@deepseek-ai/dsh-mcp-client`
-//     passes it through), while the harness subset rejects `type` arrays for
-//     authored tools (`@deepseek-ai/dsh-tools`: "type must be a single type
-//     string"). Such a node renders as the union of its names, with an `array`
-//     branch expanded through `items`: `["string","array"]` + `items:string`
-//     becomes `/string/|[/string/]`.
-//   - tuple `items` (an array of schemas) renders as the union of its position
-//     types inside the brackets — the positions themselves are not expressed.
+// TOOLS ZONE (assembly.tools): each tool keeps a SHORT form — the first
+// sentence of its description — and a MINIMAL JSON Schema. The schema stays a
+// real object (the LLM tool-call layer consumes `parameters` as JSON Schema, so
+// a compact string would break argument generation). Every annotation is
+// stripped recursively — `description`, `title`, `examples`, `default`,
+// `$comment`, `enumDescriptions` — while all structure is kept: `type`,
+// `required`, `enum`/`const` VALUES, `items`, `properties`, `$ref`,
+// `oneOf`/`anyOf`. The enum/const values are never dropped, only the prose
+// around them.
 //
-// CONTENT FORM: the content block carries the parameters as MINIFIED JSON
-// SCHEMA (`JSON.stringify`), not a hand-written annotated rendering. JSON is
-// the format every model already reads, and a serializer cannot lose or
-// misreport a node the way a custom renderer can — the `type: [...]` collapse
-// above is exactly that class of bug. The explicit `Arguments (JSON Schema):`
-// label names the dialect, so the line is not mistaken for prose. The catalog
-// line stays compact because it is the only part always in context; the
-// content block is read on demand, when the model opens the skill.
+// SKILLS: one skill per tool (except `skill` itself). The catalog `description`
+// is a bare comment — `Tool details for \`X\`.` — with no schema, so the catalog
+// stays tiny. The skill `content` carries the FULL description, the
+// `tool:<name>` prose guidance from the assembly, and the VERBATIM (fully
+// annotated) JSON Schema under an explicit `Arguments (JSON Schema):` label.
+// `whenToUse` signals the skill is a DETAIL reference, not an invocation path.
 //
 // CRITICAL: skill ids MUST be valid per the grammar `^[a-z0-9]+(?:-[a-z0-9]+)*$`.
 // Registering with `name: tool.name` (e.g. `todo_write`, `exit_plan_mode`,
@@ -80,12 +28,11 @@
 // the real tool name lives only in the `description`. Never use a raw tool name
 // as a skill id — always route through the `t<hex><initials>` scheme.
 //
-// SCOPE: this plugin ONLY moves tools out of the LLM context into skills. It
-// folds each tool's `tool:<name>` prose guidance section (from the assembly)
-// into the skill's content block, but does NOT strip those sections out of the
-// system prompt — cleaning them out is a separate concern (see the profile's
-// cordis.patch.yml). Keeping the two concerns separate means each plugin has a
-// single responsibility.
+// SCOPE: this plugin ONLY moves tool details out of the LLM context into
+// skills. It does NOT strip the `tool:<name>` prose sections out of the system
+// prompt — that is `dsh-assembly-tools-prompt-strip`'s job (kept as-is).
+// Keeping the two concerns separate means each plugin has a single
+// responsibility.
 //
 // REALM / SCOPE: this plugin is a HOST plugin (mounted in the profile's bundle
 // list), so its `system-prompt/assemble` listener is registered on the
@@ -118,7 +65,8 @@
 // skills. The skill id and description already name the tool.
 const name = "dsh-skill-from-tools";
 const inject = ["skills", "systemPrompt", "tools"];
-// The `skill` loader stays in the prompt; every other tool is hidden.
+// The `skill` loader stays in the prompt; every other tool is both directly
+// invocable and skill-backed.
 const EXCLUDED = new Set(["skill"]);
 
 // Lowercased first letters of each word of a name (camelCase + separators).
@@ -131,124 +79,6 @@ function initials(nameStr) {
   return words.map((w) => w[0].toLowerCase()).join("");
 }
 
-// One marked atom. The marker delimits a single type atom — a type name, a
-// double-quoted literal, `undef`, or `$ref:<name>` — so an operator never
-// appears inside it and a literal's own characters can never collide with one.
-function atom(text) {
-  return `/${text}/`;
-}
-
-// `$ref` as a marked atom. The pointer is never followed (a cyclic schema must
-// not recurse), so only its last token is rendered, exactly as written in the
-// pointer. The empty pointer names the document root; a target outside this
-// document and a non-string `$ref` fall back to `json`. An empty last token (a
-// trailing slash) names the empty-string key, so it renders as `$ref:` with an
-// empty name.
-function refPart(ref) {
-  if (typeof ref !== "string") return atom("json");
-  const hash = ref.indexOf("#");
-  if (hash === -1) return atom("json");
-  const pointer = ref.slice(hash + 1);
-  if (pointer === "") return atom("$ref:root");
-  const last = pointer.startsWith("/") ? pointer.split("/").at(-1) : pointer;
-  return atom(`$ref:${last}`);
-}
-
-// Union of a branch list, or '' when the list is absent or empty.
-function unionOf(list) {
-  if (!Array.isArray(list) || list.length === 0) return "";
-  return list.map(typeExpr).join("|");
-}
-
-// Parenthesize only where a tighter `&` would otherwise regroup a `|`.
-function group(text) {
-  return text.includes("|") ? `(${text})` : text;
-}
-
-// A literal value as a JSON string literal, escaped by the JSON serializer: a
-// value containing a double quote or a backslash cannot break the notation
-// (`say "hi"` -> `/"say \"hi\""/`). A value containing `/` stays intact because
-// the quotes delimit it — the marker itself has no escape sequence.
-function literal(value) {
-  return JSON.stringify(String(value));
-}
-
-// Structural part of a node: const/enum, unions, containers, a type name.
-// Returns '' when the node declares nothing this renderer can read.
-function structuralExpr(node) {
-  if (node.const !== undefined) return atom(literal(node.const));
-  if (Array.isArray(node.enum) && node.enum.length > 0) {
-    return node.enum.map((value) => atom(literal(value))).join("|");
-  }
-  const oneOf = unionOf(node.oneOf);
-  const anyOf = unionOf(node.anyOf);
-  if (oneOf && anyOf) return `${group(oneOf)}&${group(anyOf)}`;
-  if (oneOf || anyOf) return oneOf || anyOf;
-  if (node.type === "object" && node.properties) return compactFields(node);
-  if (node.type === "array" && node.items !== undefined) return `[${itemExpr(node.items)}]`;
-  if (Array.isArray(node.type)) {
-    return node.type
-      .map((t) => (t === "array" && node.items !== undefined ? `[${itemExpr(node.items)}]` : atom(String(t))))
-      .join("|");
-  }
-  if (typeof node.type === "string") return atom(node.type);
-  if (node.items !== undefined) return `[${itemExpr(node.items)}]`;
-  return "";
-}
-
-// One array's element expression. An element cannot be absent, so `undef` never
-// appears here; tuple `items` (an array of schemas) renders as the union of its
-// position types — the positions themselves are not expressed.
-function itemExpr(items) {
-  if (Array.isArray(items)) return items.map(typeExpr).join("|");
-  return typeExpr(items);
-}
-
-// Type expression for one schema node: marked atoms joined by `|`, containers
-// self-delimiting, and a `$ref` beside a structural keyword conjoined with `&`
-// (structural part first). An unreadable node renders as `/json/`.
-function typeExpr(node) {
-  if (node === null || typeof node !== "object") return atom("json");
-  const aspects = [];
-  const structural = structuralExpr(node);
-  if (structural) aspects.push(structural);
-  if (node.$ref !== undefined) aspects.push(refPart(node.$ref));
-  if (aspects.length === 0) return atom("json");
-  if (aspects.length === 1) return aspects[0];
-  return aspects.map(group).join("&");
-}
-
-// One field's expression: `undef` is an ordinary alternative in front of the
-// type, except on a const field (a fixed value, not an optional slot).
-function fieldExpr(node, isRequired) {
-  const body = typeExpr(node);
-  if (node !== null && typeof node === "object" && node.const !== undefined) return body;
-  return isRequired ? body : `${atom("undef")}|${body}`;
-}
-
-// Compact object literal for a compiled `{type:"object",properties,required}`:
-// every field is `"key":<expression>`, and its own expression carries the
-// markers.
-function compactFields(node) {
-  const props = node.properties ?? {};
-  const required = new Set(Array.isArray(node.required) ? node.required : []);
-  const parts = Object.keys(props).map((key) => `"${key}":${fieldExpr(props[key], required.has(key))}`);
-  return `{${parts.join(",")}}`;
-}
-
-// Compact schema literal for a tool's parameters; '' when there are none.
-function compactSchema(parameters) {
-  if (parameters === undefined || parameters === null || typeof parameters !== "object") return "";
-  return compactFields(parameters);
-}
-
-// Minified JSON Schema for a tool's parameters, verbatim from the registry;
-// '' when there are none.
-function schemaDump(parameters) {
-  if (parameters === undefined || parameters === null || typeof parameters !== "object") return "";
-  return JSON.stringify(parameters);
-}
-
 // First sentence of a description; '' when empty.
 function firstSentence(text) {
   if (typeof text !== "string") return "";
@@ -258,28 +88,60 @@ function firstSentence(text) {
   return m ? m[0].trim() : t;
 }
 
-// Full content block for one tool: `## \`<tool>\` tool` + an explicit "invoke as
-// a tool_call" note + the FULL description + the `tool:<name>` prose guidance
-// section from the assembly (when present) + the tool's MINIFIED JSON SCHEMA
-// under an explicit `Arguments (JSON Schema):` label. The catalog `description`
-// keeps only the first sentence and the compact literal; the content block
-// carries the complete description, the full prose guidance, and the schema.
+// Recursively strip every annotation from a JSON Schema node, keeping only
+// structure. Annotations dropped: `description`, `title`, `examples`, `default`,
+// `$comment`, `enumDescriptions`. Everything else — `type`, `required`,
+// `enum`/`const` VALUES, `items`, `properties`, `$ref`, `oneOf`/`anyOf` — is
+// kept and recursed into. The result is still a valid schema object the LLM
+// tool-call layer can consume.
+function stripSchema(node) {
+  if (node === null || typeof node !== "object") return node;
+  if (Array.isArray(node)) return node.map(stripSchema);
+  const out = {};
+  for (const [key, value] of Object.entries(node)) {
+    if (
+      key === "description" ||
+      key === "title" ||
+      key === "examples" ||
+      key === "default" ||
+      key === "$comment" ||
+      key === "enumDescriptions"
+    ) {
+      continue;
+    }
+    out[key] = typeof value === "object" && value !== null ? stripSchema(value) : value;
+  }
+  return out;
+}
+
+// Minified JSON Schema for a tool's parameters, verbatim from the registry;
+// '' when there are none.
+function schemaDump(parameters) {
+  if (parameters === undefined || parameters === null || typeof parameters !== "object") return "";
+  return JSON.stringify(parameters);
+}
+
+// Full content block for one tool: `## \`<tool>\` tool` + a detail-reference
+// note + the FULL description + the `tool:<name>` prose guidance section from
+// the assembly (when present) + the tool's VERBATIM JSON SCHEMA under an
+// explicit `Arguments (JSON Schema):` label. The catalog `description` keeps
+// only the bare "Tool details for `X`." comment; the content block carries the
+// complete description, the full prose guidance, and the schema.
 //
 // ARGUMENTS LABEL: without it the schema line would follow prose that may
 // itself mention fields, leaving no marker for where the parameter schema
 // begins, and a bare JSON line would read as one more prose sentence. The label
 // also names the dialect, and it is omitted only when the tool takes no
-// parameters (the catalog `description` still says `Arguments: {}` there).
+// parameters.
 //
 // DISAMBIGUATION: the bare word "tool" is ambiguous — a model that reads the
 // skill may not know how to invoke it. The explicit note below pins the
 // mechanism: the tool is invoked as a direct `tool_call` with its own name.
-function toolBlock(tool, schemaText, proseText) {
-  const desc = typeof tool.description === "string" ? tool.description.replaceAll(/\s+/g, " ").trim() : "";
+function toolBlock(toolName, fullDesc, schemaText, proseText) {
   return [
-    `## \`${tool.name}\` tool`,
-    `Invoke directly as a tool_call named \`${tool.name}\`.`,
-    desc,
+    `## \`${toolName}\` tool`,
+    `Full details for the \`${toolName}\` tool; invoke it directly as a tool_call.`,
+    fullDesc,
     proseText,
     schemaText ? `Arguments (JSON Schema): ${schemaText}` : ""
   ].filter(Boolean).join("\n").trim();
@@ -327,16 +189,24 @@ function apply(ctx) {
     for (const tool of all) {
       const skillName = `t${index.toString(16).padStart(hexWidth, "0")}${initials(tool.name)}`;
       if (registered !== undefined && registered.has(skillName)) { index++; continue; }
-      const desc = firstSentence(tool.description);
-      const lower = desc.length > 0 ? desc[0].toLowerCase() + desc.slice(1) : desc;
-      const catalogDesc = `Details for tool_call \`${tool.name}\`: ${lower}`.trim();
-      const description = [catalogDesc, compactSchema(tool.parameters)].filter(Boolean).map((s, i) => i === 1 ? `Arguments: ${s}` : s).join(" ");
-      const content = toolBlock(tool, schemaDump(tool.parameters), proseByTool.get(tool.name));
+      // Capture the FULL description and VERBATIM schema BEFORE the tools zone
+      // is shortened, so the skill content keeps the complete detail layer.
+      const fullDesc = typeof tool.description === "string" ? tool.description.replaceAll(/\s+/g, " ").trim() : "";
+      const verbatimSchema = schemaDump(tool.parameters);
+      // Tools zone: short description + minimal schema (annotations stripped).
+      tool.description = firstSentence(tool.description);
+      if (tool.parameters !== undefined && tool.parameters !== null && typeof tool.parameters === "object") {
+        tool.parameters = stripSchema(tool.parameters);
+      }
+      // Catalog: a bare comment naming the tool, no schema — the schema lives
+      // in the tools zone and the full detail layer lives in the content.
+      const description = `Tool details for \`${tool.name}\`.`;
+      const content = toolBlock(tool.name, fullDesc, verbatimSchema, proseByTool.get(tool.name));
       if (content.length === 0) { index++; continue; }
       const skill = {
         name: skillName,
         description,
-        whenToUse: `When the model intends to call the "${tool.name}" tool (this skill is "${skillName}").`,
+        whenToUse: `When the model needs full details or guidance for the "${tool.name}" tool (this skill is "${skillName}").`,
         content,
         invocation: { modelInvocable: true, userInvocable: false },
         source: `dsh-skill-from-tools:${tool.name}`
@@ -358,9 +228,8 @@ function apply(ctx) {
       }
       index++;
     }
-    // Authoritative: only `skill` stays in the LLM request's tools array.
-    assembly.tools = tools.filter((tool) => tool === null || typeof tool !== "object" || typeof tool.name === "string" && EXCLUDED.has(tool.name));
-    // NOTE: `tool:*` prose sections are NOT filtered here.
+    // Authoritative: every tool stays in the LLM request's tools array — the
+    // skills are a detail layer, not a replacement. No filtering here.
     return next();
   });
 }
