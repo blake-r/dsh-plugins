@@ -5,18 +5,20 @@
 # patch is applied after this bundle, so per-profile overrides still win.
 
 # This package is the deployment's replacement spill policy: the base
-# @deepseek-ai/dsh-spill-policy row (maxInlineBytes=50000) is disabled here
-# and the tighter replacement row is inserted. The row's config overrides
-# maxInlineBytes to 131072 bytes (32K tokens) — matching the read tool's
-# readMaxBytes in the deployment's tool-fs row — while the plugin's code
-# defaults (maxInlineBytes=4096, excludeTools read/skill) stay for any
-# consumer that specifies no config; a profile patch applied after this
-# bundle layer can still override the values.
+# @deepseek-ai/dsh-spill-policy row (maxInlineTokens=12500) is disabled here
+# and the tighter replacement row is inserted with NO config, so the plugin's
+# code defaults apply (maxInlineBytes=4096, headLines=2, tailLines=1,
+# excludeTools read/skill/recall). A profile patch applied after this bundle
+# layer can still override the values.
+#
+# Do not raise maxInlineBytes back to 131072 (32K tokens): the local subprocess
+# runtime caps one bash stream at ~120 KB, so a higher threshold makes bash
+# results unreachable for this policy — they get truncated into a temp file
+# instead of spilling into the session log, and only tools without their own cap
+# (grep, glob, MCP, subagents) ever spill.
 - id: spill-policy
   disabled: true
 
 - insert:
     - id: spill-policy-replacement
       name: '@blake-r/dsh-spill-policy'
-      config:
-        maxInlineBytes: 131072
