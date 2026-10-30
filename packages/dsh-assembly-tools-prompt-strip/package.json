@@ -1,6 +1,6 @@
 {
   "name": "@blake-r/dsh-assembly-tools-prompt-strip",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Drop the tool:<name> prose guidance sections from the system prompt.",
   "type": "module",
   "main": "src/dsh-assembly-tools-prompt-strip.mjs",
