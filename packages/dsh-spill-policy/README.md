@@ -16,9 +16,9 @@ needs the data.
 
 Divergence from base `@deepseek-ai/dsh-spill-policy`:
 
-- Byte cap (`maxInlineBytes` — the deployment's row config sets 131072,
-  matching the read tool's `readMaxBytes`; the code default is 4096 vs the
-  base 50000).
+- Byte cap (`maxInlineBytes` — the deployment's row config sets 16384, the
+  "4K tokens" budget under the token-meter heuristic density of 4 chars/token;
+  the code default is 4096 bytes vs the base 50000).
 - **Log-based spill.** The full output is a `plugin:spill` sibling record in
   the session log, not a spill-store file. The spill-store dependency is gone;
   the record survives compaction and fork/resume (the durable log is never
@@ -76,16 +76,17 @@ JSON keys or CSV headers contain newlines.
 ## Mount
 
 The bundle patch disables the base `spill-policy` row and inserts
-`dsh-spill-policy`. The row's config overrides `maxInlineBytes` to 131072
-bytes (32K tokens), while the remaining defaults live in the plugin code
-(`headLines: 2`, `tailLines: 1`, `excludeTools: ["read", "skill", "recall"]`)
-and apply whenever no config is specified. A profile patch applied after this
-bundle layer can still override the values:
+`dsh-spill-policy`. The row's config overrides `maxInlineBytes` to 16384 bytes
+(4K tokens at the token-meter heuristic density of 4 chars/token), while the
+remaining defaults live in the plugin code (`headLines: 2`, `tailLines: 1`,
+`excludeTools: ["read", "skill", "recall"]`) and apply whenever no config is
+specified. A profile patch applied after this bundle layer can still override
+the values:
 
 ```yaml
 - id: spill-policy-replacement
   config:
-    maxInlineBytes: 131072
+    maxInlineBytes: 16384
     headLines: 3
     tailLines: 2
 ```
