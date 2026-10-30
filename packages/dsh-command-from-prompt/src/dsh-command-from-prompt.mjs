@@ -13,6 +13,15 @@
 //     <name>:
 //       description: <short help shown in the command list>
 //       prompt: <user-message text sent to the model>
+//       hint: <placeholder shown in the composer after picking the command;
+//              optional, defaults to "optional text">
+//
+// Every command accepts an optional trailing text: the registration declares
+// `input: { hint }`, so picking the command from the GUI slash menu inserts
+// `/name ` into the composer (hint shown as placeholder) instead of executing
+// it immediately, and the user can type accompanying text before pressing
+// Enter. When the submitted line carries trailing text, it is appended to the
+// prompt (separated by a blank line) in the model-visible message.
 //
 // Implementation notes:
 //   - Profile-local plugin files are loaded dependency-free, so this plugin
@@ -24,8 +33,11 @@
 //     model-visible user message.
 //   - The `commands` service is host-plane (mounted by dsh-base, not disabled
 //     in the web profile), so these commands are available in every web session.
-//   - Commands take no arguments (`input` omitted), so handlers ignore
-//     `invocation.rawInput`.
+//   - `input: { hint }` drives the client pick path: `dsh-client-ui-commands`
+//     routes a menu pick of a command with `input` to a composer claim
+//     (`/name ` + hint placeholder) and only runs it on Enter, while a command
+//     without `input` executes detached (immediately) on pick. The trailing
+//     text arrives at the handler as `invocation.rawInput` ("" when absent).
 //
 // After editing this file bump the `?v=` in the referencing row of the
 // profile's cordis.patch.yml, otherwise the loader may serve the cached module.
@@ -61,14 +73,30 @@ function apply(ctx, config) {
         ? def.description.trim()
         : `send the configured prompt to the model`;
 
+    const hint =
+      typeof def.hint === "string" && def.hint.trim().length > 0
+        ? def.hint.trim()
+        : "optional text";
+
     const dispose = ctx.commands.register({
       name: cmdName,
       description,
+      // Declared input keeps the slash-menu pick in the composer (`/name ` with
+      // this hint as placeholder) instead of executing the command right away.
+      input: { hint },
       handler: (invocation) => {
-        invocation.agent.followup(buildUserMessage(prompt));
+        const text =
+          typeof invocation.rawInput === "string"
+            ? invocation.rawInput.trim()
+            : "";
+        const message = text.length > 0 ? `${prompt}\n\n${text}` : prompt;
+        invocation.agent.followup(buildUserMessage(message));
         return {
           kind: "success",
-          text: `Sent the "${cmdName}" prompt to the model.`
+          text:
+            text.length > 0
+              ? `Sent the "${cmdName}" prompt with your text to the model.`
+              : `Sent the "${cmdName}" prompt to the model.`
         };
       }
     });

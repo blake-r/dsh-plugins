@@ -1,0 +1,32 @@
+{
+  "name": "@blake-r/dsh-loop-guard",
+  "version": "0.1.0",
+  "description": "DSH host plugins guarding agent loops: a reasoning-loop guard (aborts degenerate thinking blocks, reminds the model to make progress) and a repeat-pattern reminder (detects repeated tool calls and complex alternations). One package, two plugin rows sharing an internal coordination module.",
+  "type": "module",
+  "main": "src/dsh-host-reasoning-loop-guard.mjs",
+  "exports": {
+    ".": "./src/dsh-host-reasoning-loop-guard.mjs",
+    "./reasoning-loop-guard": "./src/dsh-host-reasoning-loop-guard.mjs",
+    "./repeat-pattern-reminder": "./src/dsh-host-repeat-pattern-reminder.mjs"
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "node --check src/dsh-host-reasoning-loop-guard.mjs && node --check src/dsh-host-repeat-pattern-reminder.mjs && node --check src/dsh-loop-guard-shared.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}

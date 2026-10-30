@@ -1,6 +1,6 @@
 {
   "name": "@blake-r/dsh-tool-filter-root-find",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Gates tool calls that sweep the whole disk or home directory.",
   "type": "module",
   "main": "src/dsh-tool-filter-root-find.mjs",
@@ -21,7 +21,7 @@
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.1"
+    "@deepseek-ai/cordis": "^4.0.2"
   },
   "engines": {
     "node": ">=18"

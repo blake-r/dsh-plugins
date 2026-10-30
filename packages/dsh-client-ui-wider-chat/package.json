@@ -1,0 +1,24 @@
+{
+  "name": "@blake-r/dsh-client-ui-wider-chat",
+  "version": "0.1.0",
+  "description": "DSH web host plugin: widen the conversation output column to near-full width while keeping the composer card at its current width.",
+  "type": "module",
+  "main": "src/dsh-client-ui-wider-chat.mjs",
+  "exports": {
+    ".": "./src/dsh-client-ui-wider-chat.mjs"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "node --check src/dsh-client-ui-wider-chat.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}

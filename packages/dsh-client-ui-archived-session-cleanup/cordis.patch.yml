@@ -1,0 +1,9 @@
+# Bundle patch for the archived-session-cleanup plugin: inserts its plugin row
+# into the web profile roster. Applied as a profile bundle layer (the
+# `dsh.bundle.patch` manifest field). The row's `name` resolves to this
+# package's host half (lib/index.js — the archivedSessionCleanup remote
+# service); the browser half (the Settings control) is discovered through the
+# package.json `dsh.client` declaration by dsh-client-modules.
+- insert:
+    - id: archived-session-cleanup
+      name: '@blake-r/dsh-client-ui-archived-session-cleanup'

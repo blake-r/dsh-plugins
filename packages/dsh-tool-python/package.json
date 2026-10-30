@@ -1,0 +1,35 @@
+{
+  "name": "@blake-r/dsh-tool-python",
+  "version": "0.1.0",
+  "description": "py_run / py_pip tools over a per-workspace venv, with on-the-fly repair of a relocated venv.",
+  "type": "module",
+  "main": "src/dsh-tool-python.mjs",
+  "exports": {
+    ".": "./src/dsh-tool-python.mjs"
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "node --check src/dsh-tool-python.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-sandbox": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-timeout": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-tools": "0.2.0-rc.2"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}

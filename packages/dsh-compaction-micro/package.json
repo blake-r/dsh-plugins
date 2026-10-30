@@ -1,7 +1,7 @@
 {
   "name": "@blake-r/dsh-compaction-micro",
-  "version": "0.2.0",
-  "description": "Per-request trajectory re-composition for the kb preset.",
+  "version": "0.3.0",
+  "description": "Per-request trajectory re-composition.",
   "type": "module",
   "main": "src/dsh-compaction-micro.mjs",
   "exports": {
@@ -21,7 +21,7 @@
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.1"
+    "@deepseek-ai/cordis": "^4.0.2"
   },
   "engines": {
     "node": ">=18"

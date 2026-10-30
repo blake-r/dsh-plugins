@@ -5,7 +5,7 @@
 // This is the recall/search half of the upstream compaction plugin, split out
 // into its own dependency-free plugin so the bundle can be decomposed. The tool
 // cores (`recall.js`, `search.js`) and the compiler helpers they need
-// (`estimateEntryTokens`, `sanitize`, `truncateTokens`, `projectToolResultText`,
+// (`estimateEntryTokens`, `sanitize`, `projectToolResultText`,
 // `isCheckpointSource`) are vendored from upstream, adapted to the current
 // session API: the removed `session.events` array is replaced by the public
 // `session.eventAt(seq)` accessor and the contiguous `session.log` (see the
@@ -17,13 +17,25 @@
 //   - `recall` — restore the exact original content of earlier events by a
 //     typed reference: `type: "seq"` for `(seq N)` / `(seqs A-B)` markers,
 //     `type: "result"` for the `result N` pointer on a tool-call one-liner,
-//     `type: "checkpoint"` for a `[checkpoint N]` elision line.
-//   - `search` — keyword/regex search over the log. Returns the matching
-//     events with their `(seq N)` pointers, so the agent can then call
-//     `recall` to restore any hit in full.
+//     `type: "checkpoint"` for a `[checkpoint N]` elision line. A spilled
+//     sibling (`plugin:spill`) is recalled by its seq; `type: "result"` also
+//     resolves through the tool/result's callId to its sibling. Optional
+//     line-based `limit`/`offset` page a single recalled event.
+//   - `search` — keyword/regex search over the log. Returns an index: one
+//     `[seq N: <label>] - K match(es)` line per matching event, freshest
+//     matches first, with no output limits. Each hit carries the first-match
+//     line coordinate so the model can page straight to the needle. The agent
+//     can then call `recall` with any `(seq N)` pointer to restore that hit in
+//     full.
+//   - `/recall` — the same search as a human-facing slash command; its result
+//     is appended to the session as a user message (spilled to a `plugin:spill`
+//     sibling when the index is large, per the "full inline or sibling" rule).
 //
 // Neither call does a model round-trip and neither paraphrases: the log is
-// append-only, so the output is always the original content.
+// append-only, so the output is always the original content. No tool output is
+// ever truncated: recall returns every requested seq in full (or a paged window
+// it explicitly marks as partial), and search returns every matching event as
+// one index line.
 //
 // ── schema format: RAW JSON Schema, NOT the dsh-tools DSL ───────────────────
 // This plugin registers its `recall`/`search` tools via `ctx.tools.register()`
@@ -51,9 +63,22 @@
 // reaches for those tools instead of guessing. The hint lives in the prompt
 // (re-assembled every turn), not in the session log, so micro-compaction never
 // folds it. Requires injecting `["systemPrompt"]` in addition to `["tools"]`.
+//
+// ── plugin:spill sibling contract ───────────────────────────────────────────
+// dsh-spill-policy commits oversized tool outputs as `plugin:spill` sibling
+// records (ignorable plugin records that never enter the surface) and replaces
+// the model-facing result with a hint citing the sibling's seq. This plugin
+// special-cases that record type so recall/search can restore and page it:
+//   - type: `plugin:spill` (the shared record-type string).
+//   - data shape: `{ toolName: string, callId: string, content: string }`.
+//   - seq semantics: the record's own seq is the recall target; a hint cites
+//     it so `recall type="seq"` reaches the full content.
+// Keep the two packages in lockstep on this contract (type string + shape +
+// seq semantics). If they drift, recall silently degrades to the generic JSON
+// fallback for the record.
 
 const name = "dsh-tool-trajectory-recall";
-const inject = ["tools", "systemPrompt"];
+const inject = ["tools", "systemPrompt", "commands"];
 
 // ── minimal HarnessError (vendored shape from @deepseek-ai/dsh-llm) ────────
 class HarnessError extends Error {
@@ -72,10 +97,6 @@ const CTRL_RE = /[\x00-\x08\x0b-\x1f\x7f-\x9f]/g;
 
 function isHighSurrogate(code) {
   return code >= 0xd800 && code <= 0xdbff;
-}
-
-function completeCodePointAtEnd(text) {
-  return isHighSurrogate(text.charCodeAt(text.length - 1)) ? text.slice(0, -1) : text;
 }
 
 /** Split text into fixed-density tokens (VCC `_tokenize`). */
@@ -102,35 +123,6 @@ function sanitize(text) {
   if (out.includes("\r")) out = out.replaceAll("\r", "");
   if (out.includes("\x1b")) out = out.replace(ANSI_RE, "");
   return out.replace(CTRL_RE, "");
-}
-
-/** Truncate text to a non-whitespace-token budget, preserving original tokens. */
-function truncateTokens(text, limit, ref) {
-  const tokens = tokenize(text);
-  let count = 0;
-  let cut = tokens.length;
-  for (let index = 0; index < tokens.length; index += 1) {
-    const token = tokens[index];
-    if (token.trim().length === 0) continue;
-    count += 1;
-    if (count > limit) {
-      cut = index;
-      break;
-    }
-  }
-  let out = cut >= tokens.length ? text : tokens.slice(0, cut).join("");
-  let truncated = cut < tokens.length;
-  const maxChars = Math.max(32, limit * 4);
-  if (out.length > maxChars) {
-    out = completeCodePointAtEnd(out.slice(0, maxChars));
-    truncated = true;
-  } else if (truncated) {
-    out = completeCodePointAtEnd(out);
-  }
-  if (!truncated) return { text, truncated: false };
-  out = out.replace(/\s+$/u, "");
-  const note = ref === undefined ? "...(truncated)" : `...(truncated from ${ref})`;
-  return { text: out + note, truncated: true };
 }
 
 /** Project nested tool-result blocks into one plain-text string. */
@@ -170,10 +162,47 @@ function sessionEventAt(session, seq) {
   return sessionLog(session)[seq];
 }
 
+// ── plugin:spill sibling projection ──────────────────────────────────────────
+// A `plugin:spill` record is an ignorable plugin record (not a surface event),
+// so `deriveEventMessage` returns null for it and the generic fallback would
+// render it as one line of escaped JSON — useless for line-based paging. This
+// projection decodes the record's `content` back to its real newlines so
+// recall/search can window and match it line-wise.
+
+/** The shared `plugin:spill` record type written by dsh-spill-policy. */
+const SPILL_RECORD_TYPE = "plugin:spill";
+
+/** Whether an event is a `plugin:spill` sibling record. */
+function isSpillRecord(event) {
+  return event !== undefined && event !== null && event.type === SPILL_RECORD_TYPE;
+}
+
+/** The decoded plain-text body of a spill record, or undefined when not one. */
+function spillRecordBody(event) {
+  if (!isSpillRecord(event)) return undefined;
+  const data = event.data;
+  if (data === null || typeof data !== "object" || typeof data.content !== "string") return undefined;
+  return sanitize(data.content);
+}
+
+/** The tool name of a spill record, or undefined. */
+function spillRecordToolName(event) {
+  if (!isSpillRecord(event)) return undefined;
+  const data = event.data;
+  if (data === null || typeof data !== "object" || typeof data.toolName !== "string") return undefined;
+  return data.toolName.length > 0 ? data.toolName : undefined;
+}
+
+/** The callId of a spill record, or undefined. */
+function spillRecordCallId(event) {
+  if (!isSpillRecord(event)) return undefined;
+  const data = event.data;
+  if (data === null || typeof data !== "object" || typeof data.callId !== "string") return undefined;
+  return data.callId.length > 0 ? data.callId : undefined;
+}
+
 // ── vendored recall core ────────────────────────────────────────────────────
 
-/** Default total budget for one recall operation, in density-aware tokens. */
-const DEFAULT_MAX_RECALL_TOKENS = 16000;
 /** Widest single range accepted from one selection, bounding expansion work. */
 const MAX_RECALL_SPAN = 1000;
 
@@ -260,6 +289,15 @@ function findCheckpointSeqs(session) {
   return seqs;
 }
 
+/** The seq of the `plugin:spill` sibling whose callId matches, or undefined. */
+function findSpillSeqByCallId(session, callId) {
+  if (callId === undefined || callId === "") return undefined;
+  for (const event of sessionLog(session)) {
+    if (isSpillRecord(event) && spillRecordCallId(event) === callId) return event.seq;
+  }
+  return undefined;
+}
+
 /** Resolve one typed recall reference into inclusive seq ranges. */
 function resolveRecallReference(session, type, id) {
   const raw = String(id ?? "").trim();
@@ -272,6 +310,12 @@ function resolveRecallReference(session, type, id) {
     const event = sessionEventAt(session, seq);
     if (event === undefined || event.seq !== seq) return { selections: [], errors: [`result seq ${seq} not found in this session`] };
     if (event.type !== "tool/result") return { selections: [], errors: [`seq ${seq} is not a tool result (it is ${event.type})`] };
+    // A tool/result whose content was spilled resolves through its callId to
+    // the `plugin:spill` sibling that holds the full output. When a sibling
+    // exists, recall that instead of the (hint-only) result.
+    const callId = event.data?.message?.toolCallId;
+    const siblingSeq = findSpillSeqByCallId(session, callId);
+    if (siblingSeq !== undefined) return { selections: [{ start: siblingSeq, end: siblingSeq }], errors: [] };
     return { selections: [{ start: seq, end: seq }], errors: [] };
   }
   if (type === "checkpoint") {
@@ -297,61 +341,74 @@ function resolveRecallReference(session, type, id) {
   return { selections: [], errors: [`invalid recall type "${String(type)}" (expected "seq", "result", or "checkpoint")`] };
 }
 
+/**
+ * Window one recalled event's body with line-based `offset`/`limit` (both
+ * 1-based inclusive semantics mirroring the read tool). Returns
+ * `{ text, truncated }` where `truncated` is true when the body was cut and
+ * the caller must show a continuation marker. A single requested event may be
+ * paged; when several seqs are requested the window applies per event.
+ */
+function windowBody(body, offset, limit) {
+  if ((offset === undefined || offset === null) && (limit === undefined || limit === null)) {
+    return { text: body, truncated: false };
+  }
+  const lines = body.split("\n");
+  const from = Number.isInteger(offset) && offset > 0 ? offset : 1;
+  const hasLimit = Number.isInteger(limit) && limit > 0;
+  const to = hasLimit ? from + limit - 1 : lines.length;
+  const cut = hasLimit ? Math.max(0, lines.length - to) : 0;
+  const windowed = lines.slice(from - 1, to);
+  const truncated = hasLimit && to < lines.length;
+  let text = windowed.join("\n");
+  if (truncated) text += `\n[... ${cut} more line${cut === 1 ? "" : "s"} not shown; use recall with a larger limit or a later offset]`;
+  return { text, truncated };
+}
+
 /** Recall the full original content of the requested seqs from one session. */
 function recallSession(session, selections, config) {
-  const maxRecallTokens = config.maxRecallTokens;
   const requested = expandSelections(selections);
   const entries = [];
   const seqs = [];
-  let budget = maxRecallTokens;
-  let truncated = false;
   let missing = 0;
-  let skipped = 0;
   for (let index = 0; index < requested.length; index += 1) {
     const seq = requested[index];
-    if (budget <= 0) {
-      skipped = requested.length - index;
-      truncated = true;
-      break;
-    }
     const event = sessionEventAt(session, seq);
     if (event === undefined || event.seq !== seq) {
       missing += 1;
       entries.push({ seq, text: `[seq ${seq}: not found in this session]` });
       continue;
     }
-    const message = typeof session.deriveEventMessage === "function" ? session.deriveEventMessage(event) : null;
-    const body = message !== null
-      ? `[seq ${seq}: ${message.role}]\n${projectMessageText(message)}`
-      : `[seq ${seq}: ${event.type}]\n${JSON.stringify(event.data).slice(0, maxRecallTokens * 4)}`;
-    const kept = truncateTokens(body, budget, "recall budget");
-    budget -= estimateEntryTokens(kept.text);
-    if (kept.truncated) truncated = true;
-    entries.push({ seq, text: kept.text, truncated: kept.truncated });
+    // A spill sibling is projected through its decoded content (real newlines),
+    // so line-based paging works on it; everything else uses the message/JSON
+    // fallback as before.
+    const spillBody = spillRecordBody(event);
+    let body;
+    if (spillBody !== undefined) {
+      body = `[seq ${seq}: plugin:spill ${spillRecordToolName(event) ?? "tool"}]\n${spillBody}`;
+    } else {
+      const message = typeof session.deriveEventMessage === "function" ? session.deriveEventMessage(event) : null;
+      body = message !== null
+        ? `[seq ${seq}: ${message.role}]\n${projectMessageText(message)}`
+        : `[seq ${seq}: ${event.type}]\n${JSON.stringify(event.data)}`;
+    }
+    const windowed = windowBody(body, config.offset, config.limit);
+    entries.push({ seq, text: windowed.text, truncated: windowed.truncated });
     seqs.push(seq);
   }
-  if (skipped > 0) {
-    entries.push({ seq: requested[requested.length - skipped], text: `[recall budget exhausted: ${skipped} further requested seq(s) not included]` });
-  }
+  const truncated = entries.some((entry) => entry.truncated);
   return {
     text: entries.map((entry) => entry.text).join("\n\n"),
     entries,
     seqs,
     recalled: seqs.length,
     missing,
-    skipped,
+    skipped: 0,
     truncated,
     tokens: entries.reduce((total, entry) => total + estimateEntryTokens(entry.text), 0)
   };
 }
 
 // ── vendored search core ────────────────────────────────────────────────────
-
-/** Default cap on the number of matching events shown in one result. */
-const DEFAULT_MAX_SEARCH_HITS = 50;
-/** Default cap on shown matching lines per hit event. */
-const MAX_LINES_PER_HIT = 10;
-
 /** A search pattern that cannot be compiled into a regular expression. */
 class InvalidSearchPatternError extends Error {
   constructor(source, reason) {
@@ -371,53 +428,87 @@ function compileSearchPattern(source) {
   }
 }
 
-/** One search hit: the durable seq, its kind, and the rendered matched lines. */
+/** One index label for a matching event: tool name for tool rows, role otherwise. */
+function searchEventLabel(session, events, seq, event, message) {
+  // A spill sibling is labeled by its own tool name (its message is null).
+  const spillTool = spillRecordToolName(event);
+  if (spillTool !== undefined) return spillTool;
+  const blocks = message !== null && Array.isArray(message.content) ? message.content : [];
+  const toolCallBlock = blocks.find((block) => block.type === "tool-call");
+  if (event.type === "tool/call" || toolCallBlock !== undefined) {
+    const name = toolCallBlock !== undefined ? toolCallBlock.name : event.data?.name;
+    return name !== undefined && name !== "" ? String(name) : "tool-call";
+  }
+  const toolResultBlock = blocks.find((block) => block.type === "tool-result");
+  if (event.type === "tool/result" || toolResultBlock !== undefined) {
+    let callId = toolResultBlock !== undefined && toolResultBlock.toolCallId !== undefined
+      ? toolResultBlock.toolCallId
+      : event.data?.message?.source?.callId ?? event.data?.callId;
+    if (callId !== undefined && callId !== "") {
+      for (let earlier = 0; earlier < seq; earlier += 1) {
+        const earlierEvent = events[earlier];
+        if (earlierEvent === undefined || earlierEvent.seq !== earlier) continue;
+        const earlierMessage = typeof session.deriveEventMessage === "function" ? session.deriveEventMessage(earlierEvent) : null;
+        if (earlierMessage === null || !Array.isArray(earlierMessage.content)) continue;
+        const matching = earlierMessage.content.find((block) => block.type === "tool-call" && (block.toolCallId ?? block.id) === callId);
+        if (matching !== undefined) return matching.name !== undefined && matching.name !== "" ? String(matching.name) : "tool-call";
+      }
+    }
+    return "tool-result";
+  }
+  if (message !== null && message.role !== undefined && message.role !== "") return String(message.role);
+  return String(event.type);
+}
+
+/**
+ * The 1-based line number of the first pattern match inside `body`, or
+ * undefined when there is no match. Computed against the decoded spill body so
+ * the coordinate is meaningful for line-based paging.
+ */
+function firstMatchLine(body, matchAllPattern) {
+  const lines = body.split("\n");
+  for (let i = 0; i < lines.length; i += 1) {
+    if (matchAllPattern.test(lines[i])) return i + 1;
+  }
+  return undefined;
+}
+
+/** Search one session's log for matching events, freshest first, as an index. */
 function searchSession(session, patternSource, config) {
   const pattern = compileSearchPattern(patternSource);
-  const maxHits = config.maxSearchHits;
-  const maxTokens = config.maxRecallTokens;
+  const matchAllPattern = new RegExp(pattern.source, `${pattern.flags}g`);
   const events = sessionLog(session);
   const hits = [];
   let totalMatches = 0;
-  let budget = maxTokens;
-  let truncated = false;
-  for (let seq = 0; seq < events.length; seq += 1) {
+  for (let seq = events.length - 1; seq >= 0; seq -= 1) {
     const event = events[seq];
     if (event === undefined || event.seq !== seq) continue;
-    const message = typeof session.deriveEventMessage === "function" ? session.deriveEventMessage(event) : null;
-    const body = message !== null
-      ? projectMessageText(message)
-      : `[${event.type}]\n${JSON.stringify(event.data ?? null)}`;
-    const lines = body.split("\n");
-    const matched = [];
-    for (let index = 0; index < lines.length; index += 1) {
-      if (pattern.test(lines[index])) matched.push({ line: index + 1, text: sanitize(lines[index]) });
+    // A spill sibling is matched against its decoded content so a needle buried
+    // in a spilled blob is found (and the model never saw it inline).
+    const spillBody = spillRecordBody(event);
+    let body;
+    let label;
+    if (spillBody !== undefined) {
+      body = spillBody;
+      label = spillRecordToolName(event) ?? "plugin:spill";
+    } else {
+      const message = typeof session.deriveEventMessage === "function" ? session.deriveEventMessage(event) : null;
+      body = message !== null
+        ? projectMessageText(message)
+        : `[${event.type}]\n${JSON.stringify(event.data ?? null)}`;
+      label = searchEventLabel(session, events, seq, event, message);
     }
-    if (matched.length === 0) continue;
+    let count = 0;
+    for (const match of body.matchAll(matchAllPattern)) count += 1;
+    if (count === 0) continue;
     totalMatches += 1;
-    if (hits.length >= maxHits || budget <= 0) {
-      truncated = true;
-      continue;
-    }
-    const header = `[seq ${seq}: ${message !== null ? message.role : event.type}]`;
-    const shown = matched.slice(0, MAX_LINES_PER_HIT);
-    const more = matched.length - shown.length;
-    const block = [
-      header,
-      ...shown.map((match) => `  ${match.line}: ${match.text}`),
-      ...(more > 0 ? [`  ...(${more} more matching lines in this event)`] : [])
-    ].join("\n");
-    const kept = truncateTokens(block, budget, "search budget");
-    budget -= estimateEntryTokens(kept.text);
-    if (kept.truncated) truncated = true;
-    hits.push({ seq, kind: message !== null ? message.role : event.type, text: kept.text });
+    const firstLine = firstMatchLine(body, new RegExp(pattern.source, `${pattern.flags}g`));
+    const coord = firstLine === undefined ? "" : ` · first match at line ${firstLine}`;
+    hits.push({ seq, kind: label, text: `[seq ${seq}: ${label}] - ${count} match${count === 1 ? "" : "es"}${coord}` });
   }
-  const omitted = totalMatches - hits.length;
   const lines = [
     `[search "${pattern.source}": ${totalMatches} matching event(s)]`,
-    ...hits.map((hit) => hit.text),
-    ...(omitted > 0 ? [`[${omitted} more matching event(s) omitted — narrow the pattern or use recall]`] : []),
-    ...(truncated ? ["[search budget exhausted; some hits were cut]"] : [])
+    ...hits.map((hit) => hit.text)
   ];
   if (hits.length > 0) lines.push("[use recall with a (seq N) pointer to restore any hit's full original content]");
   const text = lines.join("\n\n");
@@ -425,8 +516,8 @@ function searchSession(session, patternSource, config) {
     pattern: pattern.source,
     totalMatches,
     hits,
-    omitted,
-    truncated,
+    omitted: 0,
+    truncated: false,
     tokens: hits.reduce((total, hit) => total + estimateEntryTokens(hit.text), 0),
     text
   };
@@ -434,9 +525,9 @@ function searchSession(session, patternSource, config) {
 
 // ── tool definitions (dependency-free) ──────────────────────────────────────
 
-const RECALL_DESCRIPTION = "Restore the exact original content of earlier events in THIS conversation by a typed reference. type=\"seq\" with a seq selection id (\"3-7,15\", \"seq 12\", \"seqs 3-7\" — the checkpoint marker forms) restores those events; type=\"result\" with the \"result N\" pointer from a tool-call one-liner (\"result 3\" or \"3\") restores that tool result; type=\"checkpoint\" with an ordinal (\"1\" = oldest, as in a \"[checkpoint N]\" elision line) or a \"seq N\" pointer restores that full checkpoint. The durable log is append-only, so recalled content is always the original tokens. To find events by keyword or regex instead, use the search tool.";
+const RECALL_DESCRIPTION = "Restore the exact original content of earlier events in THIS conversation by a typed reference. type=\"seq\" with a seq selection id (\"3-7,15\", \"seq 12\", \"seqs 3-7\" — the checkpoint marker forms) restores those events; type=\"result\" with the \"result N\" pointer from a tool-call one-liner (\"result 3\" or \"3\") restores that tool result (resolving through to the full spilled content when the result was spilled); type=\"checkpoint\" with an ordinal (\"1\" = oldest, as in a \"[checkpoint N]\" elision line) or a \"seq N\" pointer restores that full checkpoint. The durable log is append-only, so recalled content is always the original tokens. Optional line-based paging: pass limit (lines per event) and/or offset (1-based first line) to window a large event; a windowed recall is marked as partial, so page again with a larger limit or later offset to read the rest. To find events by keyword or regex instead, use the search tool.";
 
-const SEARCH_DESCRIPTION = "Search THIS conversation's durable event log by keyword or regular expression (case-insensitive, Unicode-aware). Every event ever recorded is searchable, including content elided or truncated by compaction checkpoints — the log is append-only and untouched. Returns the matching events with their (seq N) seq numbers and the matching lines. Then call recall with a (seq N) pointer to restore any hit's full exact original content. Escape regex special characters (e.g. use \\\\( for a literal parenthesis).";
+const SEARCH_DESCRIPTION = "Search THIS conversation's durable event log by keyword or regular expression (case-insensitive, Unicode-aware). Every event ever recorded is searchable, including content elided or truncated by compaction checkpoints and full outputs spilled into the log — the log is append-only and untouched. Returns an index: one `[seq N: <label>] - K match(es)` line per matching event, freshest matches first, with no output limits; each hit also carries the 1-based line of its first match so you can page straight to it with recall's offset. Then call recall with a (seq N) pointer to restore any hit's full exact original content. Escape regex special characters(e.g. use \\\\( for a literal parenthesis).";
 
 const RECALL_OUTPUT = {
   schema: {
@@ -472,22 +563,18 @@ const SEARCH_OUTPUT = {
   render: (_args, value) => [{ type: "text", text: value.text }]
 };
 
-/** Validate and default the tool plugin configuration. */
+/** Resolve the tool plugin configuration: no limits remain; accept any config silently. */
 function resolveConfig(config = {}) {
-  const maxRecallTokens = config.maxRecallTokens ?? DEFAULT_MAX_RECALL_TOKENS;
-  const maxSearchHits = config.maxSearchHits ?? DEFAULT_MAX_SEARCH_HITS;
-  if (typeof maxRecallTokens !== "number" || !Number.isInteger(maxRecallTokens) || maxRecallTokens <= 0) throw new Error("ToolRecallConfig: maxRecallTokens must be a positive integer");
-  if (typeof maxSearchHits !== "number" || !Number.isInteger(maxSearchHits) || maxSearchHits <= 0) throw new Error("ToolRecallConfig: maxSearchHits must be a positive integer");
-  return { maxRecallTokens, maxSearchHits };
+  return {};
 }
 
 /** Shared execution of one typed recall request against the calling agent. */
-function executeRecall(exec, type, id, resolved) {
+function executeRecall(exec, type, id, offset, limit) {
   const agent = exec.agent;
   if (agent === undefined) throw new HarnessError("recall requires a calling agent with a session", "RECALL_AGENT_REQUIRED");
   const { selections, errors } = resolveRecallReference(agent.session, type, id);
   if (errors.length > 0) throw new HarnessError(`invalid ${type} recall: ${errors.join("; ")}`, "RECALL_INVALID_SELECTION");
-  const recalled = recallSession(agent.session, selections, resolved);
+  const recalled = recallSession(agent.session, selections, { offset, limit });
   return {
     text: recalled.text,
     recalled: recalled.recalled,
@@ -514,12 +601,20 @@ function defineRecallTool(resolved) {
         id: {
           type: "string",
           description: 'Type-dependent reference: "3-7,15" / "seq 12" for seq; "result 3" or "3" for result; "1" / "checkpoint 1" or "seq 12345" for checkpoint.'
+        },
+        offset: {
+          type: "integer",
+          description: "Optional 1-based first line to return for each recalled event (line-based paging)."
+        },
+        limit: {
+          type: "integer",
+          description: "Optional maximum number of lines to return for each recalled event; a windowed recall is marked partial, so page again to read the rest."
         }
       },
       required: ["type", "id"]
     },
     output: RECALL_OUTPUT,
-    execute: (args, exec) => executeRecall(exec, args.type, args.id, resolved),
+    execute: (args, exec) => executeRecall(exec, args.type, args.id, args.offset, args.limit),
     presentCall: (args) => ({
       card: "generic",
       title: "Recall events",
@@ -576,19 +671,93 @@ function defineSearchTool(resolved) {
 /**
  * Register the recall tools (`recall` restore + `search` grep).
  * @param ctx - context carrying the tools service.
- * @param config - `{ maxRecallTokens?, maxSearchHits? }`.
+ * @param config - accepted silently and ignored (no limits remain).
  * @returns the installed registrations' combined disposer.
  */
 /** Text of the system-prompt hint about restoring compacted content. */
 const RECALL_HINT_TEXT =
-  "Folded `seq`/`result`/`checkpoint` content may be restored using tools `recall` by id or `search` by keyword — don't guess.";
+  "Folded `seq`/`result`/`checkpoint` content may be restored in full using tools `recall` by id or `search` by keyword — `search` returns an untruncated (seq N) index; don't guess. Large spilled outputs are recalled by seq; page them with recall's limit/offset.";
+
+/** Execute one grep-based `/recall` request against the calling agent's session. */
+async function executeRecallCommand(invocation, appendPluginRecord) {
+  const pattern = String(invocation.rawInput ?? "").trim();
+  if (pattern.length === 0) return { kind: "error", text: "Usage: /recall <keyword|regex>" };
+  let result;
+  try {
+    result = searchSession(invocation.agent.session, pattern, {});
+  } catch (error) {
+    if (error instanceof InvalidSearchPatternError) return { kind: "error", text: error.message };
+    throw error;
+  }
+  if (result.totalMatches === 0) return { kind: "error", text: `No matching events for "${pattern}".` };
+  const opts = { surfaceOp: "append", sourceEventSeqs: result.hits.map((hit) => hit.seq) };
+  let text = result.text;
+  if (estimateEntryTokens(result.text) > 1000) {
+    // Spill the large index to a plugin:spill sibling instead of a file
+    // artifact: the sibling lives in the durable log (survives compaction and
+    // fork/resume) and is recalled by seq, so the spill-store file dependency
+    // is gone. On any failure the full index stays inline (never lose data).
+    try {
+      const session = invocation.agent.session;
+      if (typeof appendPluginRecord !== "function" || session === undefined || session === null) {
+        throw new Error("dsh-session appendPluginRecord unavailable");
+      }
+      const seq = await invocation.agent.runMaintenance(() => appendPluginRecord(session, "plugin:spill", {
+        toolName: "command-recall",
+        callId: String(invocation.commandId ?? ""),
+        content: result.text
+      }));
+      text = `(Full formatted result stored at seq ${seq}; recall it with recall type="seq" id="${seq}")`;
+    } catch (error) {
+      // Spill unavailable: keep the full index text inline (never lose data).
+      text = result.text;
+    }
+  }
+  try {
+    await invocation.agent.runMaintenance(() => {
+      return invocation.agent.session.append("user/message", {
+        id: crypto.randomUUID(),
+        role: "user",
+        content: [{ type: "text", text }],
+        source: { kind: "plugin:recall", form: "recall" }
+      }, opts);
+    });
+  } catch (error) {
+    return { kind: "error", text: error instanceof Error ? error.message : String(error) };
+  }
+  return { kind: "success", text: `Found ${result.totalMatches} matching event(s) (~${result.tokens} tokens).` };
+}
 
 function apply(ctx, config) {
   const resolved = resolveConfig(config);
+  // Resolve @deepseek-ai/dsh-session's appendPluginRecord lazily through the
+  // composition loader so this package stays dependency-free (the same pattern
+  // dsh-compaction-micro uses for its tool-pairing oracle). Used by /recall to
+  // spill a large index to a plugin:spill sibling instead of a file artifact.
+  let appendPluginRecordPromise;
+  const resolveAppendPluginRecord = () => {
+    if (appendPluginRecordPromise === undefined) {
+      appendPluginRecordPromise = Promise.resolve().then(async () => {
+        const loader = ctx.loader;
+        if (loader === undefined || loader === null || typeof loader.import !== "function") return undefined;
+        const mod = await loader.import("@deepseek-ai/dsh-session");
+        return mod !== null && mod !== void 0 && typeof mod.appendPluginRecord === "function" ? mod.appendPluginRecord : undefined;
+      }).catch(() => undefined);
+    }
+    return appendPluginRecordPromise;
+  };
   ctx.effect(() => {
     const disposers = [
       ctx.tools.register(defineRecallTool(resolved)),
-      ctx.tools.register(defineSearchTool(resolved))
+      ctx.tools.register(defineSearchTool(resolved)),
+      ctx.commands.register({
+        name: "recall",
+        description: "Search earlier conversation history by keyword or regex",
+        handler: async (invocation) => {
+          const appendPluginRecord = await resolveAppendPluginRecord();
+          return executeRecallCommand(invocation, appendPluginRecord);
+        }
+      })
     ];
     return () => {
       for (const dispose of disposers) dispose();
@@ -603,5 +772,4 @@ function apply(ctx, config) {
     return next();
   });
 }
-
 export { apply, inject, name };

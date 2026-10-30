@@ -5,5 +5,5 @@
 # patch is applied after this bundle, so per-profile overrides still win.
 
 - insert:
-    - id: dsh-compaction-micro
+    - id: compaction-micro
       name: '@blake-r/dsh-compaction-micro'

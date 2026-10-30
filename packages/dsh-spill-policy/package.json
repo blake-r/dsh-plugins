@@ -1,0 +1,30 @@
+{
+  "name": "@blake-r/dsh-spill-policy",
+  "version": "0.1.0",
+  "description": "Replacement spill policy: bound oversized model-facing tool results to a head/tail preview plus a spill notice.",
+  "type": "module",
+  "main": "src/dsh-spill-policy.mjs",
+  "exports": {
+    ".": "./src/dsh-spill-policy.mjs"
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "node --check src/dsh-spill-policy.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}

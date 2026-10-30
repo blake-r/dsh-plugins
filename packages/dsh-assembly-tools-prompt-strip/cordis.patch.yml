@@ -5,5 +5,5 @@
 # patch is applied after this bundle, so per-profile overrides still win.
 
 - insert:
-    - id: dsh-assembly-tools-prompt-strip
+    - id: assembly-tools-prompt-strip
       name: '@blake-r/dsh-assembly-tools-prompt-strip'

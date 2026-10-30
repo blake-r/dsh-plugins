@@ -1,0 +1,24 @@
+{
+  "name": "@blake-r/dsh-host-prompt-variables-config",
+  "version": "0.1.0",
+  "description": "DSH host plugin: register extra prompt variables so they can be referenced as {{name}} in any system-prompt section.",
+  "type": "module",
+  "main": "src/dsh-host-prompt-variables-config.mjs",
+  "exports": {
+    ".": "./src/dsh-host-prompt-variables-config.mjs"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "node --check src/dsh-host-prompt-variables-config.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}

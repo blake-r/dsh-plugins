@@ -23,11 +23,20 @@ dsh-plugins/
 | --- | --- |
 | [dsh-assembly-rewrite](packages/dsh-assembly-rewrite/README.md) | Rewrite named system-prompt assembly inserts (tools, sections, contexts, variables) from config. |
 | [dsh-assembly-tools-prompt-strip](packages/dsh-assembly-tools-prompt-strip/README.md) | Drop the `tool:<name>` prose guidance sections from the system prompt. |
+| [dsh-client-ui-archived-session-cleanup](packages/dsh-client-ui-archived-session-cleanup/README.md) | Settings control to delete archived sessions older than N days, with a live preview (host remote service + browser section). |
+| [dsh-client-ui-wider-chat](packages/dsh-client-ui-wider-chat/README.md) | Widen the conversation output column to near-full width while keeping the composer card at its current width. |
 | [dsh-command-from-prompt](packages/dsh-command-from-prompt/README.md) | Generic "command = user prompt" slash-command plugin. |
-| [dsh-compaction-micro](packages/dsh-compaction-micro/README.md) | Per-request trajectory re-composition for the kb preset. |
+| [dsh-command-status-interrupt](packages/dsh-command-status-interrupt/README.md) | A `/status` command that aborts the running generation and asks the model for a progress report without opening a new turn or a user bubble. |
+| [dsh-compaction-micro](packages/dsh-compaction-micro/README.md) | Per-request trajectory re-composition. |
+| [dsh-host-prompt-variables-config](packages/dsh-host-prompt-variables-config/README.md) | Register extra prompt variables so they can be referenced as `{{name}}` in any system-prompt section. |
+| [dsh-loop-guard](packages/dsh-loop-guard/README.md) | One package, two plugin rows: a reasoning-loop guard and a repeat-pattern reminder, sharing an internal coordination module. |
+| [dsh-spill-policy](packages/dsh-spill-policy/README.md) | Replacement spill policy: bound oversized model-facing tool results to a head/tail preview plus a spill notice. |
 | [dsh-provider-websearch-lightpanda](packages/dsh-provider-websearch-lightpanda/README.md) | WebRuntime provider pair backed by the lightpanda MCP server. |
-| [dsh-skill-from-tools](packages/dsh-skill-from-tools/README.md) | One skill per tool (no module grouping), short form. |
+| [dsh-skill-from-tools](packages/dsh-skill-from-tools/README.md) | Tools stay directly invocable; one skill per tool holds full details. |
 | [dsh-tool-filter-root-find](packages/dsh-tool-filter-root-find/README.md) | Gates tool calls that sweep the whole disk or home directory. |
+| [dsh-tool-mcp-mutation-gate](packages/dsh-tool-mcp-mutation-gate/README.md) | MCP command filter that asks the user for confirmation before executing a server's mutating tools. |
+| [dsh-tool-node](packages/dsh-tool-node/README.md) | `node_run` / `node_npm` tools confined through the DSH sandbox seam. |
+| [dsh-tool-python](packages/dsh-tool-python/README.md) | `py_run` / `py_pip` tools over a per-workspace venv, with on-the-fly repair of a relocated venv. |
 | [dsh-tool-trajectory-recall](packages/dsh-tool-trajectory-recall/README.md) | Model-facing same-session recall/search tools over the durable session log. |
 
 ## How it works
