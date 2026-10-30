@@ -1,15 +1,19 @@
 /**
- * dsh-spill-policy - replacement spill policy (task: spill-and-recall)
+ * dsh-spill-policy - log-based spill policy (task: spill-and-recall)
  *
  * Divergence from base @deepseek-ai/dsh-spill-policy preview policy:
  *
  *   - Base: byte cap (maxInlineBytes=50000 in this deployment); keeps a bounded
  *     head/tail preview plus a spill notice for oversized plain-text results.
  *
- *   - This plugin: same shape but a much tighter byte cap (maxInlineBytes,
- *     default 4096). The model first judges volume from a short head/tail
- *     preview plus the notice (total byte/line counts), then reads the full
- *     artifact back via read when it actually needs the data.
+ *   - This plugin: same preview shape but a much tighter byte cap
+ *     (maxInlineBytes, default 4096) and a LOG-BASED spill. The full oversized
+ *     output is never written to a file: it is committed to the durable session
+ *     log as a `plugin:spill` sibling record (an `ignorable` plugin record that
+ *     never enters the model-visible surface), and the model-facing result is
+ *     replaced by a compact hint that carries the sibling's seq plus the
+ *     head/tail preview and total byte/line counts. The model reads the full
+ *     output back via the `recall` tool (seq pointer) when it needs the data.
  *
  *   - Structured results are classified before saving but the artifact is saved
  *     VERBATIM, never reformatted: the model can still inspect the original
@@ -24,7 +28,7 @@
  *     MCP tools wrap their result in a content-block envelope
  *     ([{"type":"text","text":"..."}]); for MCP tools (name prefix "mcp__") the
  *     envelope is unwrapped ONCE right after flattening, so the size check, the
- *     saved artifact, and the preview all work on the payload, not the envelope.
+ *     saved record, and the preview all work on the payload, not the envelope.
  *     Mixed envelopes (non-text blocks) and non-envelope text stay verbatim.
  *     Classification no longer unwraps envelopes: a transport envelope that
  *     reaches it (nested MCP payload, non-MCP tool) classifies as a JSON array
@@ -35,36 +39,44 @@
  *     Parsing failure falls back to plain text("looks structured but does not
  *     parse -> treat as txt"): .txt extension,no summary.
  *
- *   - excludeTools (default ["read", "skill"]): model-facing results of these
- *     tools never spill and stay inline in full. read must stay excluded to avoid
- *     a read -> spill -> read again loop; skill results are instructions the model
- *     needs verbatim.
+ *   - excludeTools (default ["read", "skill", "recall"]): model-facing results
+ *     of these tools never spill and stay inline in full. read must stay
+ *     excluded to avoid a read -> spill -> read again loop; skill results are
+ *     instructions the model needs verbatim; recall is excluded so an un-paged
+ *     recall of a big spilled sibling does not cascade into a fresh spill of its
+ *     own (the hint instructs paging instead).
  *
  *   - The oversized preview is a MINIMAL sample, not a budget-filling head/tail
  *     slice: the first `headLines` non-empty lines and the last `tailLines`
  *     non-empty line(s), each capped at `lineCap` bytes. A per-line ellipsis
  *     plus "[truncated N bytes]" tag marks a capped line; a "[truncated N
  *     lines]" marker separates head from tail when lines were skipped. A single
- *     header line ("[Temporary saved at <locator>] [<stats>]") sits at the top and doubles
+ *     header line ("[Spilled to seq N] [<stats>]") sits at the top and doubles
  *     as the head/tail separator. lineCap is derived from the cap minus
  *     a worst-case overhead so the replacement never exceeds maxInlineBytes by
  *     construction (the best-effort guard below stays as a safety net).
  *
  * Oversized iff utf8ByteLength(text) > maxInlineBytes.
  *
- * Structure mirrors base exactly: registers NO service and owns NO storage -
- * storage is ctx.spillStore (@deepseek-ai/dsh-spill-local); the policy only
- * decides WHEN to spill and composes the replacement. Prepended listeners
+ * Structure mirrors base exactly: registers NO service and owns NO storage.
+ * The full content lives in the session log as a `plugin:spill` sibling record
+ * (committed via `appendPluginRecord` from @deepseek-ai/dsh-session, resolved
+ * lazily through ctx.loader so this package stays dependency-free); the policy
+ * only decides WHEN to spill and composes the replacement. Prepended listeners
  * delegate via next() so tool-owned projections run first.
  *
- * Arm 1 (tools/post-execute, prepended): bounds the model-facing result.
+ * Arm 1 (tools/post-execute, prepended): bounds the model-facing result. The
+ * sibling is appended BEFORE the tool/result lands, so its seq is known
+ * immediately and the hint can cite it; the tool/result itself carries the
+ * hint. There is no Arm 2 (tools/ptc-dispatch-log): `tool/ptc-dispatch` is not
+ * surface-eligible and never reaches the model window, so spilling it would
+ * only duplicate the durable-log copy invisibly — its oversized content stays
+ * inline in the ptc-dispatch record.
  *
- * Arm 2 (tools/ptc-dispatch-log, prepended): bounds the durable-log copy of
- * oversized sub-call results(the program value stays untouched).
- *
- * Best-effort contract identical to base semantics: no session owner,no
- * ctx.spillStore backend,or a save failure - log and return the original result;a
- * spill failure must NEVER turn a successful call into an isError or hide inline result.
+ * Best-effort contract identical to base semantics: no session owner, no
+ * dsh-session loader, or a record-append failure - log and return the original
+ * result; a spill failure must NEVER turn a successful call into an isError or
+ * hide inline result.
  *
  * Dependency-free host plugin except js-yaml(lazy dynamic import;when absent,
  * YAML classification is skipped and such results are treated as plain text).
@@ -82,11 +94,6 @@ function flattenPlainText(content) {
 		text += block.text;
 	}
 	return text;
-}
-
-/** The owning session id, or undefined for a call with no agent (a direct/test call). */
-function ownerSessionId(exec) {
-	return exec.agent?.session.header.id;
 }
 
 /** Prefix of `text` whose UTF-8 size does not exceed `maxBytes`; never splits code points. */
@@ -290,21 +297,21 @@ export function artifactExtension(kind){
  * undefined when the worst-case overhead alone already exceeds `cap` (the
  * caller then keeps the inline content).
  *
- * Layout (top to bottom): a single header line "[Temporary saved at <locator>] [<kind> ·
+ * Layout (top to bottom): a single header line "[Spilled to seq <seq>] [<kind> ·
  * N bytes · M lines · <summary>]", the first `headLines` non-empty lines, a
  * "[truncated N lines]" marker when lines were skipped, then the last
  * `tailLines` non-empty lines. Each sampled line is
  * capped at `lineCap` bytes; a capped line gains a "\u2026 [truncated N bytes]"
  * suffix. lineCap is derived so the result never exceeds `cap` by construction.
  */
-export function composeReplacement({ cap, headLines, tailLines, content, structured, locator }) {
+export function composeReplacement({ cap, headLines, tailLines, content, structured, seq }) {
 	const totalBytes = Buffer.byteLength(content, "utf8");
 	const lines = content.split("\n").length;
 	const label = kindLabel(structured?.kind, structured?.value);
 	// Whitespace in the structural summary is collapsed so the header always
 	// stays on one line (JSON keys / CSV headers may contain real newlines).
 	const rest = structured ? summarizeStructured(structured.kind, structured.value).replace(/\s+/g, " ") : "";
-	const notice1 = `[Result is too long and should be read from ${locator}] Read it with the read tool, never with bash (a bash read re-triggers the spill formation). [Below is the truncated version]`;
+	const notice1 = `[Spilled to seq ${seq}] Read it back with the recall tool (recall type="seq" id="${seq}"), never with read or bash (the content is in the session log, not a file). [Below is the truncated version]`;
 	const lineWord = lines === 1 ? "line" : "lines";
 	const notice2 = `[${label} \u00b7 ${totalBytes} bytes \u00b7 ${lines} ${lineWord}${rest ? ` \u00b7 ${rest}` : ""}]`;
 	const header = `${notice1} ${notice2}`;
@@ -348,34 +355,54 @@ export function apply(ctx, config) {
 	if (!Number.isInteger(headLines) || headLines < 0 || !Number.isInteger(tailLines) || tailLines < 0 || headLines + tailLines < 1) {
 		throw new Error(`dsh-spill-policy: headLines and tailLines must be non-negative integers with headLines + tailLines >= 1 (got headLines=${headLines}, tailLines=${tailLines})`);
 	}
-	const excludeTools = Array.isArray(config?.excludeTools) && config.excludeTools.length > 0 ? config.excludeTools : ["read", "skill"];
+	const excludeTools = Array.isArray(config?.excludeTools) && config.excludeTools.length > 0 ? config.excludeTools : ["read", "skill", "recall"];
 
-	async function spillReplacement(sessionId, toolName, callId, content) {
-		if (sessionId === void 0) {
-			ctx.logger.warn(`dsh-spill-policy: no session owner for ${toolName} ${callId}; keeping the inline content`);
-			return undefined;
+	// Resolve @deepseek-ai/dsh-session's appendPluginRecord lazily through the
+	// composition loader so this package stays dependency-free (the same pattern
+	// dsh-compaction-micro uses for its tool-pairing oracle). Returns undefined
+	// when the loader or the export is unavailable; the caller then keeps the
+	// inline content.
+	let sessionModulePromise;
+	const appendPluginRecord = () => {
+		if (sessionModulePromise === void 0) {
+			sessionModulePromise = Promise.resolve().then(async () => {
+				const loader = ctx.loader;
+				if (loader === void 0 || loader === null || typeof loader.import !== "function") return void 0;
+				const mod = await loader.import("@deepseek-ai/dsh-session");
+				return mod !== null && mod !== void 0 && typeof mod.appendPluginRecord === "function" ? mod.appendPluginRecord : void 0;
+			}).catch(() => void 0);
 		}
-		const store = ctx.get("spillStore");
-		if (!store) {
-			ctx.logger.warn("dsh-spill-policy: spill-store unavailable; keeping the inline content");
+		return sessionModulePromise;
+	};
+
+	async function spillReplacement(session, toolName, callId, content) {
+		if (session === void 0 || session === null) {
+			ctx.logger.warn(`dsh-spill-policy: no session owner for ${toolName} ${callId}; keeping the inline content`);
 			return undefined;
 		}
 		let structured;
 		try { structured = await tryParseStructured(content); } catch { structured = void 0; }
-		let ref;
+		const append = await appendPluginRecord();
+		if (typeof append !== "function") {
+			ctx.logger.warn("dsh-spill-policy: dsh-session appendPluginRecord unavailable; keeping the inline content");
+			return undefined;
+		}
+		let seq;
 		try {
-			ref = await store.saveText({
-				owner: { sessionId },
-				source: { kind: "tool", toolName, callId },
-				suggestedName: `${toolName}${structured ? artifactExtension(structured.kind) : ".txt"}`,
+			// Direct append: tools/post-execute runs inside finalizeScheduledExecution,
+			// before the tool/result is appended, so no session append is mid-publish
+			// here and the record commits synchronously (its seq is known immediately).
+			seq = append(session, "plugin:spill", {
+				toolName,
+				callId,
 				content
 			});
 		} catch (error) {
-			ctx.logger.warn(`dsh-spill-policy: saveText failed for ${toolName}: ${String(error)}; keeping the inline content`);
+			ctx.logger.warn(`dsh-spill-policy: plugin:spill append failed for ${toolName}: ${String(error)}; keeping the inline content`);
 			return undefined;
 		}
 		const replacedText = composeReplacement({
-			cap, headLines, tailLines, content, structured, locator: ref.locator
+			cap, headLines, tailLines, content, structured, seq
 		});
 		if (replacedText === void 0) {
 			ctx.logger.warn(`dsh-spill-policy: spill notice for ${toolName} exceeds maxInlineBytes; keeping the inline content`);
@@ -400,7 +427,7 @@ export function apply(ctx, config) {
 		if (text === void 0) return decision;
 		const payload = exec.name.startsWith("mcp__") ? unwrapEnvelope(text) : text;
 		if (Buffer.byteLength(payload, "utf8") <= cap) return decision;
-		const replacedText = await spillReplacement(ownerSessionId(exec), exec.name, exec.callId, payload);
+		const replacedText = await spillReplacement(exec.agent?.session, exec.name, exec.callId, payload);
 		if (replacedText === void 0) return decision;
 		return {
 			kind: "accept",
@@ -411,18 +438,4 @@ export function apply(ctx, config) {
 			...decision.additionalContexts ? { additionalContexts: decision.additionalContexts } : {}
 		};
 	}, { prepend: true });
-
-ctx.on("tools/ptc-dispatch-log", async (dispatch , next) => {
-	const content = await next();
-	const text = flattenPlainText(content);
-	if (text === void 0) return content;
-	const payload = dispatch.name.startsWith("mcp__") ? unwrapEnvelope(text) : text;
-	if (Buffer.byteLength(payload, "utf8") <= cap) return content;
-	const replacedText = await spillReplacement(ownerSessionId(dispatch.exec), dispatch.name, dispatch.subCallId, payload);
-	if (replacedText === void 0) return content;
-	return [{
-			type: "text",
-			text: replacedText
-}];
-}, { prepend: true });
 }
