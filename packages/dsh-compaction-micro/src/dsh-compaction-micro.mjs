@@ -1380,64 +1380,91 @@ function apply(ctx, config = {}) {
       }
       if (anchorIdx === -1) return;
 
-      // Fold region: the contiguous foldable run after the boundary, strictly
-      // BEFORE the anchor. Everything there is folded — text-bearing steps,
-      // failed steps and reasoning-only blocks alike (the climb-from-the-end
-      // rule folds all of it, keeping only the anchor + newer live).
+      // Fold region: everything after the boundary and strictly BEFORE the
+      // anchor — text-bearing steps, failed steps and reasoning-only blocks
+      // alike (the climb-from-the-end rule folds all of it, keeping only the
+      // anchor + newer live).
+      //
+      // The region is split into contiguous foldable RUNS at every non-foldable
+      // node (a real user message, an agent-message frame, a plugin note). The
+      // split is not a choice: the engine's `replace` op takes a contiguous seq
+      // range (`replacementRange` in dsh-session splices `start..end`
+      // inclusive), so one checkpoint physically cannot span a break.
+      //
+      // All runs are collected FIRST and committed in this same pre-step. One
+      // run per pre-step was a defect: each committed checkpoint immediately
+      // became the nearest boundary and blocked every later run until the next
+      // step, so a single backlog surfaced as several micro-compaction messages
+      // minutes apart. Collecting first also means `boundaryIndex`/`anchorIdx`
+      // are computed once against the pre-fold surface — exactly what we want,
+      // since the runs are disjoint by construction and a committed checkpoint
+      // must not shrink the region still to be drained.
       const startIdx = boundaryIdx + 1;
       if (startIdx >= anchorIdx) return;
 
-      const shadowed = [];
-      let toolCalls = 0;
-      let started = false;
+      const segments = [];
+      let run = [];
       for (let i = startIdx; i < anchorIdx; i++) {
         const event = session.eventAt ? session.eventAt(nodes[i]) : undefined;
-        if (isFoldableNode(event)) {
-          started = true;
-          const node = projectNode(session, nodes[i]);
-          if (node === null) continue;
-          if (node.message !== null && node.message !== undefined && node.message.content !== undefined) {
-            for (const block of node.message.content) {
-              if (block !== null && block !== undefined && block.type === "tool-call") toolCalls++;
-            }
+        if (!isFoldableNode(event)) {
+          if (run.length > 0) {
+            segments.push(run);
+            run = [];
           }
-          shadowed.push(node);
           continue;
         }
-        if (started) break;
-        // leading non-foldable prefix (system prompt, user question): stays live
-        // above the fold range, skipped.
+        const node = projectNode(session, nodes[i]);
+        if (node !== null) run.push(node);
       }
-      if (shadowed.length === 0) return;
+      if (run.length > 0) segments.push(run);
+      if (segments.length === 0) return;
 
-      const blocks = compileIntermediate(shadowed);
-      if (blocks === null || blocks.length === 0) return;
+      for (const shadowed of segments) {
+        const blocks = compileIntermediate(shadowed);
+        // Nothing to emit for this run: there is no content to lose by letting
+        // the boundary advance past it, so keep draining the later runs.
+        if (blocks === null || blocks.length === 0) continue;
 
-      // The checkpoint's turn is the turn of the FOLDED CONTENT, not the current
-      // pre-step turn. When an artificial break (server restart) leaves the
-      // previous turn unconsolidated, the fold region can cross into that turn's
-      // content; labeling it with the current turn would mis-attribute the folded
-      // steps to the wrong turn and the turn/end consolidation would route them
-      // to the wrong per-turn node. Deriving the turn from the shadowed events
-      // keeps the checkpoint honest about which turn it actually folded.
-      let shadowedTurn = Number.isSafeInteger(turn) ? turn : 0;
-      for (const n of shadowed) {
-        if (n.event && n.event.data && Number.isSafeInteger(n.event.data.turn)) {
-          shadowedTurn = n.event.data.turn;
-          break;
+        let toolCalls = 0;
+        for (const node of shadowed) {
+          if (node.message === null || node.message === undefined || node.message.content === undefined) continue;
+          for (const block of node.message.content) {
+            if (block !== null && block !== undefined && block.type === "tool-call") toolCalls++;
+          }
         }
-      }
 
-      const meta = {
-        phase: "reasoning",
-        mode: "intermediateFold",
-        turn: shadowedTurn,
-        span: [shadowed[0].seq, shadowed[shadowed.length - 1].seq],
-        tokens: shadowed.reduce((acc, n) => acc + (n.price || 0), 0),
-        tools: toolCalls,
-        shadowedSeqs: shadowed.map((n) => n.seq)
-      };
-      commitReplacement(session, shadowed, blocks, meta, `micro (intermediate, pre-step, turn ${turn})`, "intermediateFold");
+        // The checkpoint's turn is the turn of the FOLDED CONTENT, not the current
+        // pre-step turn. When an artificial break (server restart) leaves the
+        // previous turn unconsolidated, the fold region can cross into that turn's
+        // content; labeling it with the current turn would mis-attribute the folded
+        // steps to the wrong turn and the turn/end consolidation would route them
+        // to the wrong per-turn node. Deriving the turn from each run's own events
+        // keeps every checkpoint honest about which turn it actually folded.
+        let shadowedTurn = Number.isSafeInteger(turn) ? turn : 0;
+        for (const n of shadowed) {
+          if (n.event && n.event.data && Number.isSafeInteger(n.event.data.turn)) {
+            shadowedTurn = n.event.data.turn;
+            break;
+          }
+        }
+
+        const meta = {
+          phase: "reasoning",
+          mode: "intermediateFold",
+          turn: shadowedTurn,
+          span: [shadowed[0].seq, shadowed[shadowed.length - 1].seq],
+          tokens: shadowed.reduce((acc, n) => acc + (n.price || 0), 0),
+          tools: toolCalls,
+          shadowedSeqs: shadowed.map((n) => n.seq)
+        };
+        const committed = commitReplacement(session, shadowed, blocks, meta, `micro (intermediate, pre-step, turn ${turn})`, "intermediateFold");
+        // A refused run (pairing-unsafe cut) stops the drain: committing a later
+        // run would move the boundary PAST this one, and everything below the
+        // boundary is never revisited — the refused run's reasoning would stay
+        // live until the turn/end full fold. Stopping keeps it retryable on the
+        // next pre-step.
+        if (committed === null) break;
+      }
     } catch (error) {
       log("warn", `intermediate fold failed: ${error instanceof Error ? error.message : String(error)}`);
     }
