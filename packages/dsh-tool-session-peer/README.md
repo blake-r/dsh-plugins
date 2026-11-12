@@ -2,6 +2,12 @@
 
 Peer messaging between adjacent live Sessions.
 
+Requires DSH **0.2.2-rc.2 or newer**. Since 0.2.2 the `ctx.agents` registry no
+longer offers an ownership predicate and hands out bare `{ id }` handles, so
+root detection reads `delegationDepth` from the session header instead (see
+[Scope](#scope)). The header field also exists in 0.2.1-rc.5, so this version
+runs on both.
+
 Subagents already talk to their parent and children through `send_message`
 (`@deepseek-ai/dsh-subagent`), but that runtime enforces direct parent/child
 adjacency and exposes no way to address an unrelated Session. Two GUI tabs or
@@ -41,8 +47,10 @@ how to answer with `session_send`.
 - Only **live** Sessions are addressable. A cold (persisted but not running)
   Session is not resumed: waking someone else's tab from disk would mount its
   preset behind its owner's back.
-- Only runtime **roots** are listed (`ctx.agents.isOwnedBy(id, undefined)`), so
-  another Session's subagent children stay private to it.
+- Only runtime **roots** are listed, so another Session's subagent children stay
+  private to it. Root-ness comes from the persisted session header: an Agent
+  whose header reports a non-zero `delegationDepth` is a subagent child and is
+  dropped; an absent or zero depth means top-level.
 - `session_peers` is scoped to the caller's `cwd`; a caller with no known
   workspace cannot be scoped and sees every live root.
 - Messages are capped at 32 KiB and rate-limited to 20 per minute per sending

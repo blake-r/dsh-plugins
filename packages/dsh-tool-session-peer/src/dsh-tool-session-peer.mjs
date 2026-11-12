@@ -35,8 +35,14 @@
 //   - Only live Sessions are addressable; a cold (persisted, not running)
 //     Session is not resumed here -- waking someone else's tab from disk would
 //     mount its preset behind its owner's back.
-//   - Only runtime roots are listed (`ctx.agents.isOwnedBy(id, undefined)`), so
-//     another Session's subagent children stay private to it.//
+//   - Only runtime roots are listed, so another Session's subagent children stay
+//     private to it. Root-ness is read from the persisted session header: a
+//     child carries a non-zero `delegationDepth`, a top-level Session carries
+//     none (or zero). The registry no longer answers ownership questions and a
+//     registry agent is a bare handle, so the header is read directly rather
+//     than through `@deepseek-ai/dsh-subagent`'s `delegationDepthOf`, which also
+//     consults runtime agent options that DSH 0.2.2 does not expose there.
+//
 // ── schema format ───────────────────────────────────────────────────────────
 // Tools register through raw JSON Schema (`ctx.tools.register`, not
 // `defineTool`): per-property `required: true` is rejected outside object
@@ -130,12 +136,23 @@ function peerRow(ctx, agent) {
   };
 }
 
+/**
+ * Delegation depth recorded in one Agent's session header.
+ *
+ * Absent, non-numeric or zero all mean "top-level": older persisted sessions
+ * predate the field, and a missing header must never throw here.
+ */
+function headerDelegationDepth(agent) {
+  const depth = agent?.session?.header?.delegationDepth;
+  return typeof depth === "number" && Number.isSafeInteger(depth) && depth > 0 ? depth : 0;
+}
+
 /** Every live top-level Agent except one exact Session id, in registration order. */
 function livePeers(ctx, selfId) {
   const rows = [];
   for (const agent of ctx.agents.list()) {
     if (String(agent.id) === selfId) continue;
-    if (!ctx.agents.isOwnedBy(agent.id, undefined)) continue;
+    if (headerDelegationDepth(agent) !== 0) continue;
     rows.push(peerRow(ctx, agent));
   }
   return rows;
