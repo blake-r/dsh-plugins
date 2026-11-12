@@ -8,11 +8,19 @@
 // unrelated live Session.
 //
 // This plugin closes that gap with two tools:
-//   - `session_peers` lists every other live top-level Session (id, title,
-//     status, cwd, preset) so an agent can address one;
+//   - `session_peers` lists the neighbouring live top-level Sessions -- those
+//     working in the SAME workspace directory as the caller -- with id, title,
+//     status, cwd and preset;
 //   - `session_send` delivers one model-authored message into another live
 //     Session's inbox (`agent.followup` queues a turn, `agent.steer` delivers at
 //     the nearest step boundary), waking an idle peer.
+//
+// The two scopes deliberately differ. Discovery is workspace-local: an agent is
+// told about the Sessions it shares a checkout with, not about every tab in the
+// process. Delivery is process-wide: any exact live session id resolves, so a
+// Session that was introduced out of band (a message it received, a user note)
+// can be answered even when it lives in another workspace. That wider reach is
+// intentionally NOT advertised in either tool description.
 //
 // Delivery uses only public API (`ctx.agents.get`, `agent.followup/steer`,
 // `createUserMessage`) -- no upstream patch of the subagent runtime, whose
@@ -28,8 +36,7 @@
 //     Session is not resumed here -- waking someone else's tab from disk would
 //     mount its preset behind its owner's back.
 //   - Only runtime roots are listed (`ctx.agents.isOwnedBy(id, undefined)`), so
-//     another Session's subagent children stay private to it.
-//
+//     another Session's subagent children stay private to it.//
 // ── schema format ───────────────────────────────────────────────────────────
 // Tools register through raw JSON Schema (`ctx.tools.register`, not
 // `defineTool`): per-property `required: true` is rejected outside object
@@ -52,7 +59,7 @@ class PeerError extends Error {
 }
 
 const PEERS_DESCRIPTION =
-  "List other live Sessions (peer agents) in this Harness process, excluding this Session and every subagent child. Each row gives the exact session id to pass to session_send, plus its title, status (idle or running), working directory, and preset.";
+  "List the neighbouring live Sessions: other top-level Sessions working in the same workspace directory as this one, excluding this Session and every subagent child. Each row gives the exact session id to pass to session_send, plus its title, status (idle or running), working directory, and preset.";
 
 const SEND_DESCRIPTION =
   "Send one message to another live Session (a peer agent): the cross-Session counterpart of send_message between subagents. A running target receives it at its nearest step boundary with mode=steer; otherwise it is queued as that Session's next turn and wakes an idle target. The target sees your session id and can answer with session_send back to you.";
@@ -123,8 +130,8 @@ function peerRow(ctx, agent) {
   };
 }
 
-/** Every live top-level Agent except one exact Session id. */
-function peersOf(ctx, selfId) {
+/** Every live top-level Agent except one exact Session id, in registration order. */
+function livePeers(ctx, selfId) {
   const rows = [];
   for (const agent of ctx.agents.list()) {
     if (String(agent.id) === selfId) continue;
@@ -132,6 +139,23 @@ function peersOf(ctx, selfId) {
     rows.push(peerRow(ctx, agent));
   }
   return rows;
+}
+
+/** The caller's workspace directory, or an empty string when it has none. */
+function workspaceOf(agent) {
+  const cwd = agent?.session?.header?.cwd;
+  return typeof cwd === "string" ? cwd : "";
+}
+
+/**
+ * Peers that share the caller's workspace directory. A caller without a known
+ * workspace cannot be scoped, so it sees every live root instead of nothing.
+ */
+function peersOf(ctx, agent) {
+  const rows = livePeers(ctx, String(agent.id));
+  const cwd = workspaceOf(agent);
+  if (cwd === "") return rows;
+  return rows.filter((row) => row.cwd === cwd);
 }
 
 /** Render one peer row as a single model-facing line. */
@@ -143,24 +167,31 @@ function formatPeer(row) {
   return parts.join(" | ");
 }
 
-/** Resolve one free-form target reference against the current peer roster. */
-function resolveTarget(rows, raw) {
+/**
+ * Resolve one target reference.
+ *
+ * An exact live session id resolves anywhere in the process -- that is the
+ * delivery scope. Title and id-fragment matching stays inside `scoped`, the
+ * caller's workspace neighbours, so a guess can never land in another
+ * workspace by coincidence. A failed lookup enumerates only `scoped`.
+ */
+function resolveTarget(live, scoped, raw) {
   const wanted = String(raw ?? "").trim();
   if (wanted === "") throw new PeerError("target must not be empty", "PEER_TARGET_REQUIRED");
-  const exactId = rows.find((row) => row.id === wanted);
+  const exactId = live.find((row) => row.id === wanted);
   if (exactId !== undefined) return exactId;
   const lowered = wanted.toLowerCase();
-  const exactTitle = rows.filter((row) => row.title.toLowerCase() === lowered);
+  const exactTitle = scoped.filter((row) => row.title.toLowerCase() === lowered);
   if (exactTitle.length === 1) return exactTitle[0];
-  const partial = rows.filter(
+  const partial = scoped.filter(
     (row) => row.title.toLowerCase().includes(lowered) || row.id.toLowerCase().includes(lowered)
   );
   if (partial.length === 1) return partial[0];
   if (partial.length === 0) {
     throw new PeerError(
-      rows.length === 0
-        ? `no other live Session matches "${wanted}"; there are no peers right now`
-        : `no other live Session matches "${wanted}"; available peers:\n${rows.map(formatPeer).join("\n")}`,
+      scoped.length === 0
+        ? `no live Session matches "${wanted}"; there are no peers in this workspace right now`
+        : `no live Session matches "${wanted}"; peers in this workspace:\n${scoped.map(formatPeer).join("\n")}`,
       "PEER_TARGET_NOT_FOUND"
     );
   }
@@ -209,12 +240,12 @@ class RateLimiter {
 }
 
 /** Build the model-facing peer list payload for one calling Session. */
-function peersPayload(ctx, selfId) {
-  const rows = peersOf(ctx, selfId);
+function peersPayload(ctx, agent) {
+  const rows = peersOf(ctx, agent);
   const text =
     rows.length === 0
-      ? "(no other live Sessions)"
-      : `${rows.length} other live Session(s):\n${rows.map(formatPeer).join("\n")}`;
+      ? "(no other live Sessions in this workspace)"
+      : `${rows.length} other live Session(s) in this workspace:\n${rows.map(formatPeer).join("\n")}`;
   const peers = rows.map((row) => ({
     id: row.id,
     title: row.title,
@@ -248,7 +279,7 @@ async function deliverPeer(ctx, limiter, createUserMessage, exec, args) {
     );
   }
   limiter.admit(senderId);
-  const target = resolveTarget(peersOf(ctx, senderId), args.target);
+  const target = resolveTarget(livePeers(ctx, senderId), peersOf(ctx, sender), args.target);
   const targetAgent = ctx.agents.get(target.id);
   if (targetAgent === undefined) {
     throw new PeerError(`Session "${target.id}" is no longer live`, "PEER_TARGET_GONE");
@@ -284,9 +315,9 @@ function defineTools(ctx, resolveCreateUserMessage) {
     parameters: { type: "object", properties: {}, required: [] },
     output: PEERS_OUTPUT,
     execute(_args, exec) {
-      const selfId = String(requireAgent(exec, "session_peers").id);
+      const agent = requireAgent(exec, "session_peers");
       limiter.prune();
-      return peersPayload(ctx, selfId);
+      return peersPayload(ctx, agent);
     },
     presentCall() {
       return { card: "generic", title: "List peer sessions", kind: "read", rawInput: "" };

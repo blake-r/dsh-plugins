@@ -11,8 +11,18 @@ This plugin adds two model-facing tools:
 
 | Tool | Purpose |
 |---|---|
-| `session_peers` | List every other live top-level Session: exact session id, title, status (`idle`/`running`), cwd, preset. |
+| `session_peers` | List the neighbouring live Sessions — those working in the same workspace directory — with exact session id, title, status (`idle`/`running`), cwd, preset. |
 | `session_send` | Deliver one message into another live Session's inbox. |
+
+Discovery and delivery have deliberately different scopes:
+
+- **Discovery is workspace-local.** `session_peers` shows only top-level
+  Sessions whose `cwd` equals the caller's, so an agent learns about the tabs it
+  shares a checkout with, not about every tab in the process.
+- **Delivery is process-wide.** `session_send` resolves any exact live session
+  id, including one in another workspace. That reach is not advertised in either
+  tool description: it exists for Sessions introduced out of band (a message
+  received, a note from the user), not as a browsing surface.
 
 Delivery semantics mirror subagent steering:
 
@@ -33,6 +43,8 @@ how to answer with `session_send`.
   preset behind its owner's back.
 - Only runtime **roots** are listed (`ctx.agents.isOwnedBy(id, undefined)`), so
   another Session's subagent children stay private to it.
+- `session_peers` is scoped to the caller's `cwd`; a caller with no known
+  workspace cannot be scoped and sees every live root.
 - Messages are capped at 32 KiB and rate-limited to 20 per minute per sending
   Session.
 
