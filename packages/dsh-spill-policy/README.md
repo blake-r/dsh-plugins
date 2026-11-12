@@ -38,10 +38,9 @@ Divergence from base `@deepseek-ai/dsh-spill-policy`:
 - The preview is a MINIMAL sample, not a budget-filling head/tail slice. A
   capped line gains a "… [truncated N bytes]" suffix; skipped middle lines are
   summarized by a "[truncated N lines]" marker. A single header line —
-  "[Spilled to <path>] The full output is that file on disk: read it with the
-  read tool (offset/limit to page), or parse it with bash and any script (jq,
-  python3, grep) - it is plain <kind> text. [Below is the truncated version]
-  [<stats>]" — sits at the top and doubles as the head/tail separator.
+  "[Spilled to <path>] Full output on disk - read or parse that file. Truncated
+  preview below. [<stats>]" — sits at the top and doubles as the head/tail
+  separator.
 - `lineCap` is derived from `maxInlineBytes` minus a worst-case overhead, so
   the replacement never exceeds `maxInlineBytes` by construction.
 
@@ -53,7 +52,7 @@ surface-eligible and never reaches the model window.
 For an oversized result the replacement reads (top to bottom):
 
 ```
-[Spilled to /…/sessions/…/session-abc/spill/20261112134653818-bash-call_1.jsonl] The full output is that file on disk: read it with the read tool (offset/limit to page), or parse it with bash and any script (jq, python3, grep) - it is plain JSONL text. [Below is the truncated version] [JSONL · 97782 bytes · 5000 lines · 5000 records · first-record keys: a, b]
+[Spilled to /…/sessions/…/session-abc/spill/20261112134653818-bash-call_1.jsonl] Full output on disk - read or parse that file. Truncated preview below. [JSONL · 97782 bytes · 5000 lines · 5000 records · first-record keys: a, b]
 {"a":0,"b":1}
 {"a":1,"b":2}
 [truncated 4997 lines]
@@ -63,7 +62,7 @@ For an oversized result the replacement reads (top to bottom):
 A single line longer than `lineCap` is capped with an ellipsis and a byte count:
 
 ```
-[Spilled to …/spill/20261112134653818-bash-call_2.json] … [Below is the truncated version] [JSON object · 4029 bytes · 1 line · keys: a, b, c]
+[Spilled to …/spill/20261112134653818-bash-call_2.json] Full output on disk - read or parse that file. Truncated preview below. [JSON object · 4029 bytes · 1 line · keys: a, b, c]
 {"a":1,"b":2,"c":[0,1,2,...,348,… [truncated 2725 bytes]
 ```
 
