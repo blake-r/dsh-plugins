@@ -19,8 +19,14 @@
 # Do not raise it back to 131072 (32K tokens): the local subprocess runtime caps
 # one bash stream at ~120 KB, so a higher threshold makes bash results
 # unreachable for this policy — they get truncated into a temp file instead of
-# spilling into the session log, and only tools without their own cap (grep,
-# glob, MCP, subagents) ever spill.
+# spilling, and only tools without their own cap (grep, glob, MCP, subagents)
+# ever spill.
+#
+# Oversized results are written to a file under the session's own directory
+# (<sessionDir>/spill/), next to session.jsonl.zstd, and the model-facing result
+# becomes a hint carrying that absolute path plus a head/tail preview. Nothing
+# is appended to the session log: agents read the artifact with `read` or parse
+# it with bash and any script.
 - id: spill-policy
   disabled: true
 
