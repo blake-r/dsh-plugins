@@ -13,12 +13,13 @@ Subagents already talk to their parent and children through `send_message`
 adjacency and exposes no way to address an unrelated Session. Two GUI tabs or
 two terminal Sessions had no channel at all.
 
-This plugin adds two model-facing tools:
+This plugin adds three model-facing tools:
 
 | Tool | Purpose |
 |---|---|
 | `session_peers` | List the neighbouring live Sessions — those working in the same workspace directory — with exact session id, title, status (`idle`/`running`), cwd, preset. |
 | `session_send` | Deliver one message into another live Session's inbox. |
+| `session_broadcast` | Deliver one message to every workspace neighbour at once. |
 
 Discovery and delivery have deliberately different scopes:
 
@@ -53,8 +54,16 @@ how to answer with `session_send`.
   dropped; an absent or zero depth means top-level.
 - `session_peers` is scoped to the caller's `cwd`; a caller with no known
   workspace cannot be scoped and sees every live root.
+- **Archived Sessions are excluded.** An archived Session can still have a
+  live, idle Agent, but the archive set hides it from every grouping surface
+  and the host `agent/pre-step` gate rejects its steps: a followup there would
+  claim the message, run a turn nobody can see, and drop the input unrun.
+  `session_peers` therefore omits archived Sessions, and `session_send` refuses
+  an archived target with `PEER_TARGET_ARCHIVED` instead of reporting a
+  delivery that never happens. Unarchive the Session in the GUI to reach it.
 - Messages are capped at 32 KiB and rate-limited to 20 per minute per sending
-  Session.
+  Session. A broadcast reserves its whole fan-out before sending, so it either
+  goes out completely or fails with `PEER_RATE_LIMITED`.
 
 ## Composition
 

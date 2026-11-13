@@ -1,7 +1,7 @@
 {
   "name": "@blake-r/dsh-tool-session-peer",
-  "version": "0.1.1",
-  "description": "Model-facing peer messaging between adjacent live Sessions (session_peers, session_send).",
+  "version": "0.2.0",
+  "description": "Model-facing peer messaging between adjacent live Sessions (session_peers, session_send, session_broadcast).",
   "type": "module",
   "main": "src/dsh-tool-session-peer.mjs",
   "exports": {
