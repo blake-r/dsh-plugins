@@ -60,7 +60,9 @@
 // waterfall). It tells the model
 // that content elided/truncated by compaction (tool calls, results, skills,
 // checkpoints) is restorable in full through `recall`/`search`, so the model
-// reaches for those tools instead of guessing. The hint lives in the prompt
+// reaches for those tools instead of guessing — and that a tool result folded
+// by micro-compaction is read back through its `-> result M` pointer instead of
+// re-running the command. The hint lives in the prompt
 // (re-assembled every turn), not in the session log, so micro-compaction never
 // folds it. Requires injecting `["systemPrompt"]` in addition to `["tools"]`.
 //
@@ -676,7 +678,7 @@ function defineSearchTool(resolved) {
  */
 /** Text of the system-prompt hint about restoring compacted content. */
 const RECALL_HINT_TEXT =
-  "Folded `seq`/`result`/`checkpoint` content may be restored in full using tools `recall` by id or `search` by keyword — `search` returns an untruncated (seq N) index; don't guess. Large spilled outputs are recalled by seq; page them with recall's limit/offset.";
+  "Folded `seq`/`result`/`checkpoint` content may be restored in full using tools `recall` by id or `search` by keyword — `search` returns an untruncated (seq N) index; don't guess. Large spilled outputs are recalled by seq; page them with recall's limit/offset. When a tool call you already made has been folded (its row reads `* name \"...\" (seq N -> result M)`), read that result back with `recall type=\"result\" id=\"M\"` instead of running the command again.";
 
 /** Execute one grep-based `/recall` request against the calling agent's session. */
 async function executeRecallCommand(invocation, appendPluginRecord) {
