@@ -1,0 +1,31 @@
+{
+  "name": "@blake-r/dsh-tool-session-peer",
+  "version": "0.2.0",
+  "description": "Model-facing peer messaging between adjacent live and persisted Sessions (session_peers, session_send, session_broadcast).",
+  "type": "module",
+  "main": "src/dsh-tool-session-peer.mjs",
+  "exports": {
+    ".": "./src/dsh-tool-session-peer.mjs"
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "node --check src/dsh-tool-session-peer.mjs && node --test test/*.test.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
