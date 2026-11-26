@@ -1,6 +1,6 @@
 # @blake-r/dsh-tool-session-peer
 
-Peer messaging between adjacent live Sessions.
+Peer messaging between adjacent live and persisted Sessions.
 
 Requires DSH **0.2.2-rc.2 or newer**. Since 0.2.2 the `ctx.agents` registry no
 longer offers an ownership predicate and hands out bare `{ id }` handles, so
@@ -17,24 +17,27 @@ This plugin adds three model-facing tools:
 
 | Tool | Purpose |
 |---|---|
-| `session_peers` | List the neighbouring live Sessions — those working in the same workspace directory — with exact session id, title, status (`idle`/`running`), cwd, preset. |
-| `session_send` | Deliver one message into another live Session's inbox. |
-| `session_broadcast` | Deliver one message to every workspace neighbour at once. |
+| `session_peers` | List non-archived Sessions accounted to the same workspace, live or cold, after their first user message; empty UI drafts are hidden. |
+| `session_send` | Deliver one message by exact session id or exact title; resume a cold persisted target only when explicitly addressed. |
+| `session_broadcast` | Deliver one message to every live workspace neighbour; cold Sessions are skipped. |
 
 Discovery and delivery have deliberately different scopes:
 
-- **Discovery is workspace-local.** `session_peers` shows only top-level
-  Sessions whose `cwd` equals the caller's, so an agent learns about the tabs it
-  shares a checkout with, not about every tab in the process.
-- **Delivery is process-wide.** `session_send` resolves any exact live session
-  id, including one in another workspace. That reach is not advertised in either
-  tool description: it exists for Sessions introduced out of band (a message
-  received, a note from the user), not as a browsing surface.
+- **Discovery is workspace-local.** `session_peers` shows non-archived root
+  Sessions whose `cwd` equals the caller's and whose ids are accounted to a
+  workspace. It includes cold persisted Sessions with conversation history so
+  restart does not make an active tab disappear from addressing, but excludes
+  blank UI drafts that have not received a `user/message` event.
+- **Delivery by id is process-wide.** An exact session id resolves across
+  workspaces; an exact title resolves only among the caller's listed peers.
+  Substrings and approximate matches are never used.
 
 Delivery semantics mirror subagent steering:
 
+- a cold persisted Session is resumed on its existing session id, composing its recorded agent preset; no new Session is created;
 - target `running` -> `agent.steer`, so the message lands at its nearest step boundary;
-- target `idle` -> `agent.followup`, so it becomes that Session's next turn and wakes it.
+- target `idle` or newly resumed -> `agent.followup`, so it becomes that Session's next turn and wakes it;
+- `session_broadcast` skips cold Sessions. Use an exact id or title with `session_send` to wake one.
 
 The delivered message carries the durable source
 `{ kind: 'agent-message', form: 'relay', senderSessionId }` — the same
@@ -45,15 +48,16 @@ how to answer with `session_send`.
 
 ## Scope
 
-- Only **live** Sessions are addressable. A cold (persisted but not running)
-  Session is not resumed: waking someone else's tab from disk would mount its
-  preset behind its owner's back.
+- Cold persisted Sessions are discoverable only when they remain in a
+  workspace's session account and are not archived. They are resumed only on an
+  exact `session_send` address, using the existing id and recorded preset. A
+  title must exactly match; duplicate titles are ambiguous and require the id.
 - Only runtime **roots** are listed, so another Session's subagent children stay
   private to it. Root-ness comes from the persisted session header: an Agent
   whose header reports a non-zero `delegationDepth` is a subagent child and is
   dropped; an absent or zero depth means top-level.
 - `session_peers` is scoped to the caller's `cwd`; a caller with no known
-  workspace cannot be scoped and sees every live root.
+  workspace cannot be scoped and sees every accounted non-archived root.
 - **Archived Sessions are excluded.** An archived Session can still have a
   live, idle Agent, but the archive set hides it from every grouping surface
   and the host `agent/pre-step` gate rejects its steps: a followup there would

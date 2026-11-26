@@ -8,20 +8,19 @@
 // unrelated live Session.
 //
 // This plugin closes that gap with three tools:
-//   - `session_peers` lists the neighbouring live top-level Sessions -- those
-//     working in the SAME workspace directory as the caller -- with id, title,
-//     status, cwd and preset;
-//   - `session_send` delivers one model-authored message into another live
-//     Session's inbox (`agent.followup` queues a turn, `agent.steer` delivers at
-//     the nearest step boundary), waking an idle peer;
+//   - `session_peers` lists neighbouring non-archived top-level Sessions --
+//     live or persisted/cold -- in the SAME workspace directory as the caller,
+//     with id, title, status, cwd and preset;
+//   - `session_send` resolves an exact session id or exact title, resuming a
+//     persisted/cold recipient only when that exact target is addressed, then
+//     delivers into its inbox (`agent.followup` or `agent.steer`);
 //   - `session_broadcast` delivers one message to every neighbour at once.
 //
 // The two scopes deliberately differ. Discovery is workspace-local: an agent is
 // told about the Sessions it shares a checkout with, not about every tab in the
-// process. Delivery is process-wide: any exact live session id resolves, so a
-// Session that was introduced out of band (a message it received, a user note)
-// can be answered even when it lives in another workspace. That wider reach is
-// intentionally NOT advertised in either tool description.
+// process. Delivery is process-wide by exact session id, so a Session introduced
+// out of band can be answered even when it lives in another workspace. Exact
+// titles resolve only among the caller's workspace peers.
 //
 // Delivery uses only public API (`ctx.agents.get`, `agent.followup/steer`,
 // `createUserMessage`) -- no upstream patch of the subagent runtime, whose
@@ -33,9 +32,8 @@
 // the receiving Session instead of impersonating its human user.
 //
 // Scope notes:
-//   - Only live Sessions are addressable; a cold (persisted, not running)
-//     Session is not resumed here -- waking someone else's tab from disk would
-//     mount its preset behind its owner's back.
+//   - Cold persisted Sessions are resumed only after an exact `session_send`
+//     address; substring guesses and broadcasts never wake them.
 //   - Archived Sessions are excluded from discovery and refused by delivery.
 //     An archived Session can still have a live, idle Agent: the archive set
 //     hides it from every grouping surface and the host `agent/pre-step` gate
@@ -57,7 +55,7 @@
 // `required` array.
 
 const name = "dsh-tool-session-peer";
-const inject = ["tools", "agents"];
+const inject = ["tools", "agents", "sessionQuery"];
 
 const MAX_MESSAGE_BYTES = 32768;
 const RATE_WINDOW_MS = 60000;
@@ -72,13 +70,13 @@ class PeerError extends Error {
 }
 
 const PEERS_DESCRIPTION =
-  "List the neighbouring live Sessions: other top-level Sessions working in the same workspace directory as this one, excluding this Session, every subagent child, and archived Sessions. Each row gives the exact session id to pass to session_send, plus its title, status (idle or running), working directory, and preset.";
+  "List neighbouring non-archived top-level Sessions in the same workspace directory as this one, excluding this Session, every subagent child, and empty UI drafts without a user message. Includes conversation-bearing live Sessions (idle or running) and cold persisted Sessions (status cold). Each row gives the exact session id and exact title to pass to session_send, plus working directory and preset.";
 
 const SEND_DESCRIPTION =
-  "Send one message to another live Session (a peer agent): the cross-Session counterpart of send_message between subagents. A running target receives it at its nearest step boundary with mode=steer; otherwise it is queued as that Session's next turn and wakes an idle target. The target sees your session id and can answer with session_send back to you. An archived target is refused rather than woken.";
+  "Send one message to another non-archived Session (a peer agent): the cross-Session counterpart of send_message between subagents. Supply the exact session id or exact title; a cold persisted target is resumed only on this exact address. A running target receives the message at its nearest step boundary; otherwise it is queued as that Session's next turn. The target sees your session id and can answer with session_send back to you. An archived target is refused.";
 
 const BROADCAST_DESCRIPTION =
-  "Send one message to every neighbouring live Session in this workspace at once: the same delivery as session_send, fanned out to all peers listed by session_peers (this Session, subagent children, and archived Sessions excluded). Each target receives it independently -- a running one at its nearest step boundary with mode=steer, an idle one as its next turn. Use it for announcements that concern the whole checkout; prefer session_send when only one peer needs the message.";
+  "Send one message to every neighbouring live Session in this workspace at once. Cold persisted Sessions listed by session_peers are skipped rather than resumed; use session_send with that Session's exact id or exact title to address one explicitly. This Session, subagent children, and archived Sessions are excluded. Use it for announcements that concern the whole checkout; prefer session_send when only one peer needs the message.";
 
 const PEERS_OUTPUT = {
   schema: {
@@ -216,15 +214,15 @@ function isArchived(ctx, id) {
   return archivedSessionIds(ctx).has(String(id));
 }
 
-/** Every live top-level Agent except one exact Session id, in registration order. */
-function livePeers(ctx, selfId) {
-  const rows = [];
-  for (const agent of ctx.agents.list()) {
-    if (String(agent.id) === selfId) continue;
-    if (headerDelegationDepth(agent) !== 0) continue;
-    rows.push(peerRow(ctx, agent));
+/** Session ids accounted to registered workspaces; without that index, cold ids are not exposed. */
+function workspaceSessionIds(ctx) {
+  try {
+    const registry = ctx.get("workspaceRegistry");
+    if (typeof registry?.list !== "function") return new Set();
+    return new Set(registry.list().flatMap((workspace) => workspace.sessionIds.map(String)));
+  } catch {
+    return new Set();
   }
-  return rows;
 }
 
 /** The caller's workspace directory, or an empty string when it has none. */
@@ -234,12 +232,87 @@ function workspaceOf(agent) {
 }
 
 /**
- * Peers that share the caller's workspace directory and are not archived. A
- * caller without a known workspace cannot be scoped, so it sees every live root
- * instead of nothing.
+ * All conversation-bearing top-level Sessions: runtime Agents plus persisted
+ * records. Empty UI drafts are omitted until their first user/message event;
+ * cold Sessions with history are included without making them live.
  */
-function peersOf(ctx, agent) {
-  const rows = livePeers(ctx, String(agent.id));
+async function sessionRows(ctx, selfId) {
+  let records = [];
+  try {
+    records = await ctx.sessionQuery.listSessions();
+  } catch (error) {
+    throw new PeerError(
+      `could not list persisted Sessions: ${error instanceof Error ? error.message : String(error)}`,
+      "PEER_SESSION_LIST_FAILED"
+    );
+  }
+  const byId = new Map();
+  for (const agent of ctx.agents.list()) {
+    const id = String(agent.id);
+    if (id === selfId || headerDelegationDepth(agent) !== 0) continue;
+    byId.set(id, {
+      ...peerRow(ctx, agent),
+      live: true,
+      persisted: false
+    });
+  }
+  const accountedIds = workspaceSessionIds(ctx);
+  const rootRecords = records.filter((record) => {
+    const header = record?.header;
+    const id = header?.id === undefined ? "" : String(header.id);
+    return id !== "" && id !== selfId && headerDelegationDepth({ session: { header } }) === 0 &&
+      (record.live === true || record.persisted === true) && accountedIds.has(id);
+  });
+  const candidates = new Map(byId);
+  for (const record of rootRecords) {
+    const header = record.header;
+    const id = String(header.id);
+    const liveAgent = ctx.agents.get(id);
+    const prior = candidates.get(id);
+    candidates.set(id, {
+      id,
+      title: prior?.title ?? "",
+      status: liveAgent?.status ?? "cold",
+      cwd: typeof header.cwd === "string" ? header.cwd : "",
+      preset: typeof header.agentPreset === "string" ? header.agentPreset : "",
+      live: liveAgent !== undefined,
+      persisted: record.persisted === true
+    });
+  }
+  const nonblankIds = new Set();
+  await Promise.all([...candidates.keys()].map(async (id) => {
+    try {
+      const events = await ctx.sessionQuery.listEvents(id);
+      if (events.some((event) => event.type === "user/message")) nonblankIds.add(id);
+    } catch {
+      // Do not expose a target when its conversation history cannot be verified.
+    }
+  }));
+  for (const id of candidates.keys()) {
+    if (!nonblankIds.has(id)) candidates.delete(id);
+  }
+  let titles = [];
+  const eligibleRecords = rootRecords.filter((record) => nonblankIds.has(String(record.header.id)));
+  try {
+    titles = await ctx.sessionQuery.readTitleSnapshots(eligibleRecords.map((record) => String(record.header.id)));
+  } catch {
+    titles = [];
+  }
+  const titleById = new Map(
+    titles.filter((entry) => entry.status === "fulfilled")
+      .map((entry) => [String(entry.sessionId), entry.value.title?.title ?? ""])
+  );
+  for (const record of eligibleRecords) {
+    const id = String(record.header.id);
+    const prior = candidates.get(id);
+    candidates.set(id, { ...prior, title: titleById.get(id) ?? prior?.title ?? "" });
+  }
+  return [...candidates.values()];
+}
+
+/** Non-archived peers in the caller's workspace; an unknown cwd sees all. */
+async function peersOf(ctx, agent) {
+  const rows = await sessionRows(ctx, String(agent.id));
   const archived = archivedSessionIds(ctx);
   const visible = rows.filter((row) => !archived.has(row.id));
   const cwd = workspaceOf(agent);
@@ -256,37 +329,25 @@ function formatPeer(row) {
   return parts.join(" | ");
 }
 
-/**
- * Resolve one target reference.
- *
- * An exact live session id resolves anywhere in the process -- that is the
- * delivery scope. Title and id-fragment matching stays inside `scoped`, the
- * caller's workspace neighbours, so a guess can never land in another
- * workspace by coincidence. A failed lookup enumerates only `scoped`.
- */
+/** Resolve an exact session id or exact title, never a guessed fragment. */
 function resolveTarget(live, scoped, raw) {
   const wanted = String(raw ?? "").trim();
   if (wanted === "") throw new PeerError("target must not be empty", "PEER_TARGET_REQUIRED");
   const exactId = live.find((row) => row.id === wanted);
   if (exactId !== undefined) return exactId;
-  const lowered = wanted.toLowerCase();
-  const exactTitle = scoped.filter((row) => row.title.toLowerCase() === lowered);
+  const exactTitle = scoped.filter((row) => row.title === wanted);
   if (exactTitle.length === 1) return exactTitle[0];
-  const partial = scoped.filter(
-    (row) => row.title.toLowerCase().includes(lowered) || row.id.toLowerCase().includes(lowered)
-  );
-  if (partial.length === 1) return partial[0];
-  if (partial.length === 0) {
+  if (exactTitle.length > 1) {
     throw new PeerError(
-      scoped.length === 0
-        ? `no live Session matches "${wanted}"; there are no peers in this workspace right now`
-        : `no live Session matches "${wanted}"; peers in this workspace:\n${scoped.map(formatPeer).join("\n")}`,
-      "PEER_TARGET_NOT_FOUND"
+      `title "${wanted}" matches multiple Sessions; pass the exact session id:\n${exactTitle.map(formatPeer).join("\n")}`,
+      "PEER_TARGET_AMBIGUOUS"
     );
   }
   throw new PeerError(
-    `target "${wanted}" is ambiguous; pass an exact session id:\n${partial.map(formatPeer).join("\n")}`,
-    "PEER_TARGET_AMBIGUOUS"
+    scoped.length === 0
+      ? `no Session exactly matches "${wanted}"; there are no non-archived peers in this workspace right now`
+      : `no Session exactly matches "${wanted}"; pass an exact session id or title:\n${scoped.map(formatPeer).join("\n")}`,
+    "PEER_TARGET_NOT_FOUND"
   );
 }
 
@@ -333,12 +394,12 @@ class RateLimiter {
 }
 
 /** Build the model-facing peer list payload for one calling Session. */
-function peersPayload(ctx, agent) {
-  const rows = peersOf(ctx, agent);
+async function peersPayload(ctx, agent) {
+  const rows = await peersOf(ctx, agent);
   const text =
     rows.length === 0
-      ? "(no other live Sessions in this workspace)"
-      : `${rows.length} other live Session(s) in this workspace:\n${rows.map(formatPeer).join("\n")}`;
+      ? "(no other non-archived Sessions in this workspace)"
+      : `${rows.length} other non-archived Session(s) in this workspace:\n${rows.map(formatPeer).join("\n")}`;
   const peers = rows.map((row) => ({
     id: row.id,
     title: row.title,
@@ -372,11 +433,80 @@ function requireMessage(args) {
   return { message, bytes };
 }
 
+/** Resume one persisted peer on exact addressing, sharing concurrent resumes. */
+async function resumePeer(ctx, row, resumes) {
+  const current = ctx.agents.get(row.id);
+  if (current !== undefined) return current;
+  if (!row.persisted || typeof ctx.agents.resume !== "function") {
+    throw new PeerError(`Session "${row.id}" is no longer available`, "PEER_TARGET_GONE");
+  }
+  let pending = resumes.get(row.id);
+  if (pending === undefined) {
+    pending = (async () => {
+      if (isArchived(ctx, row.id)) {
+        throw new PeerError(`Session "${row.id}" is archived and will not be resumed`, "PEER_TARGET_ARCHIVED");
+      }
+      let presetId;
+      try {
+        const observation = await ctx.sessionQuery.observeSession(row.id);
+        presetId = observation?.projections?.values?.agentPreset ?? observation?.header?.agentPreset;
+      } catch (error) {
+        throw new PeerError(
+          `could not inspect persisted Session "${row.id}" before resuming: ${error instanceof Error ? error.message : String(error)}`,
+          "PEER_TARGET_RESUME_FAILED"
+        );
+      }
+      let presets;
+      try {
+        presets = ctx.get("agentPresets");
+      } catch {
+        presets = undefined;
+      }
+      const setup = async (agentCtx) => {
+        if (presets && typeof presets.mount === "function" && presetId) {
+          const resolved = await presets.resolve(presetId);
+          await presets.mount(agentCtx, resolved.id);
+        }
+      };
+      let selection = {};
+      try {
+        selection = ctx.agentDefaultModel?.currentSelection?.() ?? {};
+      } catch {
+        selection = {};
+      }
+      try {
+        const handle = await ctx.agents.resume({
+          resumeSessionId: row.id,
+          agentOptions: {
+            ...(selection.provider ? { provider: selection.provider } : {}),
+            ...(selection.model ? { model: selection.model } : {})
+          },
+          setup
+        });
+        return handle?.agent ?? ctx.agents.get(row.id);
+      } catch (error) {
+        throw new PeerError(
+          `could not resume persisted Session "${row.id}": ${error instanceof Error ? error.message : String(error)}`,
+          "PEER_TARGET_RESUME_FAILED"
+        );
+      }
+    })();
+    resumes.set(row.id, pending);
+  }
+  try {
+    const resumed = await pending;
+    if (resumed === undefined) throw new PeerError(`Session "${row.id}" did not become live`, "PEER_TARGET_GONE");
+    return resumed;
+  } finally {
+    if (resumes.get(row.id) === pending) resumes.delete(row.id);
+  }
+}
+
 /** Deliver one validated message into one resolved peer row and describe the outcome. */
-async function sendToPeer(ctx, createUserMessage, senderId, senderTitle, row, message) {
-  const targetAgent = ctx.agents.get(row.id);
-  if (targetAgent === undefined) {
-    throw new PeerError(`Session "${row.id}" is no longer live`, "PEER_TARGET_GONE");
+async function sendToPeer(ctx, resumes, createUserMessage, senderId, senderTitle, row, message) {
+  const targetAgent = await resumePeer(ctx, row, resumes);
+  if (isArchived(ctx, row.id)) {
+    throw new PeerError(`Session "${row.id}" is archived and will not receive a message`, "PEER_TARGET_ARCHIVED");
   }
   const mode = targetAgent.status === "running" ? "steer" : "followup";
   const userMessage = createUserMessage({
@@ -392,19 +522,23 @@ async function sendToPeer(ctx, createUserMessage, senderId, senderTitle, row, me
 }
 
 /** Deliver one peer message into the target Session and describe the outcome. */
-async function deliverPeer(ctx, limiter, createUserMessage, exec, args) {
+async function deliverPeer(ctx, limiter, resumes, createUserMessage, exec, args) {
   const sender = requireAgent(exec, "session_send");
   const senderId = String(sender.id);
   const { message, bytes } = requireMessage(args);
   limiter.admit(senderId);
-  const target = resolveTarget(livePeers(ctx, senderId), peersOf(ctx, sender), args.target);
+  const all = await sessionRows(ctx, senderId);
+  const archived = archivedSessionIds(ctx);
+  const cwd = workspaceOf(sender);
+  const scoped = all.filter((row) => !archived.has(row.id) && (cwd === "" || row.cwd === cwd));
+  const target = resolveTarget(all, scoped, args.target);
   if (isArchived(ctx, target.id)) {
     throw new PeerError(
       `Session "${target.id}" is archived; its steps are rejected by the host gate, so a message would be dropped unrun. Unarchive it in the GUI first or pick another peer`,
       "PEER_TARGET_ARCHIVED"
     );
   }
-  const sent = await sendToPeer(ctx, createUserMessage, senderId, titleOf(ctx, sender.session), target, message);
+  const sent = await sendToPeer(ctx, resumes, createUserMessage, senderId, titleOf(ctx, sender.session), target, message);
   return {
     text:
       `Delivered to ${sent.id}${sent.title === "" ? "" : ` "${sent.title}"`} ` +
@@ -416,26 +550,31 @@ async function deliverPeer(ctx, limiter, createUserMessage, exec, args) {
   };
 }
 
-/** Deliver one message to every workspace neighbour and describe each outcome. */
-async function broadcastPeers(ctx, limiter, createUserMessage, exec, args) {
+/** Broadcast to live peers only; cold persisted peers require exact addressing. */
+async function broadcastPeers(ctx, limiter, resumes, createUserMessage, exec, args) {
   const sender = requireAgent(exec, "session_broadcast");
   const senderId = String(sender.id);
   const { message } = requireMessage(args);
-  const targets = peersOf(ctx, sender);
+  const targets = await peersOf(ctx, sender);
+  const liveTargets = targets.filter((row) => ctx.agents.get(row.id) !== undefined);
+  const coldTargets = targets.filter((row) => ctx.agents.get(row.id) === undefined);
   if (targets.length === 0) {
     return {
-      text: "(no other live Sessions in this workspace; nothing was sent)",
+      text: "(no other non-archived Sessions in this workspace; nothing was sent)",
       delivered: [],
       failed: []
     };
   }
-  limiter.admit(senderId, targets.length);
+  if (liveTargets.length > 0) limiter.admit(senderId, liveTargets.length);
   const senderTitle = titleOf(ctx, sender.session);
   const delivered = [];
-  const failed = [];
-  for (const row of targets) {
+  const failed = coldTargets.map((row) => ({
+    id: row.id,
+    error: "cold session skipped; address its exact id or title with session_send to resume it"
+  }));
+  for (const row of liveTargets) {
     try {
-      delivered.push(await sendToPeer(ctx, createUserMessage, senderId, senderTitle, row, message));
+      delivered.push(await sendToPeer(ctx, resumes, createUserMessage, senderId, senderTitle, row, message));
     } catch (error) {
       failed.push({ id: row.id, error: error instanceof Error ? error.message : String(error) });
     }
@@ -443,11 +582,12 @@ async function broadcastPeers(ctx, limiter, createUserMessage, exec, args) {
   const lines = delivered.map(
     (entry) => `- ${entry.id} | ${entry.mode}${entry.title === "" ? "" : ` | "${entry.title}"`}`
   );
-  for (const entry of failed) lines.push(`- ${entry.id} | FAILED | ${entry.error}`);
+  for (const entry of failed) lines.push(`- ${entry.id} | SKIPPED/FAILED | ${entry.error}`);
   return {
     text:
-      `Broadcast to ${delivered.length} of ${targets.length} peer(s) in this workspace:\n${lines.join("\n")}` +
-      (failed.length === 0 ? "" : `\n${failed.length} delivery failure(s); see the rows above.`),
+      `Broadcast delivered to ${delivered.length} of ${liveTargets.length} live peer(s); ` +
+      `${coldTargets.length} cold peer(s) skipped:\n${lines.join("\n")}` +
+      (failed.length === 0 ? "" : `\n${failed.length} peer(s) were skipped or failed; see the rows above.`),
     delivered,
     failed
   };
@@ -456,16 +596,17 @@ async function broadcastPeers(ctx, limiter, createUserMessage, exec, args) {
 /** Build both tool definitions against one plugin instance state. */
 function defineTools(ctx, resolveCreateUserMessage) {
   const limiter = new RateLimiter();
+  const resumes = new Map();
 
   const peersTool = {
     name: "session_peers",
     description: PEERS_DESCRIPTION,
     parameters: { type: "object", properties: {}, required: [] },
     output: PEERS_OUTPUT,
-    execute(_args, exec) {
+    async execute(_args, exec) {
       const agent = requireAgent(exec, "session_peers");
       limiter.prune();
-      return peersPayload(ctx, agent);
+      return await peersPayload(ctx, agent);
     },
     presentCall() {
       return { card: "generic", title: "List peer sessions", kind: "read", rawInput: "" };
@@ -476,14 +617,14 @@ function defineTools(ctx, resolveCreateUserMessage) {
     name: "session_send",
     description:
       SEND_DESCRIPTION +
-      ' Target accepts an exact session id from session_peers or an unambiguous part of its title.',
+      ' Target must exactly match a session id or an exact title from session_peers.',
     parameters: {
       type: "object",
       properties: {
         target: {
           type: "string",
           description:
-            'Recipient peer Session as returned by session_peers (exact session id preferred; an unambiguous title fragment also works).'
+            'Recipient Session as returned by session_peers; provide its exact session id or exact title.'
         },
         message: {
           type: "string",
@@ -496,7 +637,7 @@ function defineTools(ctx, resolveCreateUserMessage) {
     output: SEND_OUTPUT,
     async execute(args, exec) {
       const createUserMessage = await resolveCreateUserMessage();
-      return deliverPeer(ctx, limiter, createUserMessage, exec, args);
+      return deliverPeer(ctx, limiter, resumes, createUserMessage, exec, args);
     },
     presentCall(args) {
       return {
@@ -525,7 +666,7 @@ function defineTools(ctx, resolveCreateUserMessage) {
     output: BROADCAST_OUTPUT,
     async execute(args, exec) {
       const createUserMessage = await resolveCreateUserMessage();
-      return broadcastPeers(ctx, limiter, createUserMessage, exec, args);
+      return broadcastPeers(ctx, limiter, resumes, createUserMessage, exec, args);
     },
     presentCall(args) {
       return {

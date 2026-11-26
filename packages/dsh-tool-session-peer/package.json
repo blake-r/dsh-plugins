@@ -1,7 +1,7 @@
 {
   "name": "@blake-r/dsh-tool-session-peer",
   "version": "0.2.0",
-  "description": "Model-facing peer messaging between adjacent live Sessions (session_peers, session_send, session_broadcast).",
+  "description": "Model-facing peer messaging between adjacent live and persisted Sessions (session_peers, session_send, session_broadcast).",
   "type": "module",
   "main": "src/dsh-tool-session-peer.mjs",
   "exports": {
@@ -13,7 +13,8 @@
     "README.md"
   ],
   "scripts": {
-    "check": "node --check src/dsh-tool-session-peer.mjs"
+    "check": "node --check src/dsh-tool-session-peer.mjs && node --test test/*.test.mjs",
+    "test": "node --test test/*.test.mjs"
   },
   "dsh": {
     "bundle": {
