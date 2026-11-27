@@ -64,7 +64,7 @@ class PeerError extends Error {
 }
 
 const PEERS_DESCRIPTION =
-  "List non-archived Sessions accounted to this workspace, excluding this Session and live subagent children. Uses only the in-memory workspace index and live Agent metadata; it never reads session files. Rows always include exact session ids; live Sessions include current titles, while cold titles are unavailable. Use an exact id or exact live title with session_send.";
+  "List non-archived Sessions accounted to this workspace, excluding this Session and live subagent children. Uses only the in-memory workspace index and live Agent metadata; it never reads session files. Rows always include exact session ids and state; names are current live titles, or unknown when unavailable. Use an exact id or exact live title with session_send.";
 
 const SEND_DESCRIPTION =
   "Send one message to another non-archived Session (a peer agent): the cross-Session counterpart of send_message between subagents. Supply an exact session id from session_peers, or an exact title shown there for a live Session; duplicate title matches are rejected. Target resolution uses in-memory metadata and never reads session files. A cold persisted target is resumed only when addressed by its exact id. A running target receives the message at its nearest step boundary; otherwise it is queued as that Session's next turn. The target sees your session id and can answer with session_send back to you. An archived target is refused.";
@@ -85,12 +85,10 @@ const PEERS_OUTPUT = {
           additionalProperties: false,
           properties: {
             id: { type: "string" },
-            title: { type: "string" },
-            status: { type: "string" },
-            cwd: { type: "string" },
-            preset: { type: "string" }
+            name: { type: "string" },
+            state: { type: "string" }
           },
-          required: ["id", "title", "status"]
+          required: ["id", "name", "state"]
         }
       }
     },
@@ -163,25 +161,14 @@ function titleOf(ctx, session) {
   }
 }
 
-/** Read the current preset directly from the Session's in-memory projection. */
-function currentPresetOf(presets, session) {
-  try {
-    const preset = presets?.presetForSession?.(session);
-    return typeof preset === "string" ? preset : "";
-  } catch {
-    return "";
-  }
-}
-
 /** Describe one live Agent as an addressable peer row. */
-function peerRow(ctx, agent, presets) {
+function peerRow(ctx, agent) {
   const header = agent.session?.header ?? {};
   return {
     id: String(agent.id),
     title: titleOf(ctx, agent.session),
     status: String(agent.status ?? "unknown"),
-    cwd: typeof header.cwd === "string" ? header.cwd : "",
-    preset: currentPresetOf(presets, agent.session)
+    cwd: typeof header.cwd === "string" ? header.cwd : ""
   };
 }
 
@@ -228,7 +215,7 @@ function workspaceOf(agent) {
 }
 
 /** List indexed Sessions for one workspace without reading event logs. */
-function sessionRows(ctx, selfId, cwd, includePresets = false) {
+function sessionRows(ctx, selfId, cwd) {
   const candidates = new Map();
   try {
     const registry = ctx.get("workspaceRegistry");
@@ -242,7 +229,6 @@ function sessionRows(ctx, selfId, cwd, includePresets = false) {
           title: "",
           status: "cold",
           cwd: typeof workspace.path === "string" ? workspace.path : "",
-          preset: "",
           live: false,
           persisted: true
         });
@@ -251,14 +237,6 @@ function sessionRows(ctx, selfId, cwd, includePresets = false) {
   } catch {
     // Live Agent metadata remains useful when the workspace index itself fails.
   }
-  let presets;
-  if (includePresets) {
-    try {
-      presets = ctx.get("agentPresets");
-    } catch {
-      presets = undefined;
-    }
-  }
   for (const agent of ctx.agents.list()) {
     const id = String(agent.id);
     if (id === selfId) continue;
@@ -266,7 +244,7 @@ function sessionRows(ctx, selfId, cwd, includePresets = false) {
       candidates.delete(id);
       continue;
     }
-    const row = peerRow(ctx, agent, presets);
+    const row = peerRow(ctx, agent);
     if (cwd !== "" && row.cwd !== cwd) continue;
     candidates.set(id, {
       ...row,
@@ -278,19 +256,25 @@ function sessionRows(ctx, selfId, cwd, includePresets = false) {
 }
 
 /** Non-archived peers in the caller's workspace; an unknown cwd sees all. */
-async function peersOf(ctx, agent, includePresets = false) {
-  const rows = sessionRows(ctx, String(agent.id), workspaceOf(agent), includePresets);
+async function peersOf(ctx, agent) {
+  const rows = sessionRows(ctx, String(agent.id), workspaceOf(agent));
   const archived = archivedSessionIds(ctx);
   return rows.filter((row) => !archived.has(row.id));
 }
 
-/** Render one peer row as a single model-facing line. */
-function formatPeer(row) {
-  const parts = [`- ${row.id}`, row.status];
-  if (row.title !== "") parts.push(`"${row.title}"`);
-  if (row.preset !== "") parts.push(`preset=${row.preset}`);
-  if (row.cwd !== "") parts.push(row.cwd);
-  return parts.join(" | ");
+/** Escape cell content while keeping one peer on one Markdown table row. */
+function tableCell(value) {
+  return String(value).replace(/[|\n\r]/g, (character) => character === "|" ? "\\|" : " ");
+}
+
+/** Render all peers with a stable id/name/state column order. */
+function formatPeers(rows) {
+  const lines = ["| id | name | state |", "| --- | --- | --- |"];
+  for (const row of rows) {
+    const name = row.title === "" ? "unknown" : row.title;
+    lines.push(`| ${tableCell(row.id)} | ${tableCell(name)} | ${tableCell(row.status)} |`);
+  }
+  return lines.join("\n");
 }
 
 /** Resolve an exact id or exact live title using only in-memory metadata. */
@@ -372,17 +356,15 @@ class RateLimiter {
 
 /** Build the model-facing peer list payload for one calling Session. */
 async function peersPayload(ctx, agent) {
-  const rows = await peersOf(ctx, agent, true);
+  const rows = await peersOf(ctx, agent);
   const text =
     rows.length === 0
       ? "(no other non-archived Sessions in this workspace)"
-      : `${rows.length} other non-archived Session(s) in this workspace:\n${rows.map(formatPeer).join("\n")}`;
+      : `${rows.length} other non-archived Session(s) in this workspace:\n${formatPeers(rows)}`;
   const peers = rows.map((row) => ({
     id: row.id,
-    title: row.title,
-    status: row.status,
-    ...(row.cwd === "" ? {} : { cwd: row.cwd }),
-    ...(row.preset === "" ? {} : { preset: row.preset })
+    name: row.title === "" ? "unknown" : row.title,
+    state: row.status
   }));
   return { text, peers };
 }
@@ -430,7 +412,7 @@ async function resumePeer(ctx, row, resumes) {
         presets = undefined;
       }
       const setup = async (agentCtx, resumedAgent) => {
-        const presetId = resumedAgent?.session?.header?.agentPreset ?? row.preset;
+        const presetId = resumedAgent?.session?.header?.agentPreset;
         if (presets && typeof presets.mount === "function" && presetId) {
           const resolved = await presets.resolve(presetId);
           await presets.mount(agentCtx, resolved.id);

@@ -17,7 +17,7 @@ This plugin adds three model-facing tools:
 
 | Tool | Purpose |
 |---|---|
-| `session_peers` | List non-archived Sessions accounted to the same workspace from its in-memory index; all rows include exact IDs, live rows include titles, and cold titles are blank. |
+| `session_peers` | List non-archived Sessions accounted to the same workspace from its in-memory index in fixed `id`, `name`, `state` columns; unavailable names show as `unknown`. |
 | `session_send` | Deliver by exact session ID or exact live-session title; duplicate titles are rejected. Cold targets can be addressed by ID. |
 | `session_broadcast` | Deliver one message to every live workspace neighbour; cold Sessions are skipped. |
 

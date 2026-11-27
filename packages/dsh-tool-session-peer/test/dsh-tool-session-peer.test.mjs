@@ -204,7 +204,7 @@ test("session_send rejects duplicate exact live titles and asks for an id", asyn
   assert.equal(state.queries.listSessions, 0);
 });
 
-test("session_peers reports the current projected preset instead of the session header", async () => {
+test("session_peers returns only id, name, and state without reading presets", async () => {
   const sender = agent("sender", "Sender");
   const peer = agent("peer", "Peer");
   peer.session.header.agentPreset = "otus";
@@ -212,8 +212,9 @@ test("session_peers reports the current projected preset instead of the session 
 
   const result = await tools.get("session_peers").execute({}, { agent: sender });
 
-  assert.equal(result.peers[0].preset, "trading");
-  assert.deepEqual(state.presetReads, ["peer"]);
+  assert.deepEqual(result.peers, [{ id: "peer", name: "Peer", state: "idle" }]);
+  assert.ok(result.text.includes("| id | name | state |"));
+  assert.deepEqual(state.presetReads, []);
   assert.deepEqual(state.queries.observeSession, []);
   assert.deepEqual(state.queries.listEvents, []);
   assert.equal(state.queries.listSessions, 0);
@@ -238,7 +239,8 @@ test("session_peers includes non-archived persisted sessions that are cold", asy
 
   const result = await tools.get("session_peers").execute({}, { agent: sender });
 
-  assert.deepEqual(result.peers.map(({ id, status }) => [id, status]), [["cold", "cold"]]);
+  assert.deepEqual(result.peers, [{ id: "cold", name: "unknown", state: "cold" }]);
+  assert.ok(result.text.includes("| cold | unknown | cold |"));
 });
 
 test("session listing includes blank sessions without inspecting their history", async () => {
@@ -251,7 +253,10 @@ test("session listing includes blank sessions without inspecting their history",
   ] });
 
   const peers = await tools.get("session_peers").execute({}, { agent: sender });
-  assert.deepEqual(peers.peers.map(({ id }) => id), ["blank-live", "blank-cold"]);
+  assert.deepEqual(peers.peers, [
+    { id: "blank-live", name: "unknown", state: "idle" },
+    { id: "blank-cold", name: "unknown", state: "cold" }
+  ]);
   assert.deepEqual(state.queries.observeSession, []);
   assert.deepEqual(state.queries.listEvents, []);
   assert.equal(state.queries.listSessions, 0);
@@ -266,7 +271,7 @@ test("cold titles stay unavailable; an exact id resumes the existing session", a
   ] });
 
   const listed = await tools.get("session_peers").execute({}, { agent: sender });
-  assert.deepEqual(listed.peers.map(({ id, title }) => [id, title]), [["cold", ""]]);
+  assert.deepEqual(listed.peers, [{ id: "cold", name: "unknown", state: "cold" }]);
   await assert.rejects(
     tools.get("session_send").execute({ target: "Биржевой аналитик", message: "Сводка" }, { agent: sender }),
     (error) => error.code === "PEER_TARGET_NOT_FOUND"
