@@ -80,12 +80,19 @@
 //   `lockedChunks` chunk-objects, `1 < locked <= 2` chunks by default) is never
 //   folded, so the model's live tail stays intact mid-turn.
 //
-// Chunk window: foldable content of the current turn (assistant/message and
-// tool/result nodes after the nearest checkpoint) is priced with the vendored
-// heuristic and sliced into `chunkTokens` chunks from the oldest node. The last
-// `lockedChunks` chunk-objects form the locked window; everything older is
-// foldable. The fold boundary is aligned to complete call → result pairs (a
-// dangling call at the boundary is backed off one node and waits for its result).
+// Chunk window: everything absorbable after the nearest FULL fold (phase "turn"
+// or "session") — foldable nodes AND this plugin's own mid-turn / reasoning
+// checkpoints — is priced with the vendored heuristic and sliced into
+// `chunkTokens` chunks from the oldest node. Earlier micro passes are therefore
+// re-foldable under pressure: an intermediateFold checkpoint is recompiled from
+// its ORIGINAL frames with full-fold semantics, a mid-turn checkpoint carries
+// over verbatim. The span is split into contiguous runs at every real user
+// message and every injected frame (one `replace` op can only shadow one
+// contiguous seq range), and every qualifying run is committed in the same
+// pre-step, newest first. The last `lockedChunks` chunk-objects form the locked
+// window; everything older is foldable. A partially consumed run is cut on a
+// complete call → result pair (a dangling call at the boundary is backed off one
+// node and waits for its result).
 //
 // Checkpoint lifecycle (3.8): every replacement is a `micro-checkpoint` — its
 // message carries `source.micro` metadata (phase, turn, seq span, tokens,
@@ -1224,100 +1231,187 @@ function apply(ctx, config = {}) {
   };
 
   /**
-   * The mid-turn chunk window (3.3): the contiguous foldable run right after
-   * our nearest boundary, sliced into `chunkTokens` chunks from the oldest
-   * node. The last `lockedChunks` chunk-objects are the locked window (never
-   * folded); everything older is foldable.
-   * @param session - the session.
-   * @returns `{ startIdx, endIdx, shadowed, foldableChunks }`, or null when the
-   *   skip-guard fails (no complete foldable chunk older than the lock).
+   * The durable fold boundary for the mid-turn pressure fold: the nearest (from
+   * the end) node that is a FULL fold — phase "turn" or "session", or a legacy
+   * checkpoint without metadata. Mid-turn and reasoning checkpoints are NOT
+   * boundaries here: they are absorbable, so a pressure fold can re-fold what an
+   * earlier micro pass already folded instead of stopping in front of it. This
+   * is the same boundary rule `consolidateTurn` applies at turn/end.
    */
-  const chunkWindow = (session) => {
-    const nodes = Array.from(session.surface.nodes);
-    if (nodes.length === 0) return null;
-    const boundaryIdx = boundaryIndex(nodes, session);
+  const durableBoundaryIndex = (nodes, session) => {
+    for (let i = nodes.length - 1; i >= 0; i--) {
+      const event = session.eventAt ? session.eventAt(nodes[i]) : undefined;
+      if (!isPluginNode(event)) continue;
+      const meta = checkpointMetaOf(event);
+      if (meta === null) return i;
+      if (meta.phase === "turn" || meta.phase === "session") return i;
+    }
+    return -1;
+  };
 
-    // The contiguous foldable run of the current turn: nodes after the
-    // boundary, skipping the non-foldable prefix (system prompt, injected
-    // frames, the user's question — they stay live ABOVE the fold range), then
-    // the run of `assistant/message | tool/result` nodes. A foreign node
-    // INSIDE the run (mid-turn frame relay, user message) ends it — the range
-    // must shadow nothing but foldable nodes. With no boundary yet (fresh
-    // session, first fire) the run is simply the turn's whole foldable span.
-    const stream = [];
-    let streamTokens = 0;
-    let started = false;
+  /** True for a checkpoint the pressure fold may absorb into a new one. */
+  const isAbsorbableCheckpoint = (event) => {
+    if (!isPluginNode(event)) return false;
+    const meta = checkpointMetaOf(event);
+    if (meta === null) return false;
+    return meta.phase === "mid-turn" || meta.phase === "reasoning";
+  };
+
+  /**
+   * Every contiguous run of absorbable content after the durable boundary, in
+   * surface order: foldable nodes (`assistant/message`, `tool/result`) and
+   * absorbable checkpoints, split at every other node — real user messages and
+   * injected frames stay live and must not be shadowed. One `replace` op can
+   * only shadow one contiguous seq range, so a frame inside the span yields
+   * several runs instead of truncating the window at it.
+   * @returns `[{ run, tokens }]` in surface order.
+   */
+  const foldSegments = (session) => {
+    const nodes = Array.from(session.surface.nodes);
+    if (nodes.length === 0) return [];
+    const boundaryIdx = durableBoundaryIndex(nodes, session);
+    const segments = [];
+    let run = [];
+    let tokens = 0;
     for (let i = boundaryIdx + 1; i < nodes.length; i++) {
       const event = session.eventAt ? session.eventAt(nodes[i]) : undefined;
-      if (isFoldableNode(event)) {
-        started = true;
-        const node = projectNode(session, nodes[i]);
-        if (node === null) continue;
-        stream.push(node);
-        streamTokens += node.price;
+      if (!isFoldableNode(event) && !isAbsorbableCheckpoint(event)) {
+        if (run.length > 0) segments.push({ run, tokens });
+        run = [];
+        tokens = 0;
         continue;
       }
-      if (started) break;
-      // leading non-foldable prefix (system prompt, frames, user question):
-      // stays live above the range, skipped.
+      const node = projectNode(session, nodes[i]);
+      if (node === null) continue;
+      run.push(node);
+      tokens += node.price || 0;
     }
-    if (stream.length === 0) return null;
+    if (run.length > 0) segments.push({ run, tokens });
+    return segments;
+  };
 
-    // Chunk-object model: totalChunks = ceil(streamTokens / chunkTokens); the
-    // last `lockedChunks` chunk-objects are locked. The first foldable full
-    // chunk appears when streamTokens crosses lockedChunks * chunkTokens
-    // (default 32768) — the exact two-full-chunks boundary stays locked
-    // (skip-guard, foldableChunks = 0).
-    const totalChunks = Math.ceil(streamTokens / chunkTokens);
-    const foldableChunks = totalChunks - lockedChunks;
+  /**
+   * Pick what to fold under pressure: everything older than the locked window —
+   * `lockedChunks` chunk-objects measured from the END of the whole span —
+   * rounded down to whole chunks. Whole segments are taken oldest-first until
+   * that budget runs out; a partially consumed segment is cut at a pairing-safe
+   * boundary. Ranges come back oldest-first and disjoint.
+   * @returns `{ ranges, totalTokens, foldableChunks }`, or null when nothing is
+   *   older than the lock.
+   */
+  const selectFoldRanges = (session, segments) => {
+    let totalTokens = 0;
+    for (const segment of segments) totalTokens += segment.tokens;
+    const foldableChunks = Math.ceil(totalTokens / chunkTokens) - lockedChunks;
     if (foldableChunks <= 0) return null;
-    const foldableTokens = foldableChunks * chunkTokens;
 
-    // Nominal range end: include the node that crosses the foldable budget.
-    let endIdx = -1;
-    let acc = 0;
-    for (let j = 0; j < stream.length; j++) {
-      acc += stream[j].price;
-      if (acc >= foldableTokens) {
-        endIdx = j;
-        break;
+    let budget = foldableChunks * chunkTokens;
+    const ranges = [];
+    for (const segment of segments) {
+      if (budget <= 0) break;
+      if (segment.tokens <= budget) {
+        ranges.push(segment.run);
+        budget -= segment.tokens;
+        continue;
+      }
+      // Partial segment: take its oldest prefix worth `budget` tokens.
+      const stream = segment.run.map((node, idx) => ({ idx, seq: node.seq, event: node.event, message: node.message, price: node.price }));
+      let acc = 0;
+      let endIdx = stream.length - 1;
+      for (let j = 0; j < stream.length; j++) {
+        acc += stream[j].price || 0;
+        if (acc >= budget) {
+          endIdx = j;
+          break;
+        }
+      }
+      // Pairing back-off (3.5): never cut a tool call from its result.
+      const resultIndexByCall = resultIndexByCallId(stream);
+      while (endIdx >= 0 && hasDanglingCall(stream[endIdx].message, endIdx, resultIndexByCall)) endIdx--;
+      if (endIdx < 0) break;
+
+      // Tool-pairing snap (3.10): a token-driven cut can land inside a step's
+      // result run while its call row sits far earlier — folding there would
+      // remove calls with part of their results and leave the rest live. Move
+      // onto the engine's own nearest balanced cut instead.
+      const snap = snapEndToBalancedCut(session, stream, endIdx);
+      if (snap === null || snap.endIdx < 0) break;
+      if (snap.moved) {
+        log("info", `mid-turn: pairing snap moved the fold end from seq ${snap.from} to seq ${snap.to} (+${snap.extraTokens} tokens${snap.shrunk ? ", shrunk" : ""}) so no tool call/result pair is split`);
+        endIdx = snap.endIdx;
+        if (endIdx < 0) break;
+      }
+      ranges.push(stream.slice(0, endIdx + 1));
+      budget -= stream.slice(0, endIdx + 1).reduce((sum, node) => sum + (node.price || 0), 0);
+      break;
+    }
+    return ranges.length > 0 ? { ranges, totalTokens, foldableChunks } : null;
+  };
+
+  /**
+   * Compile one fold range into checkpoint entries with full-fold semantics:
+   * assistant text verbatim under `[assistant]` headers, calls/results folded to
+   * pointers, reasoning dropped. Already-compiled checkpoints interleave in
+   * surface order — an intermediateFold checkpoint is RECOMPILED from its ORIGINAL
+   * frames (`mode` + `shadowedSeqs`, D5), every other checkpoint carries over
+   * verbatim. Sub-runs are compiled separately because a checkpoint never splits
+   * a call -> result pair.
+   */
+  const compileRangeEntries = (session, run) => {
+    const entries = [];
+    const foldRun = [];
+    let tools = 0;
+    const flushFold = () => {
+      if (foldRun.length === 0) return;
+      const { entries: compiled, stats } = compileNodes(foldRun, resolvedConfig);
+      tools += stats.tools;
+      for (const entry of compiled) entries.push(entry);
+      foldRun.length = 0;
+    };
+    for (const node of run) {
+      if (!isPluginNode(node.event)) {
+        foldRun.push(node);
+        continue;
+      }
+      flushFold();
+      const meta = checkpointMetaOf(node.event);
+      if (meta !== null && meta.mode === "intermediateFold" && Array.isArray(meta.shadowedSeqs) && meta.shadowedSeqs.length > 0) {
+        // Recompile the ORIGINAL frames with full-fold semantics: call args ->
+        // short label, result -> seq pointer, reasoning dropped. The durable log
+        // keeps the shadowed seqs addressable.
+        const originals = [];
+        for (const seq of meta.shadowedSeqs) {
+          const projected = projectNode(session, seq);
+          if (projected !== null) originals.push(projected);
+        }
+        if (originals.length > 0) {
+          // The checkpoint's own meta.tools is summed by rangeStatsOf below.
+          const { entries: compiled } = compileNodes(originals.map((n) => ({ seq: n.seq, message: n.message })), resolvedConfig);
+          for (const entry of compiled) entries.push(entry);
+        }
+        continue;
+      }
+      const text = checkpointTextOf(node.message);
+      if (text !== null) entries.push({ seq: node.seq, text, kind: "text" });
+    }
+    flushFold();
+    return { entries, tools };
+  };
+
+  /** Token/tool accounting of one fold range (`compiledTools` from compileRangeEntries). */
+  const rangeStatsOf = (run, compiledTools) => {
+    let tokens = 0;
+    let tools = compiledTools;
+    for (const node of run) {
+      const meta = checkpointMetaOf(node.event);
+      if (meta !== null) {
+        if (Number.isSafeInteger(meta.tokens)) tokens += meta.tokens;
+        if (Number.isSafeInteger(meta.tools)) tools += meta.tools;
+      } else {
+        tokens += node.price || 0;
       }
     }
-    if (endIdx === -1) endIdx = stream.length - 1;
-
-    // Pairing back-off (3.5): never cut a tool call from its result. Drop
-    // trailing assistant nodes whose call's result lies outside the range.
-    // 3.11: the map is now built from the v4 result shape ("tool" role +
-    // `toolCallId`), so this guard actually sees results; before the fix the
-    // map was empty and the loop only ever backed off a trailing call row.
-    const resultIndexByCall = resultIndexByCallId(stream);
-    while (endIdx >= 0 && hasDanglingCall(stream[endIdx].message, endIdx, resultIndexByCall)) {
-      endIdx--;
-    }
-    if (endIdx < 0) return null;
-
-    // Tool-pairing snap (3.10): that back-off only guards a call whose row is
-    // the LAST node of the range. A token-driven end can land inside a step's
-    // result run while the call row sits far earlier — the fold then removes
-    // the calls with part of their results and leaves the rest live, which is
-    // the "corrupt surface" that stops the engine from ever compacting again.
-    // Move the end onto the engine's own nearest balanced cut instead.
-    const snap = snapEndToBalancedCut(session, stream, endIdx);
-    if (snap === null) return null;
-    if (snap.moved) {
-      log("info", `mid-turn: pairing snap moved the fold end from seq ${snap.from} to seq ${snap.to} (+${snap.extraTokens} tokens${snap.shrunk ? ", shrunk" : ""}) so no tool call/result pair is split; nominal seq ${stream[endIdx].seq}`);
-      endIdx = snap.endIdx;
-      if (endIdx < 0) return null;
-    }
-
-    const startIdx = stream[0].idx;
-    const shadowed = stream.slice(0, endIdx + 1).map((node) => ({
-      seq: node.seq,
-      event: node.event,
-      message: node.message,
-      price: node.price
-    }));
-    return { startIdx, endIdx, shadowed, foldableChunks, streamTokens };
+    return { tokens, tools };
   };
 
   /**
@@ -1515,24 +1609,43 @@ function apply(ctx, config = {}) {
       const totalTokens = measurement.totalTokens;
       if (totalTokens < microThreshold) return;
 
-      const win = chunkWindow(session);
-      if (win === null) return;
+      const segments = foldSegments(session);
+      if (segments.length === 0) {
+        log("info", `mid-turn: nothing absorbable after the durable boundary; total ${totalTokens} >= ${microThreshold}`);
+        return;
+      }
+      const selection = selectFoldRanges(session, segments);
+      if (selection === null) {
+        const absorbable = segments.reduce((sum, segment) => sum + segment.tokens, 0);
+        log("info", `mid-turn: skip-guard holds — absorbable ${absorbable} tokens sit inside the locked window (${lockedChunks * chunkTokens}); total ${totalTokens} >= ${microThreshold}`);
+        return;
+      }
 
-      const nodes = win.shadowed.map((n) => ({ seq: n.seq, message: n.message }));
-      const { entries, stats } = compileNodes(nodes, resolvedConfig);
-      if (entries.length === 0) return;
-      const blocks = frameCompiled(entries);
-
-      const meta = {
-        phase: "mid-turn",
-        turn,
-        span: [win.shadowed[0].seq, win.shadowed[win.shadowed.length - 1].seq],
-        tokens: win.shadowed.reduce((acc, n) => acc + (n.price || 0), 0),
-        tools: stats.tools
-      };
-      commitReplacement(session, win.shadowed, blocks, meta, `micro (mid-turn, pre-step, turn ${turn})`);
+      // Commit NEWEST range first: each replacement shadows only its own seqs,
+      // so the older ranges' seqs stay valid for the commits that follow.
+      let folded = 0;
+      for (let k = selection.ranges.length - 1; k >= 0; k--) {
+        const run = selection.ranges[k];
+        const { entries, tools: compiledTools } = compileRangeEntries(session, run);
+        if (entries.length === 0) continue;
+        const blocks = frameCompiled(entries);
+        if (blocks.length === 0 || blocks[0].text.length === 0) continue;
+        const { tokens, tools } = rangeStatsOf(run, compiledTools);
+        const meta = {
+          phase: "mid-turn",
+          turn,
+          span: [run[0].seq, run[run.length - 1].seq],
+          tokens,
+          tools
+        };
+        if (commitReplacement(session, run, blocks, meta, `micro (mid-turn, pre-step, turn ${turn})`) !== null) folded++;
+      }
+      if (folded === 0) {
+        log("warn", `mid-turn: ${selection.ranges.length} range(s) selected but none committed (pairing guard or empty content); total ${totalTokens} >= ${microThreshold}`);
+        return;
+      }
       deleteStaleFrames(session);
-      log("info", `micro threshold state: total ${totalTokens} >= ${microThreshold} (${(100 * totalTokens / windowTokens).toFixed(1)}% of ${windowTokens}), foldable chunks ${win.foldableChunks}`);
+      log("info", `micro threshold state: total ${totalTokens} >= ${microThreshold} (${(100 * totalTokens / windowTokens).toFixed(1)}% of ${windowTokens}), folded ${folded}/${selection.ranges.length} range(s), foldable chunks ${selection.foldableChunks}`);
     } catch (error) {
       log("warn", `mid-turn fold failed: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1630,67 +1743,15 @@ function apply(ctx, config = {}) {
       });
       if (!hasFoldable && !hasIntermediate) continue;
 
-      // Content = the span's foldable nodes compiled with the standard semantics
-      // (assistant text verbatim under `[assistant]` headers, calls/results ->
-      // pointers, reasoning dropped), interleaved in surface order with the
-      // already-compiled checkpoints: intermediate checkpoints are RECOMPILED
-      // from their original frames (mode "intermediateFold" + shadowedSeqs, D5),
-      // every other checkpoint is carried over verbatim. Sub-runs are compiled
-      // separately: a checkpoint never splits a call -> result pair (a fold
-      // commits only after both are on the surface), so pairing stays intact.
-      const entries = [];
-      const foldRun = [];
-      let tools = 0;
-      const flushFold = () => {
-        if (foldRun.length === 0) return;
-        const { entries: compiled, stats } = compileNodes(foldRun, resolvedConfig);
-        tools += stats.tools;
-        for (const entry of compiled) entries.push(entry);
-        foldRun.length = 0;
-      };
-      for (const node of run) {
-        if (isPluginNode(node.event)) {
-          flushFold();
-          const meta = checkpointMetaOf(node.event);
-          if (meta !== null && meta.mode === "intermediateFold" && Array.isArray(meta.shadowedSeqs) && meta.shadowedSeqs.length > 0) {
-            // Recompile the ORIGINAL frames with full-fold semantics: call args
-            // -> short label, result -> seq pointer, reasoning dropped, adjacent
-            // tool rows joined. The durable log keeps the shadowed seqs
-            // addressable.
-            const originals = [];
-            for (const seq of meta.shadowedSeqs) {
-              const projected = projectNode(session, seq);
-              if (projected !== null) originals.push(projected);
-            }
-            if (originals.length > 0) {
-              // The checkpoint's own meta.tools is summed by the accounting loop
-              // below, so this recompile must not add stats.tools again.
-              const { entries: compiled } = compileNodes(originals.map((n) => ({ seq: n.seq, message: n.message })), resolvedConfig);
-              for (const entry of compiled) entries.push(entry);
-            }
-          } else {
-            const text = checkpointTextOf(node.message);
-            if (text !== null) entries.push({ seq: node.seq, text, kind: "text" });
-          }
-        } else {
-          foldRun.push(node);
-        }
-      }
-      flushFold();
+      // Content follows full-fold semantics through the shared range compiler:
+      // intermediate checkpoints are recompiled from their original frames,
+      // every other checkpoint carries over verbatim in surface order.
+      const { entries, tools: compiledTools } = compileRangeEntries(session, run);
       if (entries.length === 0) continue;
       const blocks = frameCompiled(entries);
       if (blocks.length === 0 || blocks[0].text.length === 0) continue;
 
-      let tokens = 0;
-      for (const node of run) {
-        const meta = checkpointMetaOf(node.event);
-        if (meta !== null) {
-          if (Number.isSafeInteger(meta.tokens)) tokens += meta.tokens;
-          if (Number.isSafeInteger(meta.tools)) tools += meta.tools;
-        } else {
-          tokens += node.price || 0;
-        }
-      }
+      const { tokens, tools } = rangeStatsOf(run, compiledTools);
       // The segment's turn: prefer the turn carried by its content (assistant
       // messages or intermediate checkpoint metas), falling back to the passed
       // turn. Correct even when consolidating accumulated content from earlier

@@ -37,9 +37,15 @@ Three behaviors:
    first at `agent/pre-step` and destroy the model's working reasoning. This
    plugin also listens at `agent/pre-step` (BEFORE basic, `{ prepend: true }`,
    synchronous fold) and, when the surface crosses a configurable pressure
-   threshold, structurally folds the OLDEST foldable content of the current
-   turn beyond a locked window into a one-liner checkpoint. Basic then measures
-   the post-fold surface on the same step and never fires.
+   threshold, structurally folds everything older than a locked window into a
+   one-liner checkpoint. The fold span starts at the nearest FULL fold (phase
+   `turn` / `session`), so this plugin's own mid-turn and reasoning checkpoints
+   are re-foldable under pressure — an intermediateFold checkpoint is recompiled
+   from its original frames with full-fold semantics, a mid-turn checkpoint
+   carries over verbatim. Real user messages and injected frames stay live: the
+   span is split into contiguous runs at each of them and every qualifying run
+   is folded in the same pre-step, newest first. Basic then measures the
+   post-fold surface on the same step and never fires.
 
 3. **Per-turn consolidation (3.8)** — every replacement is a micro-checkpoint
    carrying `source.micro` metadata. At the next normal `turn/end` the turn's
