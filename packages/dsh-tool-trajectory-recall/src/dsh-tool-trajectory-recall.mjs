@@ -23,11 +23,13 @@
 //     line-based `limit`/`offset` page a single recalled event.
 //   - `search` — keyword/regex search over the log. Returns one block per
 //     matching event, freshest first: a `[seq N: <label>] - K match(es)` header
-//     followed by one `<line>: <snippet>` line per distinct match, where the
-//     snippet is the text around the match (`before…match…after`, up to ~120
-//     characters, `…` marking a cut edge). No hit caps and no token budgets.
-//     The agent can then call `recall` with any `(seq N)` pointer to restore
-//     that hit in full.
+//     followed by up to three `<line>: <snippet>` lines, where the snippet is
+//     the text around the match (`before…match…after`, up to ~120 characters,
+//     `…` marking a cut edge) and `<line>` is its 1-based line number in that
+//     event. Snippets are spread over distinct lines where possible; when more
+//     remain, the block ends with `…(+N more snippets)`. No hit caps and no
+//     token budgets. The agent can then call `recall` with any `(seq N)`
+//     pointer to restore that hit in full.
 //   - `/recall` — the same search as a human-facing slash command; its result
 //     is appended to the session as a user message (spilled to a `plugin:spill`
 //     sibling when the index is large, per the "full inline or sibling" rule).
@@ -36,7 +38,7 @@
 // append-only, so the output is always the original content. No tool output is
 // ever truncated: recall returns every requested seq in full (or a paged window
 // it explicitly marks as partial), and search returns every matching event with
-// an excerpt of every distinct match.
+// up to three excerpts of it, marking how many further snippets it left out.
 //
 // ── schema format: RAW JSON Schema, NOT the dsh-tools DSL ───────────────────
 // This plugin registers its `recall`/`search` tools via `ctx.tools.register()`
@@ -466,6 +468,12 @@ function searchEventLabel(session, events, seq, event, message) {
 /** Widest one search snippet in characters: context before + match + context after. */
 const SNIPPET_MAX_CHARS = 120;
 
+/**
+ * Most snippets listed per matching event. The rest are not lost — the event is
+ * restored in full with `recall`, and the listing marks how many were left out.
+ */
+const SNIPPET_MAX_PER_HIT = 3;
+
 /** Collapse runs of blanks so one excerpt stays on one output line. */
 function collapseBlanks(text) {
   return text.replace(/[ \t\f\v]+/gu, " ").trim();
@@ -507,12 +515,13 @@ function lineSnippets(line, matchAllPattern) {
 
 /**
  * Count the pattern occurrences in one event body and excerpt every matching
- * line as `<line>: <snippet>`, so each hit carries both its total occurrence
- * count and the surrounding context of every distinct fragment.
+ * line, so each hit carries both its total occurrence count and the context of
+ * every distinct fragment. Snippets are grouped per line: one line can hold
+ * several non-overlapping fragments.
  */
 function bodyMatches(body, matchAllPattern) {
   let count = 0;
-  const snippets = [];
+  const perLine = [];
   const lines = body.split("\n");
   for (let i = 0; i < lines.length; i += 1) {
     let matchedHere = false;
@@ -521,9 +530,36 @@ function bodyMatches(body, matchAllPattern) {
       matchedHere = true;
     }
     if (!matchedHere) continue;
-    for (const snippet of lineSnippets(lines[i], matchAllPattern)) snippets.push(` ${i + 1}: ${snippet}`);
+    perLine.push({ line: i + 1, snippets: lineSnippets(lines[i], matchAllPattern) });
   }
-  return { count, snippets };
+  return { count, perLine };
+}
+
+/**
+ * Up to {@link SNIPPET_MAX_PER_HIT} rendered snippets: first one from each
+ * matching line in document order, then the remaining fragments of those lines
+ * when the event has fewer matching lines than slots. Spreading over lines keeps
+ * a minified one-line event from spending the whole allowance on its first
+ * line, while the second pass still shows several fragments of a single long
+ * line. Returns the rendered lines plus how many snippets were left out.
+ */
+function selectSnippets(perLine) {
+  const total = perLine.reduce((sum, entry) => sum + entry.snippets.length, 0);
+  const picked = [];
+  for (const entry of perLine) {
+    if (picked.length >= SNIPPET_MAX_PER_HIT) break;
+    picked.push(` ${entry.line}: ${entry.snippets[0]}`);
+  }
+  if (picked.length < SNIPPET_MAX_PER_HIT) {
+    for (const entry of perLine) {
+      for (const snippet of entry.snippets.slice(1)) {
+        if (picked.length >= SNIPPET_MAX_PER_HIT) break;
+        picked.push(` ${entry.line}: ${snippet}`);
+      }
+      if (picked.length >= SNIPPET_MAX_PER_HIT) break;
+    }
+  }
+  return { snippets: picked, omitted: total - picked.length };
 }
 
 /** Search one session's log for matching events, freshest first, as an index. */
@@ -533,6 +569,8 @@ function searchSession(session, patternSource, config) {
   const events = sessionLog(session);
   const hits = [];
   let totalMatches = 0;
+  let totalOccurrences = 0;
+  let omitted = 0;
   for (let seq = events.length - 1; seq >= 0; seq -= 1) {
     const event = events[seq];
     if (event === undefined || event.seq !== seq) continue;
@@ -551,17 +589,20 @@ function searchSession(session, patternSource, config) {
         : `[${event.type}]\n${JSON.stringify(event.data ?? null)}`;
       label = searchEventLabel(session, events, seq, event, message);
     }
-    const { count, snippets } = bodyMatches(body, matchAllPattern);
+    const { count, perLine } = bodyMatches(body, matchAllPattern);
     if (count === 0) continue;
     totalMatches += 1;
-    hits.push({
-      seq,
-      kind: label,
-      text: [`[seq ${seq}: ${label}] - ${count} match${count === 1 ? "" : "es"}`, ...snippets].join("\n")
-    });
+    totalOccurrences += count;
+    const selected = selectSnippets(perLine);
+    omitted += selected.omitted;
+    const block = [`[seq ${seq}: ${label}] - ${count} match${count === 1 ? "" : "es"}`, ...selected.snippets];
+    // The marker alone states the cut: three snippets are listed above it, so
+    // "how many of how many" would repeat what the reader can already count.
+    if (selected.omitted > 0) block.push(` …(+${selected.omitted} more snippet${selected.omitted === 1 ? "" : "s"})`);
+    hits.push({ seq, kind: label, text: block.join("\n") });
   }
   const lines = [
-    `[search "${pattern.source}": ${totalMatches} matching event(s)]`,
+    `[search "${pattern.source}": ${totalMatches} matching event(s), ${totalOccurrences} match${totalOccurrences === 1 ? "" : "es"}]`,
     ...hits.map((hit) => hit.text)
   ];
   if (hits.length > 0) lines.push("[use recall with a (seq N) pointer to restore any hit's full original content]");
@@ -572,8 +613,9 @@ function searchSession(session, patternSource, config) {
   return {
     pattern: pattern.source,
     totalMatches,
+    totalOccurrences,
     hits,
-    omitted: 0,
+    omitted,
     truncated: false,
     tokens: hits.reduce((total, hit) => total + estimateEntryTokens(hit.text), 0),
     text
@@ -584,7 +626,7 @@ function searchSession(session, patternSource, config) {
 
 const RECALL_DESCRIPTION = "Restore the exact original content of earlier events in THIS conversation by a typed reference. type=\"seq\" with a seq selection id (\"3-7,15\", \"seq 12\", \"seqs 3-7\" — the checkpoint marker forms) restores those events; type=\"result\" with the \"result N\" pointer from a tool-call one-liner (\"result 3\" or \"3\") restores that tool result (resolving through to the full spilled content when the result was spilled); type=\"checkpoint\" with an ordinal (\"1\" = oldest, as in a \"[checkpoint N]\" elision line) or a \"seq N\" pointer restores that full checkpoint. The durable log is append-only, so recalled content is always the original tokens. Optional line-based paging: pass limit (lines per event) and/or offset (1-based first line) to window a large event; a windowed recall is marked as partial, so page again with a larger limit or later offset to read the rest. To find events by keyword or regex instead, use the search tool.";
 
-const SEARCH_DESCRIPTION = "Search THIS conversation's durable event log by keyword or regular expression (case-insensitive, Unicode-aware). Every event ever recorded is searchable, including content elided or truncated by compaction checkpoints and full outputs spilled into the log — the log is append-only and untouched. Returns one block per matching event, freshest first: a `[seq N: <label>] - K match(es)` header followed by one indented `<line>: <snippet>` line per distinct match, where the snippet is the text around the match (up to ~120 characters, with … marking a cut edge) and `<line>` is its 1-based line number in that event, so you can page straight to it with recall's offset. There are no hit caps, snippet caps, or token budgets. Then call recall with a (seq N) pointer to restore any hit's full exact original content. Escape regex special characters(e.g. use \\\\( for a literal parenthesis).";
+const SEARCH_DESCRIPTION = "Search THIS conversation's durable event log by keyword or regular expression (case-insensitive, Unicode-aware). Every event ever recorded is searchable, including content elided or truncated by compaction checkpoints and full outputs spilled into the log — the log is append-only and untouched. Returns one block per matching event, freshest first: a `[seq N: <label>] - K match(es)` header followed by up to three indented `<line>: <snippet>` lines, where the snippet is the text around the match (up to ~120 characters, with … marking a cut edge) and `<line>` is its 1-based line number in that event, so you can page straight to it with recall's offset. Snippets are taken from distinct lines where possible; a block with more matches than that ends with `…(+N more snippets)`. There are no hit caps or token budgets. Then call recall with a (seq N) pointer to restore any hit's full exact original content. Escape regex special characters(e.g. use \\\\( for a literal parenthesis).";
 
 const RECALL_OUTPUT = {
   schema: {
@@ -611,11 +653,12 @@ const SEARCH_OUTPUT = {
       text: { type: "string" },
       pattern: { type: "string" },
       totalMatches: { type: "integer" },
+      totalOccurrences: { type: "integer" },
       omitted: { type: "integer" },
       truncated: { type: "boolean" },
       tokens: { type: "integer" }
     },
-    required: ["text", "pattern", "totalMatches", "omitted", "truncated", "tokens"]
+    required: ["text", "pattern", "totalMatches", "totalOccurrences", "omitted", "truncated", "tokens"]
   },
   render: (_args, value) => [{ type: "text", text: value.text }]
 };
@@ -711,6 +754,7 @@ function defineSearchTool(resolved) {
         text: result.text,
         pattern: result.pattern,
         totalMatches: result.totalMatches,
+        totalOccurrences: result.totalOccurrences,
         omitted: result.omitted,
         truncated: result.truncated,
         tokens: result.tokens
@@ -733,7 +777,7 @@ function defineSearchTool(resolved) {
  */
 /** Text of the system-prompt hint about restoring compacted content. */
 const RECALL_HINT_TEXT =
-  "Folded `seq`/`result`/`checkpoint` content may be restored in full using tools `recall` by id or `search` by keyword — `search` returns an untruncated (seq N) index with a snippet per match; don't guess. Large spilled outputs are recalled by seq; page them with recall's limit/offset. When a tool call you already made has been folded (its row reads `* name \"...\" (seq N -> result M)`), read that result back with `recall type=\"result\" id=\"M\"` instead of running the command again.";
+  "Folded `seq`/`result`/`checkpoint` content may be restored in full using tools `recall` by id or `search` by keyword — `search` returns an untruncated (seq N) index with a few snippets per match; don't guess. Large spilled outputs are recalled by seq; page them with recall's limit/offset. When a tool call you already made has been folded (its row reads `* name \"...\" (seq N -> result M)`), read that result back with `recall type=\"result\" id=\"M\"` instead of running the command again.";
 
 /** Execute one grep-based `/recall` request against the calling agent's session. */
 async function executeRecallCommand(invocation, appendPluginRecord) {

@@ -48,15 +48,18 @@ content too.
 
 Keyword/regex search over the durable event log (case-insensitive,
 Unicode-aware), scanning **from the end backwards** so freshest matches come
-first. Every matching event produces one block: a header line plus one indented
-line per distinct match.
+first. The listing opens with a totals line, then every matching event produces
+one block: a header line plus up to three indented snippet lines.
 
 ```
+[search "<pattern>": E matching event(s), M matches]
 [seq N: <label>] - K match(es)
  L: <snippet>
  L: <snippet>
+ …(+R more snippets)
 ```
 
+`E` is the number of matching events and `M` the total occurrences across them.
 `<label>` is the tool name for tool-call/tool-result rows (resolved by scanning
 earlier events for the matching tool call id), the spill record's own tool name
 for `plugin:spill` siblings, or the message role otherwise, and `K` is the total
@@ -67,7 +70,11 @@ characters, with `…` marking a cut edge — and `L` is its 1-based line number
 that event, computed against the decoded spill body, so the model can page
 straight to the needle with `recall`'s `offset`. Matches whose windows overlap
 share one snippet, so a line with several adjacent hits yields one excerpt
-rather than repeats. There are no hit caps, snippet caps, or token budgets.
+rather than repeats. At most three snippets are listed per event: the first one
+from each matching line in document order, then further fragments of those lines
+when the event has fewer matching lines than slots. A block that left fragments
+out ends with `…(+R more snippets)`; nothing else is dropped — there are no hit
+caps or token budgets, and `recall` restores the whole event.
 
 Blocks are separated by a single newline (the indent already delimits them);
 only `recall` puts a blank line between restored events, since those bodies are
@@ -94,8 +101,8 @@ The recall/search cores and compiler helpers are vendored from an upstream
 compaction engine whose algorithm this plugin adapts for model-facing
 same-session recall/search tools. No tool output is ever truncated: recall
 returns every requested seq in full (or a paged window it explicitly marks as
-partial), and search returns every matching event with an excerpt of every
-distinct match.
+partial), and search returns every matching event with up to three excerpts of
+it, marking how many further snippets it left out.
 
 The `plugin:spill` sibling contract (record type string, `{ toolName, callId,
 content }` data shape, and seq semantics) is shared with `dsh-spill-policy`; the
