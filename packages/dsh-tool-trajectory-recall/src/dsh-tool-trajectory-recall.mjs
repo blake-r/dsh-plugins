@@ -513,7 +513,9 @@ function searchSession(session, patternSource, config) {
     ...hits.map((hit) => hit.text)
   ];
   if (hits.length > 0) lines.push("[use recall with a (seq N) pointer to restore any hit's full original content]");
-  const text = lines.join("\n\n");
+  // Every index entry is a single line, so the index is one line per event:
+  // joining with a blank line would double-space the whole listing.
+  const text = lines.join("\n");
   return {
     pattern: pattern.source,
     totalMatches,

@@ -54,13 +54,16 @@ first. Every matching event produces exactly one index line:
 [seq N: <label>] - K match(es) · first match at line L
 ```
 
-where `<label>` is the tool name for tool-call/tool-result rows (resolved by
-scanning earlier events for the matching tool call id), the spill record's own
-tool name for `plugin:spill` siblings, or the message role otherwise, and `K`
-is the total number of pattern occurrences in that event's projected body
-text. Each hit also carries the 1-based line `L` of its first match, computed
-against the decoded spill body, so the model can page straight to the needle
-with `recall`'s `offset`. There are no hit caps, line caps, or token budgets.
+The index is compact — one line per matching event, no blank lines between
+entries (only `recall` separates restored events with a blank line, since those
+bodies are multi-line). `<label>` is the tool name for tool-call/tool-result
+rows (resolved by scanning earlier events for the matching tool call id), the
+spill record's own tool name for `plugin:spill` siblings, or the message role
+otherwise, and `K` is the total number of pattern occurrences in that event's
+projected body text. Each hit also carries the 1-based line `L` of its first
+match, computed against the decoded spill body, so the model can page straight
+to the needle with `recall`'s `offset`. There are no hit caps, line caps, or
+token budgets.
 Search matches full spilled content too — a needle buried in a spilled blob
 that the model never saw inline is still found. The trailing hint line points
 back at `recall` with a `(seq N)` pointer to restore any hit's full original
