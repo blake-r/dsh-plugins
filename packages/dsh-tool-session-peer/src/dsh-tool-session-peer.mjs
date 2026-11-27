@@ -49,7 +49,7 @@
 // `required` array.
 
 const name = "dsh-tool-session-peer";
-const inject = ["tools", "agents"];
+const inject = ["tools", "agents", "workspaceRegistry"];
 
 const MAX_MESSAGE_BYTES = 32768;
 const RATE_WINDOW_MS = 60000;
@@ -186,21 +186,24 @@ function headerDelegationDepth(agent) {
   return typeof depth === "number" && Number.isSafeInteger(depth) && depth > 0 ? depth : 0;
 }
 
-/**
- * The workspace registry's durable archive set, as a Set of session ids.
- *
- * The registry is optional: a composition without `@deepseek-ai/dsh-workspace`
- * has no archive concept, and an absent service must read as "nothing is
- * archived" rather than hide every peer.
- */
+/** Read the archive set or fail closed when its status cannot be trusted. */
 function archivedSessionIds(ctx) {
+  let ids;
   try {
-    const registry = ctx.get("workspaceRegistry");
-    const ids = registry?.archivedSessionIds;
-    return Array.isArray(ids) ? new Set(ids.map(String)) : new Set();
+    ids = ctx.get("workspaceRegistry")?.archivedSessionIds;
   } catch {
-    return new Set();
+    throw new PeerError(
+      "cannot verify Session archive status; refusing peer operation",
+      "PEER_ARCHIVE_STATUS_UNAVAILABLE"
+    );
   }
+  if (!Array.isArray(ids) || ids.some((id) => typeof id !== "string")) {
+    throw new PeerError(
+      "cannot verify Session archive status; refusing peer operation",
+      "PEER_ARCHIVE_STATUS_UNAVAILABLE"
+    );
+  }
+  return new Set(ids);
 }
 
 /** Whether one Session id is in the archive set. */
@@ -236,7 +239,7 @@ function sessionRows(ctx, selfId, cwd) {
       }
     }
   } catch {
-    // Live Sessions remain discoverable without the optional workspace registry.
+    // Live Agent metadata remains useful when the workspace index itself fails.
   }
   for (const agent of ctx.agents.list()) {
     const id = String(agent.id);

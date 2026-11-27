@@ -3,7 +3,16 @@ import test from "node:test";
 
 import { apply } from "../src/dsh-tool-session-peer.mjs";
 
-function setup({ sender, peers = [], records, archived = [] }) {
+function setup({
+  sender,
+  peers = [],
+  records,
+  archived = [],
+  registryError,
+  archiveError,
+  omitWorkspaceRegistry = false,
+  omitArchiveSet = false
+}) {
   const tools = new Map();
   const liveAgents = [sender, ...peers];
   const sessionRecords = records ?? liveAgents.map((agent) => ({
@@ -68,18 +77,25 @@ function setup({ sender, peers = [], records, archived = [] }) {
       import: async () => ({ createUserMessage: (message) => ({ id: "message-1", ...message }) })
     },
     get(key) {
-      if (key === "workspaceRegistry") return {
-        archivedSessionIds: archived,
-        list: () => {
-          const workspaces = new Map();
-          for (const record of sessionRecords) {
-            const path = record.header.cwd ?? "";
-            if (!workspaces.has(path)) workspaces.set(path, { path, sessionIds: [] });
-            workspaces.get(path).sessionIds.push(record.header.id);
+      if (key === "workspaceRegistry") {
+        if (registryError) throw registryError;
+        if (omitWorkspaceRegistry) return undefined;
+        return {
+          get archivedSessionIds() {
+            if (archiveError) throw archiveError;
+            return omitArchiveSet ? undefined : archived;
+          },
+          list: () => {
+            const workspaces = new Map();
+            for (const record of sessionRecords) {
+              const path = record.header.cwd ?? "";
+              if (!workspaces.has(path)) workspaces.set(path, { path, sessionIds: [] });
+              workspaces.get(path).sessionIds.push(record.header.id);
+            }
+            return [...workspaces.values()];
           }
-          return [...workspaces.values()];
-        }
-      };
+        };
+      }
       if (key === "sessionTitle") return { get: (session) => ({ title: session.title ?? "" }) };
       if (key === "agentPresets") return {
         async resolve(id) { return { id }; },
@@ -263,6 +279,36 @@ test("session_broadcast skips cold sessions without resuming them", async () => 
   assert.equal(result.failed.length, 1);
   assert.match(result.failed[0].error, /cold session skipped/);
   assert.equal(state.resumed.length, 0);
+});
+
+test("session_send refuses cold targets when archive status is unavailable", async (t) => {
+  const unavailable = [
+    ["registry absent", { omitWorkspaceRegistry: true }],
+    ["registry lookup throws", { registryError: new Error("registry unavailable") }],
+    ["archive state read throws", { archiveError: new Error("state unavailable") }],
+    ["archive state missing", { omitArchiveSet: true }]
+  ];
+
+  for (const [name, failure] of unavailable) {
+    await t.test(name, async () => {
+      const sender = agent("sender", "Sender");
+      const { tools, state } = setup({
+        sender,
+        ...failure,
+        records: [
+          { header: { id: "sender", ...sender.session.header }, live: true, persisted: true },
+          coldRecord("cold", "Archived candidate")
+        ]
+      });
+
+      await assert.rejects(
+        tools.get("session_send").execute({ target: "cold", message: "wake" }, { agent: sender }),
+        (error) => error.code === "PEER_ARCHIVE_STATUS_UNAVAILABLE"
+      );
+      assert.equal(state.resumed.length, 0);
+      assert.equal(state.queries.listSessions, 0);
+    });
+  }
 });
 
 test("archived cold sessions are neither listed nor resumed", async () => {

@@ -67,14 +67,18 @@ how to answer with `session_send`.
   claim the message, run a turn nobody can see, and drop the input unrun.
   `session_peers` therefore omits archived Sessions, and `session_send` refuses
   an archived target with `PEER_TARGET_ARCHIVED` instead of reporting a
-  delivery that never happens. Unarchive the Session in the GUI to reach it.
+  delivery that never happens. If the registry or archive set is unavailable,
+  peer operations fail closed with `PEER_ARCHIVE_STATUS_UNAVAILABLE`; they never
+  assume the target is unarchived. Unarchive the Session in the GUI to reach it.
 - Messages are capped at 32 KiB and rate-limited to 20 per minute per sending
   Session. A broadcast reserves its whole fan-out before sending, so it either
   goes out completely or fails with `PEER_RATE_LIMITED`.
 
 ## Composition
 
-The bundle patch inserts one host-plane row:
+The bundle patch inserts one host-plane row. It requires the host
+`workspaceRegistry` service so archive checks are authoritative; operations refuse
+with `PEER_ARCHIVE_STATUS_UNAVAILABLE` if its state cannot be read.
 
 ```yaml
 - insert:
