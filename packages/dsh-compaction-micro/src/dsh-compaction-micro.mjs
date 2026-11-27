@@ -75,24 +75,34 @@
 //   request header), with the SAME thresholdRatio/headroomTokens knob names and
 //   defaults as dsh-compaction-basic, so both compactors configure alike and
 //   micro always fires exactly one `chunkTokens` budget earlier.
-//   skip-guard: `foldableChunks >= 1` (derived from lockedChunks; the foldable
-//   content must be older than the locked window). The locked window (the last
-//   `lockedChunks` chunk-objects, `1 < locked <= 2` chunks by default) is never
-//   folded, so the model's live tail stays intact mid-turn.
+//   skip-guard: `foldableChunks >= 1` AND at least one `chunkTokens` worth of
+//   absorbable content before the lock line. Both are derived from lockedChunks.
 //
-// Chunk window: everything absorbable after the nearest FULL fold (phase "turn"
-// or "session") — foldable nodes AND this plugin's own mid-turn / reasoning
-// checkpoints — is priced with the vendored heuristic and sliced into
-// `chunkTokens` chunks from the oldest node. Earlier micro passes are therefore
-// re-foldable under pressure: an intermediateFold checkpoint is recompiled from
-// its ORIGINAL frames with full-fold semantics, a mid-turn checkpoint carries
-// over verbatim. The span is split into contiguous runs at every real user
-// message and every injected frame (one `replace` op can only shadow one
-// contiguous seq range), and every qualifying run is committed in the same
-// pre-step, newest first. The last `lockedChunks` chunk-objects form the locked
-// window; everything older is foldable. A partially consumed run is cut on a
-// complete call → result pair (a dangling call at the boundary is backed off one
-// node and waits for its result).
+// Chunk accounting vs folding — two separate concerns:
+//
+//   ACCOUNTING measures how much dialogue has been lived through, so it runs over
+//   the WHOLE surface from its first node: every surface node is priced with the
+//   vendored heuristic and sliced into `chunkTokens` chunks from the start; the
+//   last `lockedChunks` chunks (`1 < locked <= 2` by default) form the locked
+//   window and their start offset is the LOCK LINE. Accounting folds nothing and
+//   never re-folds a full fold; it only answers "may this pass run" and "where
+//   does it stop". Anchoring it to a dialogue position instead of to a token
+//   budget keeps the lock exact: a budget of whole chunks rounds UP and silently
+//   eats up to one extra chunk of live tail.
+//
+//   FOLDING only touches ABSORBABLE content that starts before the lock line:
+//   foldable nodes (`assistant/message`, `tool/result`) plus this plugin's own
+//   mid-turn / reasoning checkpoints, all of them after the nearest FULL fold
+//   (phase "turn" or "session"). Full folds, real user messages and injected
+//   frames inside that region are never shadowed. Earlier micro passes are thus
+//   re-foldable under pressure: an intermediateFold checkpoint is recompiled from
+//   its ORIGINAL frames with full-fold semantics, a mid-turn checkpoint carries
+//   over verbatim. The span is split into contiguous runs at every real user
+//   message and every injected frame (one `replace` op can only shadow one
+//   contiguous seq range), and every qualifying run is committed in the same
+//   pre-step, newest first. A run straddling the lock line is cut on a complete
+//   call → result pair (a dangling call at the boundary is backed off one node and
+//   waits for its result).
 //
 // Checkpoint lifecycle (3.8): every replacement is a `micro-checkpoint` — its
 // message carries `source.micro` metadata (phase, turn, seq span, tokens,
@@ -1291,61 +1301,63 @@ function apply(ctx, config = {}) {
   };
 
   /**
-   * Pick what to fold under pressure: everything older than the locked window —
-   * `lockedChunks` chunk-objects measured from the END of the whole span —
-   * rounded down to whole chunks. Whole segments are taken oldest-first until
-   * that budget runs out; a partially consumed segment is cut at a pairing-safe
-   * boundary. Ranges come back oldest-first and disjoint.
-   * @returns `{ ranges, totalTokens, foldableChunks }`, or null when nothing is
-   *   older than the lock.
+   * Chunk accounting runs over the WHOLE dialogue surface from its first node:
+   * every surface node is priced and sliced into `chunkTokens` chunks from the
+   * start; the last `lockedChunks` chunks are the locked window. This is pure
+   * arithmetic — it folds nothing and never re-folds a full fold. Folding itself
+   * only touches absorbable content that STARTS before the lock line; full folds
+   * and user messages inside that region stay untouched.
+   * @returns `{ ranges, totalTokens, foldableChunks }`, or null when nothing
+   *   absorbable lies outside the locked window.
    */
   const selectFoldRanges = (session, segments) => {
+    const nodes = Array.from(session.surface.nodes);
+    const startOf = new Map();
     let totalTokens = 0;
-    for (const segment of segments) totalTokens += segment.tokens;
+    for (const seq of nodes) {
+      startOf.set(seq, totalTokens);
+      const node = projectNode(session, seq);
+      if (node !== null) totalTokens += node.price || 0;
+    }
     const foldableChunks = Math.ceil(totalTokens / chunkTokens) - lockedChunks;
     if (foldableChunks <= 0) return null;
+    const lockStart = totalTokens - lockedChunks * chunkTokens;
 
-    let budget = foldableChunks * chunkTokens;
     const ranges = [];
     for (const segment of segments) {
-      if (budget <= 0) break;
-      if (segment.tokens <= budget) {
-        ranges.push(segment.run);
-        budget -= segment.tokens;
+      const full = segment.run.map((node, idx) => ({ idx, seq: node.seq, event: node.event, message: node.message, price: node.price }));
+      let cutEnd = -1;
+      for (let idx = 0; idx < full.length; idx++) {
+        if ((startOf.get(full[idx].seq) ?? totalTokens) >= lockStart) break;
+        cutEnd = idx;
+      }
+      if (cutEnd < 0) continue;
+      if (cutEnd === full.length - 1) {
+        ranges.push(full);
         continue;
       }
-      // Partial segment: take its oldest prefix worth `budget` tokens.
-      const stream = segment.run.map((node, idx) => ({ idx, seq: node.seq, event: node.event, message: node.message, price: node.price }));
-      let acc = 0;
-      let endIdx = stream.length - 1;
-      for (let j = 0; j < stream.length; j++) {
-        acc += stream[j].price || 0;
-        if (acc >= budget) {
-          endIdx = j;
-          break;
-        }
-      }
-      // Pairing back-off (3.5): never cut a tool call from its result.
-      const resultIndexByCall = resultIndexByCallId(stream);
-      while (endIdx >= 0 && hasDanglingCall(stream[endIdx].message, endIdx, resultIndexByCall)) endIdx--;
-      if (endIdx < 0) break;
-
-      // Tool-pairing snap (3.10): a token-driven cut can land inside a step's
-      // result run while its call row sits far earlier — folding there would
-      // remove calls with part of their results and leave the rest live. Move
-      // onto the engine's own nearest balanced cut instead.
-      const snap = snapEndToBalancedCut(session, stream, endIdx);
-      if (snap === null || snap.endIdx < 0) break;
+      // The lock line falls inside this run: cut it at a pairing-safe boundary.
+      let endIdx = cutEnd;
+      const resultIndexByCall = resultIndexByCallId(full);
+      while (endIdx >= 0 && hasDanglingCall(full[endIdx].message, endIdx, resultIndexByCall)) endIdx--;
+      if (endIdx < 0) continue;
+      const snap = snapEndToBalancedCut(session, full, endIdx);
+      if (snap === null || snap.endIdx < 0) continue;
       if (snap.moved) {
         log("info", `mid-turn: pairing snap moved the fold end from seq ${snap.from} to seq ${snap.to} (+${snap.extraTokens} tokens${snap.shrunk ? ", shrunk" : ""}) so no tool call/result pair is split`);
         endIdx = snap.endIdx;
-        if (endIdx < 0) break;
+        if (endIdx < 0) continue;
       }
-      ranges.push(stream.slice(0, endIdx + 1));
-      budget -= stream.slice(0, endIdx + 1).reduce((sum, node) => sum + (node.price || 0), 0);
-      break;
+      ranges.push(full.slice(0, endIdx + 1));
     }
-    return ranges.length > 0 ? { ranges, totalTokens, foldableChunks } : null;
+    if (ranges.length === 0) return null;
+    let foldableTokens = 0;
+    for (const range of ranges) for (const node of range) foldableTokens += node.price || 0;
+    if (foldableTokens < chunkTokens) {
+      log("info", `mid-turn: only ${foldableTokens} tokens lie before the lock line (min ${chunkTokens}); fold skipped this pass`);
+      return null;
+    }
+    return { ranges, totalTokens, foldableChunks };
   };
 
   /**

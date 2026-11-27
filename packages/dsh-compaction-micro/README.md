@@ -38,14 +38,27 @@ Three behaviors:
    plugin also listens at `agent/pre-step` (BEFORE basic, `{ prepend: true }`,
    synchronous fold) and, when the surface crosses a configurable pressure
    threshold, structurally folds everything older than a locked window into a
-   one-liner checkpoint. The fold span starts at the nearest FULL fold (phase
-   `turn` / `session`), so this plugin's own mid-turn and reasoning checkpoints
-   are re-foldable under pressure — an intermediateFold checkpoint is recompiled
-   from its original frames with full-fold semantics, a mid-turn checkpoint
-   carries over verbatim. Real user messages and injected frames stay live: the
-   span is split into contiguous runs at each of them and every qualifying run
-   is folded in the same pre-step, newest first. Basic then measures the
-   post-fold surface on the same step and never fires.
+   one-liner checkpoint.
+
+   Chunk accounting and folding are separate concerns. ACCOUNTING measures how
+   much dialogue has been lived through, so it prices the WHOLE surface from its
+   first node, slices it into `chunkTokens` chunks from the start, and puts the
+   lock line where the last `lockedChunks` chunks begin. It folds nothing and
+   never re-folds a full fold; it only decides whether a pass may run and where
+   it stops. Anchoring it to a dialogue position rather than to a whole-chunk
+   token budget keeps the lock exact — a budget rounds up and silently eats up to
+   one extra chunk of live tail.
+
+   FOLDING only touches absorbable content that starts before the lock line: the
+   span begins at the nearest FULL fold (phase `turn` / `session`), so this
+   plugin's own mid-turn and reasoning checkpoints are re-foldable under pressure
+   — an intermediateFold checkpoint is recompiled from its original frames with
+   full-fold semantics, a mid-turn checkpoint carries over verbatim. Full folds,
+   real user messages and injected frames stay live: the span is split into
+   contiguous runs at each of them and every qualifying run is folded in the same
+   pre-step, newest first. A pass is skipped when less than one chunk of
+   absorbable content lies before the lock line. Basic then measures the post-fold
+   surface on the same step and never fires.
 
 3. **Per-turn consolidation (3.8)** — every replacement is a micro-checkpoint
    carrying `source.micro` metadata. At the next normal `turn/end` the turn's
@@ -96,10 +109,12 @@ patch:
   `null` / `[]` remove a tool's fallback). Defaults: `glob` → `pattern`,
   `grep` → `pattern`, `read`/`write`/`edit` → `file_path`.
 - `chunkTokens` (positive integer, default `16384`): the token budget of one
-  chunk-object when slicing the mid-turn foldable stream.
+  chunk-object when slicing the dialogue surface for chunk accounting, and the
+  minimum amount of absorbable content a pressure pass must find before the lock
+  line to be worth running.
 - `lockedChunks` (positive integer, default `2`, kept at 2 by the guard):
-  the number of chunk-objects at the live tail that are NEVER folded mid-turn
-  (the model's live window, 16385..32768 tokens by default).
+  the number of chunk-objects at the live tail of the dialogue that are NEVER
+  folded mid-turn (the model's live window, 16385..32768 tokens by default).
 - `thresholdRatio` (positive finite number, default `0.8`): same knob name and
   default as `dsh-compaction-basic` — the micro threshold is
   `floor(min(W*thresholdRatio, W − maxTokens − headroomTokens)) − chunkTokens`,
