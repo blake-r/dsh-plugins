@@ -21,9 +21,9 @@ never turns a successful call into an error or hides content.
 
 Divergence from base `@deepseek-ai/dsh-spill-policy`:
 
-- Byte cap (`maxInlineBytes` — the deployment's row config sets 16384, the
-  "4K tokens" budget under the token-meter heuristic density of 4 chars/token;
-  the code default is 4096 bytes vs the base 50000).
+- Byte cap (`maxInlineBytes` — the deployment's row config sets 131072, matching
+  the read tool's `readMaxBytes` so the policy never folds a result smaller than
+  one read call can return; the code default is 4096 bytes vs the base 50000).
 - **File-based spill.** The artifact lands in `<sessionDir>/spill/`, whose path
   comes from the persistence backend itself
   (`ctx.get("sessionPersistence").locate(session.header)`), so nothing hardcodes
@@ -74,17 +74,17 @@ newlines.
 ## Mount
 
 The bundle patch disables the base `spill-policy` row and inserts
-`dsh-spill-policy`. The row's config overrides `maxInlineBytes` to 16384 bytes
-(4K tokens at the token-meter heuristic density of 4 chars/token), while the
-remaining defaults live in the plugin code (`headLines: 2`, `tailLines: 1`,
-`excludeTools: ["read", "skill", "recall"]`) and apply whenever no config is
-specified. A profile patch applied after this bundle layer can still override
-the values:
+`dsh-spill-policy`. The row's config overrides `maxInlineBytes` to 131072 bytes
+(the read tool's `readMaxBytes`, so a result one read call could return stays
+inline), while the remaining defaults live in the plugin code (`headLines: 2`,
+`tailLines: 1`, `excludeTools: ["read", "skill", "recall"]`) and apply whenever no
+config is specified. A profile patch applied after this bundle layer can still
+override the values:
 
 ```yaml
 - id: spill-policy-replacement
   config:
-    maxInlineBytes: 16384
+    maxInlineBytes: 131072
     headLines: 3
     tailLines: 2
 ```
