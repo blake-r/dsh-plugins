@@ -7,6 +7,7 @@ function setup({
   sender,
   peers = [],
   records,
+  currentPresets = {},
   archived = [],
   registryError,
   archiveError,
@@ -24,7 +25,12 @@ function setup({
   for (const record of sessionRecords) {
     if (record.title !== undefined) titleById.set(record.header.id, record.title);
   }
-  const state = { resumed: [], mountedPresets: [], queries: { listSessions: 0, listEvents: [], observeSession: [] } };
+  const state = {
+    resumed: [],
+    mountedPresets: [],
+    presetReads: [],
+    queries: { listSessions: 0, listEvents: [], observeSession: [] }
+  };
   const eventsById = new Map(sessionRecords.map((record) => [
     record.header.id,
     record.events ?? [{ type: "user/message" }]
@@ -98,6 +104,10 @@ function setup({
       }
       if (key === "sessionTitle") return { get: (session) => ({ title: session.title ?? "" }) };
       if (key === "agentPresets") return {
+        presetForSession(session) {
+          state.presetReads.push(session?.header?.id);
+          return currentPresets[session?.header?.id] ?? null;
+        },
         async resolve(id) { return { id }; },
         async mount(_agentCtx, id) { state.mountedPresets.push(id); }
       };
@@ -113,7 +123,7 @@ function agent(id, title, cwd = "/workspace", status = "idle") {
   return {
     id,
     status,
-    session: { header: { cwd, delegationDepth: 0, agentPreset: "kilo" }, title },
+    session: { header: { id, cwd, delegationDepth: 0, agentPreset: "kilo" }, title },
     calls,
     async followup(message) { calls.push(["followup", message]); },
     async steer(message) { calls.push(["steer", message]); }
@@ -189,6 +199,21 @@ test("session_send rejects duplicate exact live titles and asks for an id", asyn
     (error) => error.code === "PEER_TARGET_AMBIGUOUS"
   );
   assert.equal(first.calls.length + second.calls.length, 0);
+  assert.deepEqual(state.queries.observeSession, []);
+  assert.deepEqual(state.queries.listEvents, []);
+  assert.equal(state.queries.listSessions, 0);
+});
+
+test("session_peers reports the current projected preset instead of the session header", async () => {
+  const sender = agent("sender", "Sender");
+  const peer = agent("peer", "Peer");
+  peer.session.header.agentPreset = "otus";
+  const { tools, state } = setup({ sender, peers: [peer], currentPresets: { peer: "trading" } });
+
+  const result = await tools.get("session_peers").execute({}, { agent: sender });
+
+  assert.equal(result.peers[0].preset, "trading");
+  assert.deepEqual(state.presetReads, ["peer"]);
   assert.deepEqual(state.queries.observeSession, []);
   assert.deepEqual(state.queries.listEvents, []);
   assert.equal(state.queries.listSessions, 0);

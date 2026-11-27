@@ -163,15 +163,25 @@ function titleOf(ctx, session) {
   }
 }
 
+/** Read the current preset directly from the Session's in-memory projection. */
+function currentPresetOf(presets, session) {
+  try {
+    const preset = presets?.presetForSession?.(session);
+    return typeof preset === "string" ? preset : "";
+  } catch {
+    return "";
+  }
+}
+
 /** Describe one live Agent as an addressable peer row. */
-function peerRow(ctx, agent) {
+function peerRow(ctx, agent, presets) {
   const header = agent.session?.header ?? {};
   return {
     id: String(agent.id),
     title: titleOf(ctx, agent.session),
     status: String(agent.status ?? "unknown"),
     cwd: typeof header.cwd === "string" ? header.cwd : "",
-    preset: typeof header.agentPreset === "string" ? header.agentPreset : ""
+    preset: currentPresetOf(presets, agent.session)
   };
 }
 
@@ -218,7 +228,7 @@ function workspaceOf(agent) {
 }
 
 /** List indexed Sessions for one workspace without reading event logs. */
-function sessionRows(ctx, selfId, cwd) {
+function sessionRows(ctx, selfId, cwd, includePresets = false) {
   const candidates = new Map();
   try {
     const registry = ctx.get("workspaceRegistry");
@@ -241,6 +251,14 @@ function sessionRows(ctx, selfId, cwd) {
   } catch {
     // Live Agent metadata remains useful when the workspace index itself fails.
   }
+  let presets;
+  if (includePresets) {
+    try {
+      presets = ctx.get("agentPresets");
+    } catch {
+      presets = undefined;
+    }
+  }
   for (const agent of ctx.agents.list()) {
     const id = String(agent.id);
     if (id === selfId) continue;
@@ -248,7 +266,7 @@ function sessionRows(ctx, selfId, cwd) {
       candidates.delete(id);
       continue;
     }
-    const row = peerRow(ctx, agent);
+    const row = peerRow(ctx, agent, presets);
     if (cwd !== "" && row.cwd !== cwd) continue;
     candidates.set(id, {
       ...row,
@@ -260,8 +278,8 @@ function sessionRows(ctx, selfId, cwd) {
 }
 
 /** Non-archived peers in the caller's workspace; an unknown cwd sees all. */
-async function peersOf(ctx, agent) {
-  const rows = sessionRows(ctx, String(agent.id), workspaceOf(agent));
+async function peersOf(ctx, agent, includePresets = false) {
+  const rows = sessionRows(ctx, String(agent.id), workspaceOf(agent), includePresets);
   const archived = archivedSessionIds(ctx);
   return rows.filter((row) => !archived.has(row.id));
 }
@@ -354,7 +372,7 @@ class RateLimiter {
 
 /** Build the model-facing peer list payload for one calling Session. */
 async function peersPayload(ctx, agent) {
-  const rows = await peersOf(ctx, agent);
+  const rows = await peersOf(ctx, agent, true);
   const text =
     rows.length === 0
       ? "(no other non-archived Sessions in this workspace)"
