@@ -15,7 +15,7 @@ function setup({ sender, peers = [], records, archived = [] }) {
   for (const record of sessionRecords) {
     if (record.title !== undefined) titleById.set(record.header.id, record.title);
   }
-  const state = { resumed: [], mountedPresets: [] };
+  const state = { resumed: [], mountedPresets: [], queries: { listSessions: 0, listEvents: [], observeSession: [] } };
   const eventsById = new Map(sessionRecords.map((record) => [
     record.header.id,
     record.events ?? [{ type: "user/message" }]
@@ -35,8 +35,8 @@ function setup({ sender, peers = [], records, archived = [] }) {
       }
     },
     sessionQuery: {
-      async listSessions() { return sessionRecords; },
-      async listEvents(id) { return eventsById.get(id) ?? []; },
+      async listSessions() { state.queries.listSessions += 1; return sessionRecords; },
+      async listEvents(id) { state.queries.listEvents.push(id); return eventsById.get(id) ?? []; },
       async readTitleSnapshots(ids) {
         return ids.map((sessionId) => ({
           sessionId,
@@ -45,8 +45,14 @@ function setup({ sender, peers = [], records, archived = [] }) {
         }));
       },
       async observeSession(sessionId) {
+        state.queries.observeSession.push(sessionId);
         const record = sessionRecords.find((row) => row.header.id === sessionId);
-        return { header: record.header, projections: { values: { agentPreset: record.header.agentPreset } } };
+        return {
+          header: record.header,
+          events: eventsById.get(sessionId) ?? [],
+          projections: { values: { agentPreset: record.header.agentPreset } },
+          [Symbol.dispose]() {}
+        };
       }
     },
     tools: {
@@ -64,7 +70,15 @@ function setup({ sender, peers = [], records, archived = [] }) {
     get(key) {
       if (key === "workspaceRegistry") return {
         archivedSessionIds: archived,
-        list: () => [{ sessionIds: sessionRecords.map((record) => record.header.id) }]
+        list: () => {
+          const workspaces = new Map();
+          for (const record of sessionRecords) {
+            const path = record.header.cwd ?? "";
+            if (!workspaces.has(path)) workspaces.set(path, { path, sessionIds: [] });
+            workspaces.get(path).sessionIds.push(record.header.id);
+          }
+          return [...workspaces.values()];
+        }
       };
       if (key === "sessionTitle") return { get: (session) => ({ title: session.title ?? "" }) };
       if (key === "agentPresets") return {
@@ -99,51 +113,79 @@ function coldRecord(id, title, cwd = "/workspace") {
   };
 }
 
-test("session_send accepts an exact peer title", async () => {
+test("session_send addresses a live peer by id without listing or reading other sessions", async () => {
   const sender = agent("sender", "Sender");
   const recipient = agent("recipient", "Биржевой аналитик");
-  const { tools } = setup({ sender, peers: [recipient] });
+  const unrelated = agent("unrelated", "Unrelated", "/other-workspace");
+  const { tools, state } = setup({ sender, peers: [recipient, unrelated] });
 
   const result = await tools.get("session_send").execute(
-    { target: "Биржевой аналитик", message: "Сводка" },
+    { target: "recipient", message: "Сводка" },
     { agent: sender }
   );
 
   assert.equal(result.delivered, true);
   assert.equal(result.targetSessionId, "recipient");
   assert.equal(recipient.calls.length, 1);
+  assert.deepEqual(state.queries.observeSession, []);
+  assert.deepEqual(state.queries.listEvents, []);
+  assert.equal(state.queries.listSessions, 0);
 });
 
-test("session_send rejects a title fragment instead of guessing a recipient", async () => {
+test("session_send resolves an exact live title without reading session files", async () => {
   const sender = agent("sender", "Sender");
   const recipient = agent("recipient", "Биржевой аналитик");
-  const { tools } = setup({ sender, peers: [recipient] });
+  const { tools, state } = setup({ sender, peers: [recipient] });
 
-  await assert.rejects(
-    tools.get("session_send").execute(
-      { target: "Биржевой", message: "Сводка" },
-      { agent: sender }
-    ),
-    (error) => error.code === "PEER_TARGET_NOT_FOUND"
+  const result = await tools.get("session_send").execute(
+    { target: "Биржевой аналитик", message: "Сводка" },
+    { agent: sender }
   );
-  assert.equal(recipient.calls.length, 0);
+
+  assert.equal(result.targetSessionId, "recipient");
+  assert.equal(recipient.calls.length, 1);
+  assert.deepEqual(state.queries.observeSession, []);
+  assert.deepEqual(state.queries.listEvents, []);
+  assert.equal(state.queries.listSessions, 0);
 });
 
-test("duplicate exact titles require an exact session id", async () => {
+test("session_send scopes title lookup to the caller workspace", async () => {
   const sender = agent("sender", "Sender");
-  const { tools } = setup({ sender, records: [
-    { header: { id: "sender", ...sender.session.header }, live: true, persisted: true },
-    coldRecord("cold-a", "Биржевой аналитик"),
-    coldRecord("cold-b", "Биржевой аналитик")
-  ] });
+  const outside = agent("outside", "Outside title", "/other-workspace");
+  const { tools, state } = setup({ sender, peers: [outside] });
 
   await assert.rejects(
-    tools.get("session_send").execute(
-      { target: "Биржевой аналитик", message: "Сводка" },
-      { agent: sender }
-    ),
+    tools.get("session_send").execute({ target: "Outside title", message: "Сводка" }, { agent: sender }),
+    (error) => error.code === "PEER_TARGET_NOT_FOUND"
+  );
+  assert.equal(outside.calls.length, 0);
+  assert.deepEqual(state.queries.observeSession, []);
+});
+
+test("session_send rejects duplicate exact live titles and asks for an id", async () => {
+  const sender = agent("sender", "Sender");
+  const first = agent("first", "Same title");
+  const second = agent("second", "Same title");
+  const { tools, state } = setup({ sender, peers: [first, second] });
+
+  await assert.rejects(
+    tools.get("session_send").execute({ target: "Same title", message: "Сводка" }, { agent: sender }),
     (error) => error.code === "PEER_TARGET_AMBIGUOUS"
   );
+  assert.equal(first.calls.length + second.calls.length, 0);
+  assert.deepEqual(state.queries.observeSession, []);
+  assert.deepEqual(state.queries.listEvents, []);
+  assert.equal(state.queries.listSessions, 0);
+});
+
+test("session_peers hides live subagent children even when indexed", async () => {
+  const sender = agent("sender", "Sender");
+  const child = agent("child", "Child");
+  child.session.header.delegationDepth = 1;
+  const { tools } = setup({ sender, peers: [child] });
+
+  const result = await tools.get("session_peers").execute({}, { agent: sender });
+  assert.deepEqual(result.peers, []);
 });
 
 test("session_peers includes non-archived persisted sessions that are cold", async () => {
@@ -158,7 +200,7 @@ test("session_peers includes non-archived persisted sessions that are cold", asy
   assert.deepEqual(result.peers.map(({ id, status }) => [id, status]), [["cold", "cold"]]);
 });
 
-test("blank live and cold drafts are hidden and cannot be addressed", async () => {
+test("session listing includes blank sessions without inspecting their history", async () => {
   const sender = agent("sender", "Sender");
   const blankLive = agent("blank-live", "");
   const { tools, state } = setup({ sender, peers: [blankLive], records: [
@@ -168,35 +210,39 @@ test("blank live and cold drafts are hidden and cannot be addressed", async () =
   ] });
 
   const peers = await tools.get("session_peers").execute({}, { agent: sender });
-  assert.deepEqual(peers.peers, []);
-  await assert.rejects(
-    tools.get("session_send").execute({ target: "blank-live", message: "Сводка" }, { agent: sender }),
-    (error) => error.code === "PEER_TARGET_NOT_FOUND"
-  );
-  await assert.rejects(
-    tools.get("session_send").execute({ target: "blank-cold", message: "Сводка" }, { agent: sender }),
-    (error) => error.code === "PEER_TARGET_NOT_FOUND"
-  );
-  assert.equal(blankLive.calls.length, 0);
+  assert.deepEqual(peers.peers.map(({ id }) => id), ["blank-live", "blank-cold"]);
+  assert.deepEqual(state.queries.observeSession, []);
+  assert.deepEqual(state.queries.listEvents, []);
+  assert.equal(state.queries.listSessions, 0);
   assert.equal(state.resumed.length, 0);
 });
 
-test("session_send resumes a cold session by exact title and delivers without creating an id", async () => {
+test("cold titles stay unavailable; an exact id resumes the existing session", async () => {
   const sender = agent("sender", "Sender");
   const { tools, state } = setup({ sender, records: [
     { header: { id: "sender", ...sender.session.header }, live: true, persisted: true },
     coldRecord("cold", "Биржевой аналитик")
   ] });
 
+  const listed = await tools.get("session_peers").execute({}, { agent: sender });
+  assert.deepEqual(listed.peers.map(({ id, title }) => [id, title]), [["cold", ""]]);
+  await assert.rejects(
+    tools.get("session_send").execute({ target: "Биржевой аналитик", message: "Сводка" }, { agent: sender }),
+    (error) => error.code === "PEER_TARGET_NOT_FOUND"
+  );
   const result = await tools.get("session_send").execute(
-    { target: "Биржевой аналитик", message: "Сводка" },
+    { target: "cold", message: "Сводка" },
     { agent: sender }
   );
 
   assert.equal(result.targetSessionId, "cold");
+  assert.equal(result.targetTitle, "Биржевой аналитик");
   assert.equal(state.resumed.length, 1);
   assert.equal(state.resumed[0].resumeSessionId, "cold");
   assert.deepEqual(state.mountedPresets, ["kilo"]);
+  assert.deepEqual(state.queries.observeSession, []);
+  assert.deepEqual(state.queries.listEvents, []);
+  assert.equal(state.queries.listSessions, 0);
 });
 
 test("session_broadcast skips cold sessions without resuming them", async () => {

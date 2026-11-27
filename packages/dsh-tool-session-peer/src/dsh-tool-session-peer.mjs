@@ -8,19 +8,17 @@
 // unrelated live Session.
 //
 // This plugin closes that gap with three tools:
-//   - `session_peers` lists neighbouring non-archived top-level Sessions --
-//     live or persisted/cold -- in the SAME workspace directory as the caller,
-//     with id, title, status, cwd and preset;
-//   - `session_send` resolves an exact session id or exact title, resuming a
-//     persisted/cold recipient only when that exact target is addressed, then
-//     delivers into its inbox (`agent.followup` or `agent.steer`);
+//   - `session_peers` lists neighbouring non-archived Sessions accounted to the
+//     SAME workspace directory as the caller, with exact IDs and live titles;
+//   - `session_send` resolves an exact session id or exact title from in-memory
+//     workspace/live-agent metadata, resuming a persisted/cold recipient only
+//     when addressed by id, then delivers into its inbox;
 //   - `session_broadcast` delivers one message to every neighbour at once.
 //
-// The two scopes deliberately differ. Discovery is workspace-local: an agent is
-// told about the Sessions it shares a checkout with, not about every tab in the
-// process. Delivery is process-wide by exact session id, so a Session introduced
-// out of band can be answered even when it lives in another workspace. Exact
-// titles resolve only among the caller's workspace peers.
+// The two scopes deliberately differ. Discovery and title matching are
+// workspace-local and use only the in-memory workspace index and live Agents.
+// Delivery by exact id is process-wide; a cold Session is restored only when
+// explicitly addressed. Listing and target resolution never read session logs.
 //
 // Delivery uses only public API (`ctx.agents.get`, `agent.followup/steer`,
 // `createUserMessage`) -- no upstream patch of the subagent runtime, whose
@@ -40,13 +38,9 @@
 //     rejects its steps, so a followup there would claim the message, run a
 //     turn nobody can see, and drop the input unrun. Reporting `delivered`
 //     for that would be a lie, hence the explicit refusal.
-//   - Only runtime roots are listed, so another Session's subagent children stay
-//     private to it. Root-ness is read from the persisted session header: a
-//     child carries a non-zero `delegationDepth`, a top-level Session carries
-//     none (or zero). The registry no longer answers ownership questions and a
-//     registry agent is a bare handle, so the header is read directly rather
-//     than through `@deepseek-ai/dsh-subagent`'s `delegationDepthOf`, which also
-//     consults runtime agent options that DSH 0.2.2 does not expose there.
+//   - Live subagent children are excluded using their in-memory session header.
+//     Cold workspace-index rows are listed by id because filtering them by
+//     delegation depth would require reading session files.
 //
 // ── schema format ───────────────────────────────────────────────────────────
 // Tools register through raw JSON Schema (`ctx.tools.register`, not
@@ -55,7 +49,7 @@
 // `required` array.
 
 const name = "dsh-tool-session-peer";
-const inject = ["tools", "agents", "sessionQuery"];
+const inject = ["tools", "agents"];
 
 const MAX_MESSAGE_BYTES = 32768;
 const RATE_WINDOW_MS = 60000;
@@ -70,13 +64,13 @@ class PeerError extends Error {
 }
 
 const PEERS_DESCRIPTION =
-  "List neighbouring non-archived top-level Sessions in the same workspace directory as this one, excluding this Session, every subagent child, and empty UI drafts without a user message. Includes conversation-bearing live Sessions (idle or running) and cold persisted Sessions (status cold). Each row gives the exact session id and exact title to pass to session_send, plus working directory and preset.";
+  "List non-archived Sessions accounted to this workspace, excluding this Session and live subagent children. Uses only the in-memory workspace index and live Agent metadata; it never reads session files. Rows always include exact session ids; live Sessions include current titles, while cold titles are unavailable. Use an exact id or exact live title with session_send.";
 
 const SEND_DESCRIPTION =
-  "Send one message to another non-archived Session (a peer agent): the cross-Session counterpart of send_message between subagents. Supply the exact session id or exact title; a cold persisted target is resumed only on this exact address. A running target receives the message at its nearest step boundary; otherwise it is queued as that Session's next turn. The target sees your session id and can answer with session_send back to you. An archived target is refused.";
+  "Send one message to another non-archived Session (a peer agent): the cross-Session counterpart of send_message between subagents. Supply an exact session id from session_peers, or an exact title shown there for a live Session; duplicate title matches are rejected. Target resolution uses in-memory metadata and never reads session files. A cold persisted target is resumed only when addressed by its exact id. A running target receives the message at its nearest step boundary; otherwise it is queued as that Session's next turn. The target sees your session id and can answer with session_send back to you. An archived target is refused.";
 
 const BROADCAST_DESCRIPTION =
-  "Send one message to every neighbouring live Session in this workspace at once. Cold persisted Sessions listed by session_peers are skipped rather than resumed; use session_send with that Session's exact id or exact title to address one explicitly. This Session, subagent children, and archived Sessions are excluded. Use it for announcements that concern the whole checkout; prefer session_send when only one peer needs the message.";
+  "Send one message to every neighbouring live Session in this workspace at once. Cold persisted Sessions listed by session_peers are skipped rather than resumed; use session_send with that Session's exact id to address one explicitly. This Session, subagent children, and archived Sessions are excluded. Use it for announcements that concern the whole checkout; prefer session_send when only one peer needs the message.";
 
 const PEERS_OUTPUT = {
   schema: {
@@ -214,110 +208,59 @@ function isArchived(ctx, id) {
   return archivedSessionIds(ctx).has(String(id));
 }
 
-/** Session ids accounted to registered workspaces; without that index, cold ids are not exposed. */
-function workspaceSessionIds(ctx) {
-  try {
-    const registry = ctx.get("workspaceRegistry");
-    if (typeof registry?.list !== "function") return new Set();
-    return new Set(registry.list().flatMap((workspace) => workspace.sessionIds.map(String)));
-  } catch {
-    return new Set();
-  }
-}
-
 /** The caller's workspace directory, or an empty string when it has none. */
 function workspaceOf(agent) {
   const cwd = agent?.session?.header?.cwd;
   return typeof cwd === "string" ? cwd : "";
 }
 
-/**
- * All conversation-bearing top-level Sessions: runtime Agents plus persisted
- * records. Empty UI drafts are omitted until their first user/message event;
- * cold Sessions with history are included without making them live.
- */
-async function sessionRows(ctx, selfId) {
-  let records = [];
+/** List indexed Sessions for one workspace without reading event logs. */
+function sessionRows(ctx, selfId, cwd) {
+  const candidates = new Map();
   try {
-    records = await ctx.sessionQuery.listSessions();
-  } catch (error) {
-    throw new PeerError(
-      `could not list persisted Sessions: ${error instanceof Error ? error.message : String(error)}`,
-      "PEER_SESSION_LIST_FAILED"
-    );
+    const registry = ctx.get("workspaceRegistry");
+    for (const workspace of registry?.list?.() ?? []) {
+      if (cwd !== "" && workspace.path !== cwd) continue;
+      for (const rawId of workspace.sessionIds ?? []) {
+        const id = String(rawId);
+        if (id === selfId) continue;
+        candidates.set(id, {
+          id,
+          title: "",
+          status: "cold",
+          cwd: typeof workspace.path === "string" ? workspace.path : "",
+          preset: "",
+          live: false,
+          persisted: true
+        });
+      }
+    }
+  } catch {
+    // Live Sessions remain discoverable without the optional workspace registry.
   }
-  const byId = new Map();
   for (const agent of ctx.agents.list()) {
     const id = String(agent.id);
-    if (id === selfId || headerDelegationDepth(agent) !== 0) continue;
-    byId.set(id, {
-      ...peerRow(ctx, agent),
-      live: true,
-      persisted: false
-    });
-  }
-  const accountedIds = workspaceSessionIds(ctx);
-  const rootRecords = records.filter((record) => {
-    const header = record?.header;
-    const id = header?.id === undefined ? "" : String(header.id);
-    return id !== "" && id !== selfId && headerDelegationDepth({ session: { header } }) === 0 &&
-      (record.live === true || record.persisted === true) && accountedIds.has(id);
-  });
-  const candidates = new Map(byId);
-  for (const record of rootRecords) {
-    const header = record.header;
-    const id = String(header.id);
-    const liveAgent = ctx.agents.get(id);
-    const prior = candidates.get(id);
-    candidates.set(id, {
-      id,
-      title: prior?.title ?? "",
-      status: liveAgent?.status ?? "cold",
-      cwd: typeof header.cwd === "string" ? header.cwd : "",
-      preset: typeof header.agentPreset === "string" ? header.agentPreset : "",
-      live: liveAgent !== undefined,
-      persisted: record.persisted === true
-    });
-  }
-  const nonblankIds = new Set();
-  await Promise.all([...candidates.keys()].map(async (id) => {
-    try {
-      const events = await ctx.sessionQuery.listEvents(id);
-      if (events.some((event) => event.type === "user/message")) nonblankIds.add(id);
-    } catch {
-      // Do not expose a target when its conversation history cannot be verified.
+    if (id === selfId) continue;
+    if (headerDelegationDepth(agent) !== 0) {
+      candidates.delete(id);
+      continue;
     }
-  }));
-  for (const id of candidates.keys()) {
-    if (!nonblankIds.has(id)) candidates.delete(id);
-  }
-  let titles = [];
-  const eligibleRecords = rootRecords.filter((record) => nonblankIds.has(String(record.header.id)));
-  try {
-    titles = await ctx.sessionQuery.readTitleSnapshots(eligibleRecords.map((record) => String(record.header.id)));
-  } catch {
-    titles = [];
-  }
-  const titleById = new Map(
-    titles.filter((entry) => entry.status === "fulfilled")
-      .map((entry) => [String(entry.sessionId), entry.value.title?.title ?? ""])
-  );
-  for (const record of eligibleRecords) {
-    const id = String(record.header.id);
-    const prior = candidates.get(id);
-    candidates.set(id, { ...prior, title: titleById.get(id) ?? prior?.title ?? "" });
+    const row = peerRow(ctx, agent);
+    if (cwd !== "" && row.cwd !== cwd) continue;
+    candidates.set(id, {
+      ...row,
+      live: true,
+      persisted: candidates.get(id)?.persisted ?? false
+    });
   }
   return [...candidates.values()];
 }
 
 /** Non-archived peers in the caller's workspace; an unknown cwd sees all. */
 async function peersOf(ctx, agent) {
-  const rows = await sessionRows(ctx, String(agent.id));
+  const rows = sessionRows(ctx, String(agent.id), workspaceOf(agent));
   const archived = archivedSessionIds(ctx);
-  const visible = rows.filter((row) => !archived.has(row.id));
-  const cwd = workspaceOf(agent);
-  if (cwd === "") return visible;
-  return visible.filter((row) => row.cwd === cwd);
+  return rows.filter((row) => !archived.has(row.id));
 }
 
 /** Render one peer row as a single model-facing line. */
@@ -329,26 +272,39 @@ function formatPeer(row) {
   return parts.join(" | ");
 }
 
-/** Resolve an exact session id or exact title, never a guessed fragment. */
-function resolveTarget(live, scoped, raw) {
+/** Resolve an exact id or exact live title using only in-memory metadata. */
+function resolveTarget(ctx, sender, raw) {
   const wanted = String(raw ?? "").trim();
   if (wanted === "") throw new PeerError("target must not be empty", "PEER_TARGET_REQUIRED");
-  const exactId = live.find((row) => row.id === wanted);
-  if (exactId !== undefined) return exactId;
-  const exactTitle = scoped.filter((row) => row.title === wanted);
-  if (exactTitle.length === 1) return exactTitle[0];
-  if (exactTitle.length > 1) {
+  const senderId = String(sender.id);
+  const notFound = () => new PeerError(
+    `no Session exactly matches id or live title "${wanted}"; use session_peers`,
+    "PEER_TARGET_NOT_FOUND"
+  );
+  if (wanted === senderId) throw notFound();
+  if (isArchived(ctx, wanted)) {
     throw new PeerError(
-      `title "${wanted}" matches multiple Sessions; pass the exact session id:\n${exactTitle.map(formatPeer).join("\n")}`,
+      `Session "${wanted}" is archived; its steps are rejected by the host gate, so a message would be dropped unrun. Unarchive it in the GUI first or pick another peer`,
+      "PEER_TARGET_ARCHIVED"
+    );
+  }
+
+  const allRows = sessionRows(ctx, senderId, "");
+  const byId = allRows.find((row) => row.id === wanted);
+  if (byId !== undefined) return byId;
+
+  const cwd = workspaceOf(sender);
+  const scopedRows = cwd === "" ? allRows : allRows.filter((row) => row.cwd === cwd);
+  const archived = archivedSessionIds(ctx);
+  const matches = scopedRows.filter((row) => row.live && row.title === wanted && !archived.has(row.id));
+  if (matches.length === 1) return matches[0];
+  if (matches.length > 1) {
+    throw new PeerError(
+      `title "${wanted}" matches multiple live Sessions; use an exact session id instead`,
       "PEER_TARGET_AMBIGUOUS"
     );
   }
-  throw new PeerError(
-    scoped.length === 0
-      ? `no Session exactly matches "${wanted}"; there are no non-archived peers in this workspace right now`
-      : `no Session exactly matches "${wanted}"; pass an exact session id or title:\n${scoped.map(formatPeer).join("\n")}`,
-    "PEER_TARGET_NOT_FOUND"
-  );
+  throw notFound();
 }
 
 /** Build the model-visible body delivered into the target Session. */
@@ -446,23 +402,14 @@ async function resumePeer(ctx, row, resumes) {
       if (isArchived(ctx, row.id)) {
         throw new PeerError(`Session "${row.id}" is archived and will not be resumed`, "PEER_TARGET_ARCHIVED");
       }
-      let presetId;
-      try {
-        const observation = await ctx.sessionQuery.observeSession(row.id);
-        presetId = observation?.projections?.values?.agentPreset ?? observation?.header?.agentPreset;
-      } catch (error) {
-        throw new PeerError(
-          `could not inspect persisted Session "${row.id}" before resuming: ${error instanceof Error ? error.message : String(error)}`,
-          "PEER_TARGET_RESUME_FAILED"
-        );
-      }
       let presets;
       try {
         presets = ctx.get("agentPresets");
       } catch {
         presets = undefined;
       }
-      const setup = async (agentCtx) => {
+      const setup = async (agentCtx, resumedAgent) => {
+        const presetId = resumedAgent?.session?.header?.agentPreset ?? row.preset;
         if (presets && typeof presets.mount === "function" && presetId) {
           const resolved = await presets.resolve(presetId);
           await presets.mount(agentCtx, resolved.id);
@@ -509,6 +456,7 @@ async function sendToPeer(ctx, resumes, createUserMessage, senderId, senderTitle
     throw new PeerError(`Session "${row.id}" is archived and will not receive a message`, "PEER_TARGET_ARCHIVED");
   }
   const mode = targetAgent.status === "running" ? "steer" : "followup";
+  const targetTitle = row.title || titleOf(ctx, targetAgent.session);
   const userMessage = createUserMessage({
     content: [{ type: "text", text: composeBody(senderId, senderTitle, message) }],
     source: { kind: "agent-message", form: "relay", senderSessionId: senderId }
@@ -518,7 +466,7 @@ async function sendToPeer(ctx, resumes, createUserMessage, senderId, senderTitle
   } else {
     await targetAgent.followup(userMessage);
   }
-  return { id: row.id, title: row.title, mode };
+  return { id: row.id, title: targetTitle, mode };
 }
 
 /** Deliver one peer message into the target Session and describe the outcome. */
@@ -527,17 +475,7 @@ async function deliverPeer(ctx, limiter, resumes, createUserMessage, exec, args)
   const senderId = String(sender.id);
   const { message, bytes } = requireMessage(args);
   limiter.admit(senderId);
-  const all = await sessionRows(ctx, senderId);
-  const archived = archivedSessionIds(ctx);
-  const cwd = workspaceOf(sender);
-  const scoped = all.filter((row) => !archived.has(row.id) && (cwd === "" || row.cwd === cwd));
-  const target = resolveTarget(all, scoped, args.target);
-  if (isArchived(ctx, target.id)) {
-    throw new PeerError(
-      `Session "${target.id}" is archived; its steps are rejected by the host gate, so a message would be dropped unrun. Unarchive it in the GUI first or pick another peer`,
-      "PEER_TARGET_ARCHIVED"
-    );
-  }
+  const target = await resolveTarget(ctx, sender, args.target);
   const sent = await sendToPeer(ctx, resumes, createUserMessage, senderId, titleOf(ctx, sender.session), target, message);
   return {
     text:
@@ -570,7 +508,7 @@ async function broadcastPeers(ctx, limiter, resumes, createUserMessage, exec, ar
   const delivered = [];
   const failed = coldTargets.map((row) => ({
     id: row.id,
-    error: "cold session skipped; address its exact id or title with session_send to resume it"
+    error: "cold session skipped; address its exact id with session_send to resume it"
   }));
   for (const row of liveTargets) {
     try {
@@ -617,14 +555,14 @@ function defineTools(ctx, resolveCreateUserMessage) {
     name: "session_send",
     description:
       SEND_DESCRIPTION +
-      ' Target must exactly match a session id or an exact title from session_peers.',
+      ' Target must exactly match a session id or an exact live title from session_peers.',
     parameters: {
       type: "object",
       properties: {
         target: {
           type: "string",
           description:
-            'Recipient Session as returned by session_peers; provide its exact session id or exact title.'
+            'Recipient Session as returned by session_peers; provide its exact session id or exact live title.'
         },
         message: {
           type: "string",
