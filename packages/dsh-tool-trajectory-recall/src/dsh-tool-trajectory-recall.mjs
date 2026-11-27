@@ -21,12 +21,13 @@
 //     sibling (`plugin:spill`) is recalled by its seq; `type: "result"` also
 //     resolves through the tool/result's callId to its sibling. Optional
 //     line-based `limit`/`offset` page a single recalled event.
-//   - `search` — keyword/regex search over the log. Returns an index: one
-//     `[seq N: <label>] - K match(es)` line per matching event, freshest
-//     matches first, with no output limits. Each hit carries the first-match
-//     line coordinate so the model can page straight to the needle. The agent
-//     can then call `recall` with any `(seq N)` pointer to restore that hit in
-//     full.
+//   - `search` — keyword/regex search over the log. Returns one block per
+//     matching event, freshest first: a `[seq N: <label>] - K match(es)` header
+//     followed by one `<line>: <snippet>` line per distinct match, where the
+//     snippet is the text around the match (`before…match…after`, up to ~120
+//     characters, `…` marking a cut edge). No hit caps and no token budgets.
+//     The agent can then call `recall` with any `(seq N)` pointer to restore
+//     that hit in full.
 //   - `/recall` — the same search as a human-facing slash command; its result
 //     is appended to the session as a user message (spilled to a `plugin:spill`
 //     sibling when the index is large, per the "full inline or sibling" rule).
@@ -34,8 +35,8 @@
 // Neither call does a model round-trip and neither paraphrases: the log is
 // append-only, so the output is always the original content. No tool output is
 // ever truncated: recall returns every requested seq in full (or a paged window
-// it explicitly marks as partial), and search returns every matching event as
-// one index line.
+// it explicitly marks as partial), and search returns every matching event with
+// an excerpt of every distinct match.
 //
 // ── schema format: RAW JSON Schema, NOT the dsh-tools DSL ───────────────────
 // This plugin registers its `recall`/`search` tools via `ctx.tools.register()`
@@ -462,17 +463,67 @@ function searchEventLabel(session, events, seq, event, message) {
   return String(event.type);
 }
 
+/** Widest one search snippet in characters: context before + match + context after. */
+const SNIPPET_MAX_CHARS = 120;
+
+/** Collapse runs of blanks so one excerpt stays on one output line. */
+function collapseBlanks(text) {
+  return text.replace(/[ \t\f\v]+/gu, " ").trim();
+}
+
 /**
- * The 1-based line number of the first pattern match inside `body`, or
- * undefined when there is no match. Computed against the decoded spill body so
- * the coordinate is meaningful for line-based paging.
+ * One `before…match…after` excerpt of `line` around the match at `index`, cut to
+ * {@link SNIPPET_MAX_CHARS} characters with an ellipsis on every cut edge.
+ * Returns the excerpt plus the index just past its window, so a caller can skip
+ * later matches that are already visible inside it.
  */
-function firstMatchLine(body, matchAllPattern) {
+function matchSnippet(line, index, length) {
+  const width = Math.max(length, 1);
+  if (width >= SNIPPET_MAX_CHARS) {
+    const cut = collapseBlanks(line.slice(index, index + SNIPPET_MAX_CHARS));
+    return { text: `${index > 0 ? "…" : ""}${cut}…`, end: index + width };
+  }
+  const room = SNIPPET_MAX_CHARS - width;
+  let start = Math.max(0, index - Math.floor(room / 2));
+  let end = Math.min(line.length, start + width + room);
+  start = Math.max(0, end - width - room);
+  const body = collapseBlanks(line.slice(start, end));
+  return { text: `${start > 0 ? "…" : ""}${body}${end < line.length ? "…" : ""}`, end };
+}
+
+/** Every distinct excerpt on one line: one per match not already covered by an earlier window. */
+function lineSnippets(line, matchAllPattern) {
+  const snippets = [];
+  let coveredUntil = -1;
+  for (const match of line.matchAll(matchAllPattern)) {
+    const index = match.index ?? 0;
+    if (index < coveredUntil) continue;
+    const snippet = matchSnippet(line, index, match[0].length);
+    snippets.push(snippet.text);
+    coveredUntil = snippet.end;
+  }
+  return snippets;
+}
+
+/**
+ * Count the pattern occurrences in one event body and excerpt every matching
+ * line as `<line>: <snippet>`, so each hit carries both its total occurrence
+ * count and the surrounding context of every distinct fragment.
+ */
+function bodyMatches(body, matchAllPattern) {
+  let count = 0;
+  const snippets = [];
   const lines = body.split("\n");
   for (let i = 0; i < lines.length; i += 1) {
-    if (matchAllPattern.test(lines[i])) return i + 1;
+    let matchedHere = false;
+    for (const _match of lines[i].matchAll(matchAllPattern)) {
+      count += 1;
+      matchedHere = true;
+    }
+    if (!matchedHere) continue;
+    for (const snippet of lineSnippets(lines[i], matchAllPattern)) snippets.push(` ${i + 1}: ${snippet}`);
   }
-  return undefined;
+  return { count, snippets };
 }
 
 /** Search one session's log for matching events, freshest first, as an index. */
@@ -500,21 +551,23 @@ function searchSession(session, patternSource, config) {
         : `[${event.type}]\n${JSON.stringify(event.data ?? null)}`;
       label = searchEventLabel(session, events, seq, event, message);
     }
-    let count = 0;
-    for (const match of body.matchAll(matchAllPattern)) count += 1;
+    const { count, snippets } = bodyMatches(body, matchAllPattern);
     if (count === 0) continue;
     totalMatches += 1;
-    const firstLine = firstMatchLine(body, new RegExp(pattern.source, `${pattern.flags}g`));
-    const coord = firstLine === undefined ? "" : ` · first match at line ${firstLine}`;
-    hits.push({ seq, kind: label, text: `[seq ${seq}: ${label}] - ${count} match${count === 1 ? "" : "es"}${coord}` });
+    hits.push({
+      seq,
+      kind: label,
+      text: [`[seq ${seq}: ${label}] - ${count} match${count === 1 ? "" : "es"}`, ...snippets].join("\n")
+    });
   }
   const lines = [
     `[search "${pattern.source}": ${totalMatches} matching event(s)]`,
     ...hits.map((hit) => hit.text)
   ];
   if (hits.length > 0) lines.push("[use recall with a (seq N) pointer to restore any hit's full original content]");
-  // Every index entry is a single line, so the index is one line per event:
-  // joining with a blank line would double-space the whole listing.
+  // A hit is a header line plus its indented snippet lines, so hits are joined
+  // with a single newline: the indent already separates one hit from the next,
+  // and a blank line between them would only double the listing's height.
   const text = lines.join("\n");
   return {
     pattern: pattern.source,
@@ -531,7 +584,7 @@ function searchSession(session, patternSource, config) {
 
 const RECALL_DESCRIPTION = "Restore the exact original content of earlier events in THIS conversation by a typed reference. type=\"seq\" with a seq selection id (\"3-7,15\", \"seq 12\", \"seqs 3-7\" — the checkpoint marker forms) restores those events; type=\"result\" with the \"result N\" pointer from a tool-call one-liner (\"result 3\" or \"3\") restores that tool result (resolving through to the full spilled content when the result was spilled); type=\"checkpoint\" with an ordinal (\"1\" = oldest, as in a \"[checkpoint N]\" elision line) or a \"seq N\" pointer restores that full checkpoint. The durable log is append-only, so recalled content is always the original tokens. Optional line-based paging: pass limit (lines per event) and/or offset (1-based first line) to window a large event; a windowed recall is marked as partial, so page again with a larger limit or later offset to read the rest. To find events by keyword or regex instead, use the search tool.";
 
-const SEARCH_DESCRIPTION = "Search THIS conversation's durable event log by keyword or regular expression (case-insensitive, Unicode-aware). Every event ever recorded is searchable, including content elided or truncated by compaction checkpoints and full outputs spilled into the log — the log is append-only and untouched. Returns an index: one `[seq N: <label>] - K match(es)` line per matching event, freshest matches first, with no output limits; each hit also carries the 1-based line of its first match so you can page straight to it with recall's offset. Then call recall with a (seq N) pointer to restore any hit's full exact original content. Escape regex special characters(e.g. use \\\\( for a literal parenthesis).";
+const SEARCH_DESCRIPTION = "Search THIS conversation's durable event log by keyword or regular expression (case-insensitive, Unicode-aware). Every event ever recorded is searchable, including content elided or truncated by compaction checkpoints and full outputs spilled into the log — the log is append-only and untouched. Returns one block per matching event, freshest first: a `[seq N: <label>] - K match(es)` header followed by one indented `<line>: <snippet>` line per distinct match, where the snippet is the text around the match (up to ~120 characters, with … marking a cut edge) and `<line>` is its 1-based line number in that event, so you can page straight to it with recall's offset. There are no hit caps, snippet caps, or token budgets. Then call recall with a (seq N) pointer to restore any hit's full exact original content. Escape regex special characters(e.g. use \\\\( for a literal parenthesis).";
 
 const RECALL_OUTPUT = {
   schema: {
@@ -680,7 +733,7 @@ function defineSearchTool(resolved) {
  */
 /** Text of the system-prompt hint about restoring compacted content. */
 const RECALL_HINT_TEXT =
-  "Folded `seq`/`result`/`checkpoint` content may be restored in full using tools `recall` by id or `search` by keyword — `search` returns an untruncated (seq N) index; don't guess. Large spilled outputs are recalled by seq; page them with recall's limit/offset. When a tool call you already made has been folded (its row reads `* name \"...\" (seq N -> result M)`), read that result back with `recall type=\"result\" id=\"M\"` instead of running the command again.";
+  "Folded `seq`/`result`/`checkpoint` content may be restored in full using tools `recall` by id or `search` by keyword — `search` returns an untruncated (seq N) index with a snippet per match; don't guess. Large spilled outputs are recalled by seq; page them with recall's limit/offset. When a tool call you already made has been folded (its row reads `* name \"...\" (seq N -> result M)`), read that result back with `recall type=\"result\" id=\"M\"` instead of running the command again.";
 
 /** Execute one grep-based `/recall` request against the calling agent's session. */
 async function executeRecallCommand(invocation, appendPluginRecord) {

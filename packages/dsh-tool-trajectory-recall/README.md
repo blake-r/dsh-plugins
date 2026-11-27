@@ -48,26 +48,33 @@ content too.
 
 Keyword/regex search over the durable event log (case-insensitive,
 Unicode-aware), scanning **from the end backwards** so freshest matches come
-first. Every matching event produces exactly one index line:
+first. Every matching event produces one block: a header line plus one indented
+line per distinct match.
 
 ```
-[seq N: <label>] - K match(es) · first match at line L
+[seq N: <label>] - K match(es)
+ L: <snippet>
+ L: <snippet>
 ```
 
-The index is compact — one line per matching event, no blank lines between
-entries (only `recall` separates restored events with a blank line, since those
-bodies are multi-line). `<label>` is the tool name for tool-call/tool-result
-rows (resolved by scanning earlier events for the matching tool call id), the
-spill record's own tool name for `plugin:spill` siblings, or the message role
-otherwise, and `K` is the total number of pattern occurrences in that event's
-projected body text. Each hit also carries the 1-based line `L` of its first
-match, computed against the decoded spill body, so the model can page straight
-to the needle with `recall`'s `offset`. There are no hit caps, line caps, or
-token budgets.
-Search matches full spilled content too — a needle buried in a spilled blob
-that the model never saw inline is still found. The trailing hint line points
-back at `recall` with a `(seq N)` pointer to restore any hit's full original
-content.
+`<label>` is the tool name for tool-call/tool-result rows (resolved by scanning
+earlier events for the matching tool call id), the spill record's own tool name
+for `plugin:spill` siblings, or the message role otherwise, and `K` is the total
+number of pattern occurrences in that event's projected body text.
+
+Each snippet is the text around the match — `before…match…after`, up to ~120
+characters, with `…` marking a cut edge — and `L` is its 1-based line number in
+that event, computed against the decoded spill body, so the model can page
+straight to the needle with `recall`'s `offset`. Matches whose windows overlap
+share one snippet, so a line with several adjacent hits yields one excerpt
+rather than repeats. There are no hit caps, snippet caps, or token budgets.
+
+Blocks are separated by a single newline (the indent already delimits them);
+only `recall` puts a blank line between restored events, since those bodies are
+multi-line. Search matches full spilled content too — a needle buried in a
+spilled blob that the model never saw inline is still found. The trailing hint
+line points back at `recall` with a `(seq N)` pointer to restore any hit's full
+original content.
 
 ### `/recall` slash command
 
@@ -87,7 +94,8 @@ The recall/search cores and compiler helpers are vendored from an upstream
 compaction engine whose algorithm this plugin adapts for model-facing
 same-session recall/search tools. No tool output is ever truncated: recall
 returns every requested seq in full (or a paged window it explicitly marks as
-partial), and search returns every matching event as one index line.
+partial), and search returns every matching event with an excerpt of every
+distinct match.
 
 The `plugin:spill` sibling contract (record type string, `{ toolName, callId,
 content }` data shape, and seq semantics) is shared with `dsh-spill-policy`; the
